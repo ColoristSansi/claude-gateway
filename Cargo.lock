@@ -1254,6 +1254,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "toml_edit 0.25.17+spec-1.1.0",
  "windows-sys 0.61.2",
 ]
 
@@ -3448,6 +3449,8 @@ version = "1.0.154"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e7e9cc8b1b85264074fbcc02a88680c4096b1e47df8f739dceb03bf482f04bd6"
 dependencies = [
+ "foldhash",
+ "indexmap 2.14.2",
  "itoa",
  "memchr",
  "serde",
@@ -4379,6 +4382,7 @@ dependencies = [
  "indexmap 2.14.2",
  "toml_datetime 1.1.2+spec-1.1.0",
  "toml_parser",
+ "toml_writer",
  "winnow 1.0.4",
 ]
 
