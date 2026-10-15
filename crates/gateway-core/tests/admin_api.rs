@@ -149,6 +149,8 @@ impl Harness {
             admin: Some(admin.clone()),
             // 票 62 的维护面：这一格只测票 52 的管理面，不挂。
             maintenance: None,
+            // 票 61 的升级面：要 Tauri updater 插件，这里不挂。
+            updater: None,
         };
         let gateway = service::start(config).await.expect("起网关");
         Harness {

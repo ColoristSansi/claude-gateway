@@ -455,6 +455,49 @@ function logQuery(f: LogFilters, cursor: number | null): string {
 const json = (body: unknown): RequestInit => ({ method: 'POST', body: JSON.stringify(body ?? {}) });
 const put = (body: unknown): RequestInit => ({ method: 'PUT', body: JSON.stringify(body ?? {}) });
 
+/**
+ * 自动升级（票 61）：`/api/update/*` 的响应体。
+ *
+ * 检查 / 下载 / 安装都由**外壳**（Tauri updater 插件）干：前端只发三个请求 + 轮询 status。
+ * 安装时进程会被安装器接管（装完自动重启），所以 install 是「立刻应答」，进度看 status。
+ */
+export type AvailableUpdate = {
+  version: string;
+  notes: string | null;
+  pubDate: string | null;
+  downloadUrl: string;
+};
+
+export type LocalPackage = {
+  fileName: string;
+  path: string;
+  bytes: number;
+  version: string | null;
+};
+
+export type UpdateRollback = {
+  /** 回退指引原文（设置页「关于」/帮助里直接显示）。 */
+  guide: string;
+  installersDir: string;
+  packages: LocalPackage[];
+  previous: LocalPackage | null;
+  lastUpdate: { from: string; to: string; at: string; package: string } | null;
+};
+
+export type UpdateStatus = {
+  currentVersion: string;
+  endpoints: string[];
+  checking: boolean;
+  installing: boolean;
+  lastCheckedAt: string | null;
+  available: AvailableUpdate | null;
+  downloadedBytes: number;
+  totalBytes: number | null;
+  installingPackage: string | null;
+  error: string | null;
+  rollback: UpdateRollback;
+};
+
 export const api = {
   // ── 票 53：日志与用量基础（合并时原样保留） ──
   logs: (f: LogFilters, cursor: number | null = null) =>
@@ -630,4 +673,12 @@ export const api = {
 
   // ── 概览的端到端验收 ──
   acceptanceRun: () => req<AcceptanceResult>('/api/acceptance/run', json({})),
+
+  // ── 自动升级（票 61）：检查 / 用户确认 / 静默安装 ──
+  /** 查一次（查不动会抛错，错误原文来自后端）。 */
+  updateCheck: () => req<UpdateStatus>('/api/update/check', { method: 'POST' }),
+  /** 下载 + 验签 + 静默安装（**立刻应答**；装完由安装器把应用拉起来）。 */
+  updateInstall: () => req<UpdateStatus>('/api/update/install', { method: 'POST' }),
+  /** 轮询用：当前版本、进度、失败原因、回退指引与本地留包。 */
+  updateStatus: () => req<UpdateStatus>('/api/update/status'),
 };

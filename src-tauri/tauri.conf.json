@@ -33,5 +33,17 @@
         "installerHooks": "nsis/hooks.nsh"
       }
     }
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/OWNER/REPO/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEE1NEU1ODZGNUM3M0VDNDIKUldSQzdITmNiMWhPcGNpS2tLc3daQitKaWlUamEvU1B0NXVSaThRRXhvSnpMRmMvVUxva0pTeGgK",
+      "requireSignedVersion": true,
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }

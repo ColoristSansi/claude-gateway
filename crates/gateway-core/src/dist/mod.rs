@@ -9,11 +9,14 @@
 //! - [`restore`]：卸载时的「还原客户端配置」——**复用** `writer` 引擎的摘键还原，
 //!   不另写一套还原逻辑（票 45/46/47 的 `FileSpec` 就是还原清单）。
 //! - [`cli`]：脚本可调用的参数面；外壳的 bin 认它，卸载器的 `--restore-clients --silent` 也走它。
+//! - [`update`]（票 61）：升级留包（`updates\`）+ 回退指引 + 更新状态形状；真正的
+//!   「检查 / 下载 / 安装」在 Tauri 的 updater 插件里，这里只放能裸跑的那半。
 
 pub mod autostart;
 pub mod bundle;
 pub mod cli;
 pub mod restore;
+pub mod update;
 
 /// DPAPI 密文**换机解不开**（spec §13）：导出 / 导入两处都给这句原文，界面（票 59）直接显示。
 ///

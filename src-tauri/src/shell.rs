@@ -17,6 +17,7 @@ use tauri::{App, AppHandle, Manager, Window, WindowEvent, Wry};
 
 use gateway_core::clients::ClientEnv;
 use gateway_core::dist::autostart::{self, HkcuRun};
+use gateway_core::dist::update::UpdateSource;
 use gateway_core::ingress::api::{rfc3339_utc, AdminCtx, GatewayControl, Maintenance};
 use gateway_core::ingress::proxy;
 use gateway_core::service::{self, Gateway, GatewayConfig};
@@ -28,6 +29,8 @@ pub struct Shell {
     gateway: Mutex<Option<Gateway>>,
     status_item: Mutex<Option<MenuItem<Wry>>>,
     autostart_item: Mutex<Option<MenuItem<Wry>>>,
+    /// 升级面（票 61）：`setup` 建一次，网关启动 / 重启时都要把它递给 `GatewayConfig`。
+    updater: Option<Arc<dyn UpdateSource>>,
 }
 
 /// 托盘图标：两种状态色（运行 / 停止）。票 43 只做两态，够表达「在不在跑」。
@@ -228,6 +231,8 @@ async fn start_gateway(app: &AppHandle, port: u16) -> Result<(), String> {
         version: env!("CARGO_PKG_VERSION").to_string(),
         forwarding,
         maintenance: Some(maintenance),
+        // 升级面（票 61）：`setup` 建好的那个句柄留着，换端口 / 重启网关后新网关照样带升级端点。
+        updater: app.state::<Shell>().updater.clone(),
         admin,
     };
     let gateway = service::start(config).await.map_err(|e| {
@@ -280,6 +285,13 @@ pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
 
     let db_path = data_dir.join(store::DB_FILE_NAME);
 
+    // 升级面（票 61）：插件已在 main 里注册，这里建句柄 → 随网关挂进管理 API → 启动后静默检查一次。
+    let updater = crate::updater::ShellUpdater::new(
+        app.handle().clone(),
+        data_dir.clone(),
+        env!("CARGO_PKG_VERSION"),
+    );
+
     // 库先开：端口、维护面、管理面上下文、转发面装配都从它来（票 52 起 `settings.port` 是唯一真相，
     // `config.json` 只当老配置的迁移兜底）。
     let store = match Store::open(&data_dir) {
@@ -324,6 +336,8 @@ pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
         version: env!("CARGO_PKG_VERSION").to_string(),
         forwarding,
         maintenance,
+        // 升级面（票 61）：同一个句柄也留着给启动后的静默检查。
+        updater: Some(updater.clone() as Arc<dyn UpdateSource>),
         admin,
     };
 
@@ -352,8 +366,12 @@ pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
         gateway: Mutex::new(gateway),
         status_item: Mutex::new(None),
         autostart_item: Mutex::new(None),
+        updater: Some(updater.clone() as Arc<dyn UpdateSource>),
     });
     build_tray(app.handle(), running, port)?;
+    // 启动后静默检查一次（票 18 §3）：只把结果放进 `/api/update/status`，不弹窗；
+    // 网关没起来也照样检查（那是网络的事，与端口无关）。
+    updater.spawn_startup_check();
 
     // Run 键拉起来的那次（`--startup`）：直接进托盘，不弹窗口。网关照常起。
     if is_startup_launch(&std::env::args().collect::<Vec<_>>()) {

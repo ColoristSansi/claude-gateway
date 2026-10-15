@@ -44,6 +44,17 @@
 //!
 //! 这四个要动数据目录与库，所以由外壳在启动时递进来一个 [`Maintenance`] 句柄；
 //! **没递进来就 503**，不静默假装成功。
+//!
+//! 票 61 在这里补自动升级那一格（更新横幅与设置页调它）：
+//!
+//! | 端点 | 用途 |
+//! | --- | --- |
+//! | `GET /api/update/status` | 当前版本、端点、上次检查结果、下载进度、回退指引与本地留包 |
+//! | `POST /api/update/check` | 去端点问一次有没有新版（失败给 502 + 人话） |
+//! | `POST /api/update/install` | 下载 + 验签 + 静默安装并自动重启（**立刻应答**，进度走 status） |
+//!
+//! 检查 / 下载 / 安装是 Tauri updater 插件的事（要 AppHandle），所以外壳递进来一个
+//! [`crate::dist::update::UpdateSource`]；**没递进来同样是 503**。
 
 pub mod bindings;
 pub mod clients;
@@ -69,6 +80,7 @@ use serde_json::{json, Value};
 use crate::binding::BindingTable;
 use crate::clients::{ClientEnv, ClientId, GatewayValues};
 use crate::dist::autostart::{self, HkcuRun};
+use crate::dist::update::UpdateSource;
 use crate::dist::{bundle, DPAPI_MIGRATION_WARNING};
 use crate::obs::{self, BodyLogWindow, LogQuery, BODY_LOG_WINDOW};
 use crate::store::{settings_keys, Store};
@@ -332,6 +344,8 @@ pub struct ApiState {
     admin: Option<Arc<AdminCtx>>,
     logs: Option<LogsState>,
     maint: Option<Maintenance>,
+    /// 自动升级（票 61）：外壳把 Tauri updater 插件接进来才有，没有就 503。
+    updater: Option<Arc<dyn UpdateSource>>,
 }
 
 /// 日志面的两个句柄（票 53；与转发路径共用同一个 body 窗口实例）。
@@ -353,6 +367,7 @@ impl ApiState {
             admin: None,
             logs: None,
             maint: None,
+            updater: None,
         }
     }
 
@@ -383,6 +398,16 @@ impl ApiState {
 
     pub fn maintenance(&self) -> Option<&Maintenance> {
         self.maint.as_ref()
+    }
+
+    /// 挂上升级面（票 61，外壳把 Tauri updater 插件接进来）。
+    pub fn with_updater(mut self, updater: Arc<dyn UpdateSource>) -> Self {
+        self.updater = Some(updater);
+        self
+    }
+
+    pub fn updater(&self) -> Option<&Arc<dyn UpdateSource>> {
+        self.updater.as_ref()
     }
 
     pub fn version(&self) -> &str {
@@ -466,6 +491,10 @@ pub fn router(state: ApiState) -> Router {
         )
         .route("/api/export", post(export_config))
         .route("/api/import", post(import_config))
+        // 票 61：自动升级（更新横幅 / 设置页调这三个）。
+        .route("/api/update/status", get(update_status))
+        .route("/api/update/check", post(update_check))
+        .route("/api/update/install", post(update_install))
         .merge(overview::routes())
         .merge(upstreams::routes())
         .merge(bindings::routes())
@@ -685,6 +714,49 @@ async fn import_config(State(state): State<ApiState>, Json(req): Json<ImportRequ
     match bundle::import(maint.store(), &text, req.password.as_deref(), mode).await {
         Ok(report) => Json(report).into_response(),
         Err(e) => maintenance_failed(e),
+    }
+}
+
+// ── 票 61：自动升级（更新横幅 / 设置页调这三个） ────────────────────────────────
+
+/// 升级面没挂上（外壳没把 updater 插件接进来）时的统一答复：503，说清是「没挂上」。
+fn update_unavailable() -> Response {
+    failed_status(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "升级面不可用：外壳没有把 updater 接进来（检查更新 / 安装更新不可用）".to_string(),
+    )
+}
+
+/// `GET /api/update/status`：当前版本、端点、上次检查结果、下载进度、回退指引与本地留包。
+async fn update_status(State(state): State<ApiState>) -> Response {
+    let Some(updater) = state.updater() else {
+        return update_unavailable();
+    };
+    Json(updater.snapshot()).into_response()
+}
+
+/// `POST /api/update/check`：去端点问一次。查不动（网络 / 清单格式 / 端点不是 https）给 502 + 人话，
+/// 界面按 `error.message` 原样显示——升级失败不许吞掉原因。
+async fn update_check(State(state): State<ApiState>) -> Response {
+    let Some(updater) = state.updater() else {
+        return update_unavailable();
+    };
+    match updater.clone().check().await {
+        Ok(status) => Json(status).into_response(),
+        Err(message) => failed_status(StatusCode::BAD_GATEWAY, message),
+    }
+}
+
+/// `POST /api/update/install`：下载 + 验签 + 静默安装。**立刻应答**，不等安装器：
+/// 真装起来时插件会 `exit(0)` 让 NSIS 把新版拉起，这个进程根本回不了话；
+/// 失败（验签不过、下载不到）落在 `status.error` 里，界面轮询 status 就能看到。
+async fn update_install(State(state): State<ApiState>) -> Response {
+    let Some(updater) = state.updater() else {
+        return update_unavailable();
+    };
+    match updater.clone().start_install() {
+        Ok(status) => Json(status).into_response(),
+        Err(message) => failed_status(StatusCode::BAD_REQUEST, message),
     }
 }
 

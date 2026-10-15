@@ -34,6 +34,9 @@ pub struct GatewayConfig {
     /// 维护面（票 62）：开机自启开关 / 导出 / 导入要动数据目录与库。
     /// `None` = 这些端点是 503（只起管理面 / 测试不带）。
     pub maintenance: Option<crate::ingress::api::Maintenance>,
+    /// 升级面（票 61）：检查更新 / 下载 / 静默安装走 Tauri 的 updater 插件，由外壳实现
+    /// [`crate::dist::update::UpdateSource`] 后递进来。`None` = `/api/update/*` 是 503。
+    pub updater: Option<Arc<dyn crate::dist::update::UpdateSource>>,
     /// 管理面 `/api/*` 的业务上下文（库 + 三个客户端的配置根 + 外壳句柄，票 52）。
     /// `None` = 只挂 `/api/status` 那一条（M1 单测那档）。
     pub admin: Option<Arc<AdminCtx>>,
@@ -138,6 +141,10 @@ pub async fn start(cfg: GatewayConfig) -> Result<Gateway, StartError> {
     // 票 62：维护面（导出 / 导入 / 自启开关）跟着库走，不管转发面挂没挂。
     if let Some(maint) = cfg.maintenance {
         api_state = api_state.with_maintenance(maint);
+    }
+    // 票 61：升级面（检查更新 / 静默安装）同样由外壳递进来；没递进来就是 503。
+    if let Some(updater) = cfg.updater {
+        api_state = api_state.with_updater(updater);
     }
     if let Some(admin) = cfg.admin.clone() {
         // 绑定成功之后才知道真端口（`port = 0` 是操作系统挑的）：写回管理面上下文。

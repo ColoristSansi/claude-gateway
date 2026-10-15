@@ -285,22 +285,23 @@ async fn refresh_catalog(State(state): State<ApiState>) -> Result<Json<Value>, A
 }
 
 /// 关于与版本（spec §10 第 7 条 / 票 18 第 45 条）：版本 + 上一版回退指引 + 免安装 zip 版提示。
+///
+/// 回退指引与本地留包从**票 61** 的 `dist::update` 来（升级留包的正是它）：指引里会指名道姓
+/// 写出该双击哪个文件，`packages` 给的是绝对路径。**不做一键回退按钮**——那一步本身就会写坏东西。
 async fn about(State(state): State<ApiState>) -> Result<Json<Value>, ApiFailure> {
     let admin = admin(&state)?;
-    let updates = admin.data_dir.join("updates");
-    // 回退指引（票 18 第 45 条）：`updates\` 里存着本次下载的新包与上一版安装包，
-    // **不做一键回退按钮**——那一步本身就会写坏东西，只告诉用户装哪个文件。
-    let packages = list_files(&updates);
+    let rollback = crate::dist::update::rollback(&admin.data_dir, state.version());
+    let packages: Vec<String> = rollback.packages.iter().map(|p| p.path.clone()).collect();
     let portable = is_portable_exe(&std::env::current_exe().unwrap_or_default());
     Ok(ok_json(json!({
         "version": state.version(),
         "dbPath": admin.db_path,
         "dataDir": admin.data_dir.to_string_lossy(),
-        "updatesDir": updates.to_string_lossy(),
+        "updatesDir": rollback.installers_dir,
         "packages": packages,
         "rollback": {
-            "guidance": "要回到上一个版本：把 updates 目录里上一版的安装包再装一次即可，数据（上游 / 绑定 / 日志）不动。网关不提供一键回退——那一步本身就会写坏东西。",
-            "hasPrevious": !packages.is_empty(),
+            "guidance": rollback.guide,
+            "hasPrevious": rollback.previous.is_some(),
         },
         "portable": {
             "isPortable": portable,
@@ -311,25 +312,13 @@ async fn about(State(state): State<ApiState>) -> Result<Json<Value>, ApiFailure>
             },
         },
         "update": {
-            // 「检查更新」的落地归票 61（公开 Releases + latest.json + 签名校验），当前未接。
-            "supported": false,
-            "note": "这一版还没有内置自动更新（归票 61）：升级请下载新版安装包覆盖安装，数据不动。",
+            // 票 61 起内置自动更新：启动后静默检查一次，设置页可手动检查；下载后**必须**过签名
+            // （不可关），passive 静默安装 + 装完自动重启。升级不改端口、数据与客户端配置。
+            "supported": true,
+            "note": "已内置自动更新：启动后静默检查一次，设置页可手动检查。下载后会校验签名（不可关），\
+    被动静默安装并自动重启；升级不改端口、数据与客户端配置。"
         },
     })))
-}
-
-/// 目录里的文件（按名字排序；不存在就是空表）。只列文件名，不读内容。
-fn list_files(dir: &std::path::Path) -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut names: Vec<String> = entries
-        .flatten()
-        .filter(|e| e.path().is_file())
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .collect();
-    names.sort();
-    names
 }
 
 /// 免安装 zip 版判据（票 18 第 26 条）：NSIS 装出来的 exe 在
@@ -356,7 +345,16 @@ mod tests {
     }
 
     #[test]
-    fn list_files_of_a_missing_dir_is_empty_not_an_error() {
-        assert!(list_files(std::path::Path::new("C:\\definitely\\not\\here")).is_empty());
+    fn about_reports_an_empty_rollback_for_a_dir_that_was_never_used() {
+        // 「关于」那一格的回退指引来自 dist::update：数据目录里还没有 updates\installers\ 时
+        // 应当是空清单 + 一条可执行的指引，而不是报错（票 61）。
+        let rb = crate::dist::update::rollback(
+            std::path::Path::new("C:\\definitely\\not\\here"),
+            "0.1.0",
+        );
+        assert!(rb.packages.is_empty());
+        assert!(rb.previous.is_none());
+        assert!(rb.guide.contains("退出"), "{}", rb.guide);
+        assert!(rb.guide.contains("当初下载"), "{}", rb.guide);
     }
 }

@@ -17,3 +17,7 @@ anyhow = "1"
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 # 单实例：第二次启动被挡住并把已有窗口提到前面；不开 semver feature（票 18 §2）。
 tauri-plugin-single-instance = "2"
+# 自动升级（票 61）：检查 / 下载 / 验签 / passive 静默安装 + 装完自动重启。配置在
+# tauri.conf.json 的 `plugins.updater`（https 强制、requireSignedVersion、installMode=passive）；
+# 本地闭环验收用的 http 端点只在 tauri.conf.test.json（`--config` 覆盖）里，不进生产配置。
+tauri-plugin-updater = "2"

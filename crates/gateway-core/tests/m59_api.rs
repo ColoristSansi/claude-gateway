@@ -125,6 +125,8 @@ impl Harness {
             version: "0.1.0-test".into(),
             forwarding: Some(proxy.clone()),
             admin: Some(admin),
+            // 票 61 的升级面：要 Tauri updater 插件，这里不挂（/api/update/* 是 503）。
+            updater: None,
             maintenance: Some(Maintenance::with_autostart_value(
                 store.clone(),
                 root.clone(),
@@ -637,7 +639,12 @@ async fn settings_page_reads_and_writes_its_fields() {
         !a["portable"]["note"].as_str().unwrap().is_empty(),
         "免安装提示不能空着：{a}"
     );
-    assert_eq!(a["update"]["supported"], false);
+    // 票 61 把「检查更新」接上了：这一格从占位（false）改成真接上（true），文案也换成真的。
+    assert_eq!(a["update"]["supported"], true);
+    assert!(
+        a["update"]["note"].as_str().unwrap().contains("签名"),
+        "文案要说清签名校验不可关：{a}"
+    );
 
     // 端口那一项走的是 `/api/gateway/port` 同一段 `apply_port_change`（写库 + 同步已生效客户端）。
     // 这一档没有外壳，按新端口重启那一半不做（真实应用里由外壳做）。

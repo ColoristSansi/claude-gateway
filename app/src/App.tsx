@@ -20,6 +20,7 @@ import { ModelsPage } from './pages/ModelsPage';
 import { OverviewPage } from './pages/OverviewPage';
 import { SettingsPage } from './pages/SettingsPage';
 import { UpstreamsPage } from './pages/UpstreamsPage';
+import { UpdateBanner } from './UpdateBanner';
 import { UsagePage } from './pages/UsagePage';
 
 type PageDef = {
@@ -222,6 +223,10 @@ export function App() {
           </button>
         </div>
       )}
+
+      {/* 升级横幅（票 61）：有新版 / 正在静默安装 / 升级失败时才出现。
+          设置页（票 59）那格「关于」直接显示 status.rollback.guide 与 installersDir。 */}
+      <UpdateBanner />
 
       <div className="layout">
         <nav className="nav">

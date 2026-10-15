@@ -70,6 +70,8 @@ impl H {
             forwarding: Some(forwarding),
             admin: Some(admin),
             maintenance: None,
+            // 票 61 的升级面：要 Tauri updater 插件，这里不挂（/api/update/* 是 503）。
+            updater: None,
         })
         .await
         .expect(tag);

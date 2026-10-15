@@ -16,6 +16,7 @@ import {
   type DistInfo,
   type ImportReport,
   type SettingsView,
+  type UpdateStatus,
 } from '../api';
 import { ErrorBlock, formatTime } from '../components';
 import { setCurrency } from '../currency';
@@ -51,6 +52,12 @@ export function SettingsPage() {
   const [overwrite, setOverwrite] = useState(false);
   const [importReport, setImportReport] = useState<ImportReport | null>(null);
 
+  // 检查更新（票 61）：设置页这一个按钮打的就是顶栏横幅用的那两个接口。
+  const [update, setUpdate] = useState<UpdateStatus | null>(null);
+  const [updateBusy, setUpdateBusy] = useState(false);
+  const [updateNote, setUpdateNote] = useState<string | null>(null);
+  const [updateConfirm, setUpdateConfirm] = useState(false);
+
   const apply = useCallback((s: SettingsView) => {
     setSettings(s);
     setBody(s.bodyRecording);
@@ -74,7 +81,42 @@ export function SettingsPage() {
     void load();
     void api.distInfo().then(setDist).catch(() => setDist(null));
     void api.about().then(setAbout).catch(() => setAbout(null));
+    void api.updateStatus().then(setUpdate).catch(() => setUpdate(null));
   }, [load]);
+
+  /** 检查更新（票 61）：查不动就把后端那句人话原样显示，不吞。 */
+  async function checkUpdate() {
+    setUpdateBusy(true);
+    setUpdateNote(null);
+    try {
+      const s = await api.updateCheck();
+      setUpdate(s);
+      setUpdateNote(
+        s.available
+          ? `发现新版本 ${s.available.version}（当前 ${s.currentVersion}）。`
+          : `已经是最新版本（当前 ${s.currentVersion}）。`,
+      );
+    } catch (e) {
+      setUpdateNote(e instanceof Error ? e.message : String(e));
+    } finally {
+      setUpdateBusy(false);
+    }
+  }
+
+  /** 下载 + 验签 + 静默安装：**立刻应答**，之后进程会被安装器接管并自动重启。 */
+  async function installUpdate() {
+    setUpdateConfirm(false);
+    setUpdateBusy(true);
+    setUpdateNote(null);
+    try {
+      setUpdate(await api.updateInstall());
+      setUpdateNote('正在下载并静默安装，装完会自动重启（数据 / 端口 / 客户端配置都不动）。');
+    } catch (e) {
+      setUpdateNote(e instanceof Error ? e.message : String(e));
+    } finally {
+      setUpdateBusy(false);
+    }
+  }
 
   /** 一次保存：写回后把草稿值对齐后端真值（不乐观更新）。 */
   async function save(what: string, patch: Parameters<typeof api.saveSettings>[0]) {
@@ -562,9 +604,35 @@ export function SettingsPage() {
               </>
             )}
             <div className="actions">
-              <button type="button" disabled title="自动更新归票 61，这一版还没接">
-                检查更新（未接）
-              </button>
+              {update?.available ? (
+                updateConfirm ? (
+                  <>
+                    <span className="muted">
+                      确认后静默安装 {update.available.version} 并自动重启（数据、端口、客户端配置都不动）？
+                    </span>
+                    <button type="button" onClick={() => void installUpdate()} disabled={updateBusy}>
+                      确认安装
+                    </button>
+                    <button type="button" onClick={() => setUpdateConfirm(false)}>取消</button>
+                  </>
+                ) : (
+                  <button type="button" onClick={() => setUpdateConfirm(true)} disabled={updateBusy}>
+                    下载并安装 {update.available.version}
+                  </button>
+                )
+              ) : (
+                <button type="button" onClick={() => void checkUpdate()} disabled={updateBusy}>
+                  {updateBusy ? '检查中…' : '检查更新'}
+                </button>
+              )}
+              {update?.installing ? (
+                <span className="muted">
+                  正在{update.totalBytes ? `下载 ${Math.round((update.downloadedBytes / update.totalBytes) * 100)}%` : '下载'}
+                  {update.installingPackage ? ` · 正在静默安装 ${update.installingPackage}` : ''}
+                  ，装完会自动重启。
+                </span>
+              ) : null}
+              <Notice text={updateNote ?? update?.error ?? null} bad={Boolean(update?.error)} />
             </div>
           </div>
         </div>

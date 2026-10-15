@@ -119,6 +119,8 @@ async fn three_step_path_with_a_real_upstream() {
         admin: Some(admin.clone()),
         // 票 62 的维护面：这一格只测票 52 的验收面，不挂。
         maintenance: None,
+        // 票 61 的升级面：要 Tauri updater 插件，这里不挂。
+        updater: None,
     })
     .await
     .unwrap();

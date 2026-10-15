@@ -3,6 +3,7 @@
 
 mod maint;
 mod shell;
+mod updater;
 
 fn main() {
     // 无界面维护动作（票 62）：导出 / 导入 / 自启开关 / 卸载时还原客户端配置。
@@ -18,6 +19,10 @@ fn main() {
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             shell::show_main_window(app)
         }))
+        // 自动升级（票 61）：配置在 tauri.conf.json 的 `plugins.updater`（https 强制、
+        // requireSignedVersion、windows.installMode = passive）。这里只注册，动作由
+        // `shell::setup` 建句柄后接进管理 API 与启动时的静默检查。
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(shell::setup)
         // 票 52：网关没在跑时（`/api/*` 发不出去）前端走这三条 IPC 启动 / 换端口。
         .invoke_handler(tauri::generate_handler![

@@ -536,6 +536,33 @@ table.logs tr.bad td {
   color: #c0392b;
 }
 
+/* 升级横幅（票 61）：有新版本 / 正在静默安装 / 升级失败时才出现。 */
+.update-banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 16px;
+  border-bottom: 1px solid #8884;
+  background: #2e7d3215;
+}
+
+.update-banner button {
+  font: inherit;
+  padding: 3px 10px;
+  cursor: pointer;
+}
+
+.update-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.update-error {
+  color: #c0392b;
+  white-space: pre-wrap;
+}
 /* ── 票 59：用量页的条形图 / 日志详情抽屉 / 设置页 ── */
 
 .bar-row {
