@@ -274,6 +274,9 @@ pub async fn status(
 
     let any_exists = inspects.iter().any(|i| i.exists);
     let all_gateway = !inspects.is_empty() && inspects.iter().all(FileInspect::is_gateway_state);
+    // 「没有网关键」= **网关写下去的值一个都不在了**，不是「文件里一个键都没有」：
+    // Desktop 的 `_meta.json` 还原后 `appliedId` 必须指回某个档案（`Default`），
+    // 那一行永远在（票 55 现场实测：按「一个键都没有」判会把「已回官方」误报成「值不匹配」）。
     let no_gateway_keys = inspects.iter().all(FileInspect::has_no_gateway_keys);
     let restored = {
         let mut rows = Vec::new();
