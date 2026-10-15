@@ -1,0 +1,12 @@
+data: {"id":"chatcmpl-mock-toolresult","object":"chat.completion.chunk","created":0,"model":"mock-upstream","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-mock-toolresult","object":"chat.completion.chunk","created":0,"model":"mock-upstream","choices":[{"index":0,"delta":{"content":"上海现在晴，26 度。"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-mock-toolresult","object":"chat.completion.chunk","created":0,"model":"mock-upstream","choices":[{"index":0,"delta":{"content":"要不要带伞看你去哪。"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-mock-toolresult","object":"chat.completion.chunk","created":0,"model":"mock-upstream","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"id":"chatcmpl-mock-toolresult","object":"chat.completion.chunk","created":0,"model":"mock-upstream","choices":[],"usage":{"prompt_tokens":64,"completion_tokens":21,"total_tokens":85,"prompt_tokens_details":{"cached_tokens":0}}}
+
+data: [DONE]
+

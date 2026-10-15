@@ -1,0 +1,2 @@
+data: {"id":"chatcmpl-mock-hardcut","object":"chat.completion.chunk","created":0,"model":"mock-upstream","choices":[{"index":0,"delta":{"role":"assistant","content":"说到一半"},"finish_reason":null}]}
+
