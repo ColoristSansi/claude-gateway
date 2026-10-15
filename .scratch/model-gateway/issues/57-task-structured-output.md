@@ -28,8 +28,9 @@ Blocked by: 49, 51
 
 ## Answer
 
-（2026-10-15，`task/57-structured-output`，基于集成分支 `f630830`，收工前已并
-`integration/model-gateway`，冲突就地解决、门禁在合并后的树上重跑全绿）
+（2026-10-15，`task/57-structured-output`，基于集成分支 `f630830`，工作提交 `459fba2`；
+收工前已并 `integration/model-gateway`（`42f33ff`）成 `c5e8559`，无冲突；门禁与两条真上游的
+探针都在合并后的树上重跑过，全绿）
 
 ### 做了什么
 
