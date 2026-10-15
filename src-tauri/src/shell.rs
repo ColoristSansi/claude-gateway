@@ -93,6 +93,8 @@ pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
         port,
         db_path: db_path.clone(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        // 转发面（`/v1/*`）的状态：供应商表与绑定表来自票 49 / 51，外壳这里先只起管理面。
+        forwarding: None,
     };
 
     // 网关与外壳同进程（票 18 §2 定案：不是 sidecar）。

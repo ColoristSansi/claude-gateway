@@ -1,0 +1,74 @@
+{
+  "scenario": "toolresult",
+  "outbound_wire": "openai",
+  "upstream": "mock",
+  "model": "mock-toolresult",
+  "origin": "authored",
+  "recorded_at": "2026-10-15T00:00:00Z",
+  "request": {
+    "model": "mock-openai-toolresult",
+    "max_tokens": 256,
+    "stream": true,
+    "tools": [
+      {
+        "name": "get_weather",
+        "description": "查天气",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "city": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "content": "帮我看看上海天气"
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "我查一下。"
+          },
+          {
+            "type": "tool_use",
+            "id": "toolu_1",
+            "name": "get_weather",
+            "input": {
+              "city": "上海"
+            }
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "tool_result",
+            "tool_use_id": "toolu_1",
+            "content": "晴 26 度"
+          },
+          {
+            "type": "text",
+            "text": "那要带伞吗？"
+          }
+        ]
+      }
+    ]
+  },
+  "expect": {
+    "status": 200,
+    "last_event": "message_stop"
+  },
+  "quirks": [],
+  "masks": [
+    "message.id"
+  ],
+  "chunks": [],
+  "changed_why": ""
+}

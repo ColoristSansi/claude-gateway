@@ -1,0 +1,4 @@
+data: {"id":"chatcmpl-mock-abort","object":"chat.completion.chunk","created":0,"model":"mock-upstream","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-mock-abort","object":"chat.completion.chunk","created":0,"model":"mock-upstream","choices":[{"index":0,"delta":{"content":"说到一半就断了"},"finish_reason":null}]}
+
