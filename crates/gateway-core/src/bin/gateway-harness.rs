@@ -282,7 +282,7 @@ async fn main() -> anyhow::Result<()> {
     let table = binding::load(&store).await?;
     let catalog = provider::catalog_map(&store).await?;
 
-    let gw = Gateway::new(store, s.upstreams, table);
+    let mut gw = Gateway::new(store, s.upstreams, table);
     gw.set_catalog(catalog);
     gw.ping = Duration::from_secs(env_u64("GATEWAY_PING_SECS", 15));
     gw.probe = Duration::from_secs(env_u64("GATEWAY_PROBE_SECS", 20));

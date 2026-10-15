@@ -196,12 +196,16 @@ impl Quirk {
         }
     }
 
+    /// 解析 quirk 名（规范名是 [`Quirk::name`] 的 PascalCase；spec §6 样例与手写 JSON 里的
+    /// camelCase 也认，免得把「写对了意思、写错了大小写」的配置静默丢掉）。
     pub fn parse(name: &str, arg: &str) -> Option<Quirk> {
         match name {
-            "ClientUserAgent" => Some(Quirk::ClientUserAgent(arg.to_string())),
-            "SessionIdHeader" => Some(Quirk::SessionIdHeader(arg.to_string())),
-            "NoModelsEndpoint" => Some(Quirk::NoModelsEndpoint),
-            "ModelsListNeedsCredential" => Some(Quirk::ModelsListNeedsCredential),
+            "ClientUserAgent" | "clientUserAgent" => Some(Quirk::ClientUserAgent(arg.to_string())),
+            "SessionIdHeader" | "sessionIdHeader" => Some(Quirk::SessionIdHeader(arg.to_string())),
+            "NoModelsEndpoint" | "noModelsEndpoint" => Some(Quirk::NoModelsEndpoint),
+            "ModelsListNeedsCredential" | "modelsListNeedsCredential" => {
+                Some(Quirk::ModelsListNeedsCredential)
+            }
             "TemperatureMax2" => Some(Quirk::TemperatureMax2),
             "EmptyThinkingSignature" => Some(Quirk::EmptyThinkingSignature),
             "SilentTruncate" => Some(Quirk::SilentTruncate),
@@ -1097,7 +1101,10 @@ pub async fn delete_upstream_forced(store: &Store, id: &str) -> Result<usize> {
     store
         .write(move |c| {
             let tx = c.transaction()?;
-            tx.execute("DELETE FROM virtual_models WHERE upstream_id=?1", params![id])?;
+            tx.execute(
+                "DELETE FROM virtual_models WHERE upstream_id=?1",
+                params![id],
+            )?;
             tx.execute("DELETE FROM upstreams WHERE id=?1", params![id])?;
             tx.commit()?;
             Ok(())
@@ -1180,7 +1187,11 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
 
 /// 把一条预填变成一张还没保存的上游表（向导第②步的起点）。
 pub fn preset_to_upstream(preset: &ProviderPreset) -> Upstream {
-    let mut up = Upstream::new(preset.id.clone(), preset.name.clone(), preset.base_url.clone());
+    let mut up = Upstream::new(
+        preset.id.clone(),
+        preset.name.clone(),
+        preset.base_url.clone(),
+    );
     up.path_templates.clear();
     for (wire, path) in &preset.paths {
         if let Some(w) = Wire::parse(wire) {

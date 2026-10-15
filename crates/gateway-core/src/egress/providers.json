@@ -26,8 +26,8 @@
     },
     "auth": { "default": "bearer" },
     "quirks": [
-      ["clientUserAgent", "claude-gateway/0.1"],
-      ["modelsListNeedsCredential", ""]
+      ["ClientUserAgent", "claude-gateway/0.1"],
+      ["ModelsListNeedsCredential", ""]
     ],
     "note": "一个模型只属于一个 API family，发错端点直接报错；模型清单只认带凭据那份（未授权的全量列表勾了会 403）。",
     "docUrl": "https://opencode.ai/v2/docs/console/api/inference/"
@@ -44,8 +44,8 @@
     },
     "auth": { "default": "bearer" },
     "quirks": [
-      ["clientUserAgent", "claude-gateway/0.1"],
-      ["sessionIdHeader", "x-opencode-session"]
+      ["ClientUserAgent", "claude-gateway/0.1"],
+      ["SessionIdHeader", "x-opencode-session"]
     ],
     "note": "Go 面要求专属 UA 与会话头；/models 在 <base>/v1/models。",
     "docUrl": "https://opencode.ai/v2/docs/console/go/"
@@ -59,7 +59,7 @@
       "anthropic": "/v1/messages"
     },
     "auth": { "default": "x-api-key" },
-    "quirks": [["noModelsEndpoint", ""]],
+    "quirks": [["NoModelsEndpoint", ""]],
     "note": "Anthropic 兼容端点只有 /v1/messages，没有 /v1/models（模型发现必然 404，手填模型 ID）。baseUrl 不要带 /v1。Token Plan 用 token-plan. 前缀的域名与 sk-sp- key。",
     "docUrl": "https://platform.qianwenai.com/docs/api-reference/chat/anthropic"
   },

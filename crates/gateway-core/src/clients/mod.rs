@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Result};
 use serde::Serialize;
 
-use crate::binding::Profile;
 use crate::binding::ExposedModel;
+use crate::binding::Profile;
 use crate::store::Store;
 use crate::writer::{
     claude_code, codex, desktop, ConflictMode, FileInspect, FileSpec, WriteReport, WriteRoots,
@@ -211,10 +211,7 @@ pub struct ClientStatus {
 }
 
 /// 一份文件实读 + 记录（四次读盘，不缓存）。
-async fn inspect_file(
-    writer: &Writer,
-    spec: &FileSpec,
-) -> Result<(FileInspect, ClientFileStatus)> {
+async fn inspect_file(writer: &Writer, spec: &FileSpec) -> Result<(FileInspect, ClientFileStatus)> {
     let inspect = writer.inspect(spec).await;
     let rec = writer.recorded(&spec.client, &spec.rel_path).await?;
     let status = ClientFileStatus {
@@ -258,7 +255,12 @@ pub fn specs(
 }
 
 /// 实读三张卡（或一张）：**每次进页面都调它**，没有缓存。
-pub async fn status(env: &ClientEnv, store: &Store, id: ClientId, v: &GatewayValues) -> Result<ClientStatus> {
+pub async fn status(
+    env: &ClientEnv,
+    store: &Store,
+    id: ClientId,
+    v: &GatewayValues,
+) -> Result<ClientStatus> {
     let writer = env.writer(store, id);
     let specs = specs(env, store, id, v)?;
 
@@ -300,7 +302,8 @@ pub async fn status(env: &ClientEnv, store: &Store, id: ClientId, v: &GatewayVal
     match id {
         ClientId::Desktop => {
             notes.push(
-                "配置改完必须**完全退出并重开** Claude Desktop 才生效（它不做热重载）。".to_string(),
+                "配置改完必须**完全退出并重开** Claude Desktop 才生效（它不做热重载）。"
+                    .to_string(),
             );
             notes.push(
                 "「未登录」不是错误：3P 用静态 API key，允许占位（§8.3），与 1P 的登录态互不影响。"
@@ -312,13 +315,19 @@ pub async fn status(env: &ClientEnv, store: &Store, id: ClientId, v: &GatewayVal
             );
         }
         ClientId::ClaudeCode => {
-            notes.push("只写 ANTHROPIC_AUTH_TOKEN（写 ANTHROPIC_API_KEY 需一次交互批准，会静默失灵）。".to_string());
+            notes.push(
+                "只写 ANTHROPIC_AUTH_TOKEN（写 ANTHROPIC_API_KEY 需一次交互批准，会静默失灵）。"
+                    .to_string(),
+            );
             notes.push("「未登录」不是错误：Claude Code 零凭据也能用网关（§8.3）。".to_string());
         }
         ClientId::Codex => {
-            notes.push("Codex CLI 与桌面应用**同一张卡**（共用 ~/.codex/config.toml）。".to_string());
             notes.push(
-                "改完要完全退出重开；「未登录」只影响云线程，不影响模型选择器与网关请求。".to_string(),
+                "Codex CLI 与桌面应用**同一张卡**（共用 ~/.codex/config.toml）。".to_string(),
+            );
+            notes.push(
+                "改完要完全退出重开；「未登录」只影响云线程，不影响模型选择器与网关请求。"
+                    .to_string(),
             );
             notes.push(
                 "目录文件（model_catalog_json）不是网关写的那份时按冲突处理：先「放弃」，确认后才「认领并覆盖」。"
@@ -430,15 +439,19 @@ fn report(
                 Some(backup.to_string_lossy().to_string()),
                 notice.clone(),
                 format!(
-                    "{}：已写入（{}备份 {}）{}",
+                    "{}：已写入{}；备份：{}{}",
                     abs.display(),
-                    if *first_write { "首次接管，" } else { "" },
-                    if *marker_only {
-                        "无原文件，只记 marker"
+                    if *first_write {
+                        "（首次接管）"
                     } else {
-                        "见"
+                        ""
                     },
-                    notice.clone().map(|n| format!("；{n}")).unwrap_or_default()
+                    backup.display(),
+                    if *marker_only {
+                        "（原文件不存在，只记 marker）"
+                    } else {
+                        ""
+                    },
                 ),
             ),
             crate::writer::FileOutcome::Removed { backup, .. } => (

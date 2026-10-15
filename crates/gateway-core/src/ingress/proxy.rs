@@ -64,9 +64,18 @@ impl std::fmt::Debug for Gateway {
     /// 只报条数与旋钮。
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Gateway")
-            .field("upstreams", &self.upstreams.read().map(|t| t.len()).unwrap_or(0))
-            .field("catalog", &self.catalog.read().map(|t| t.len()).unwrap_or(0))
-            .field("bindings", &self.bindings.read().map(|t| t.len()).unwrap_or(0))
+            .field(
+                "upstreams",
+                &self.upstreams.read().map(|t| t.len()).unwrap_or(0),
+            )
+            .field(
+                "catalog",
+                &self.catalog.read().map(|t| t.len()).unwrap_or(0),
+            )
+            .field(
+                "bindings",
+                &self.bindings.read().map(|t| t.len()).unwrap_or(0),
+            )
             .field("ping", &self.ping)
             .field("probe", &self.probe)
             .finish_non_exhaustive()
@@ -119,10 +128,8 @@ impl Gateway {
         let upstreams = crate::egress::provider::list_upstreams(&self.store).await?;
         let catalog = crate::egress::provider::catalog_map(&self.store).await?;
         let bindings = crate::binding::load(&self.store).await?;
-        *self.upstreams.write().unwrap_or_else(|e| e.into_inner()) = upstreams
-            .into_iter()
-            .map(|u| (u.id.clone(), u))
-            .collect();
+        *self.upstreams.write().unwrap_or_else(|e| e.into_inner()) =
+            upstreams.into_iter().map(|u| (u.id.clone(), u)).collect();
         self.set_catalog(catalog);
         *self.bindings.write().unwrap_or_else(|e| e.into_inner()) = bindings;
         Ok(())

@@ -24,7 +24,10 @@ pub fn routes() -> Router<ApiState> {
     Router::new()
         .route("/api/providers", get(list_providers))
         .route("/api/upstreams", get(list_upstreams).post(create_upstream))
-        .route("/api/upstreams/{id}", put(update_upstream).delete(remove_upstream))
+        .route(
+            "/api/upstreams/{id}",
+            put(update_upstream).delete(remove_upstream),
+        )
         .route("/api/upstreams/{id}/references", get(references))
         .route(
             "/api/upstreams/{id}/credentials",
@@ -36,10 +39,7 @@ pub fn routes() -> Router<ApiState> {
             get(list_models).post(add_manual_model),
         )
         .route("/api/upstreams/{id}/selftest", post(selfcheck))
-        .route(
-            "/api/upstreams/{id}/models/{model}/prices",
-            put(set_prices),
-        )
+        .route("/api/upstreams/{id}/models/{model}/prices", put(set_prices))
         .layer(DefaultBodyLimit::max(4 * 1024 * 1024))
 }
 
@@ -60,7 +60,7 @@ async fn list_providers(State(state): State<ApiState>) -> Result<Json<Value>, Ap
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
         })
         .await
-        .map_err(|e| ApiFailure::from(e))?;
+        .map_err(ApiFailure::from)?;
     Ok(ok_json(json!({
         "presets": presets,
         "snapshot": snapshot,
@@ -130,7 +130,10 @@ async fn create_upstream(
     let admin = admin(&state)?;
     let up = upstream_from_body(&body, None)?;
     if up.id.trim().is_empty() {
-        return Err(bad_request("上游 id 不能为空", "向导第②步应当带一个 id（可用 baseUrl 生成）"));
+        return Err(bad_request(
+            "上游 id 不能为空",
+            "向导第②步应当带一个 id（可用 baseUrl 生成）",
+        ));
     }
     if provider::load_upstream(&admin.store, &up.id)
         .await
@@ -152,7 +155,10 @@ async fn create_upstream(
     admin.reload_forwarding().await.map_err(ApiFailure::from)?;
     let saved = save_credentials(&admin.store, &up.id, &body).await?;
     let view = view(&admin.store, &up).await?;
-    Ok((StatusCode::CREATED, ok_json(json!({"upstream": view, "credentialsSaved": saved}))))
+    Ok((
+        StatusCode::CREATED,
+        ok_json(json!({"upstream": view, "credentialsSaved": saved})),
+    ))
 }
 
 /// 改上游（声明式字段；凭据走 `PUT /credentials`）。
@@ -174,7 +180,9 @@ async fn update_upstream(
     admin.reload_forwarding().await.map_err(ApiFailure::from)?;
     let saved = save_credentials(&admin.store, &id, &body).await?;
     let view = view(&admin.store, &up).await?;
-    Ok(ok_json(json!({"upstream": view, "credentialsSaved": saved})))
+    Ok(ok_json(
+        json!({"upstream": view, "credentialsSaved": saved}),
+    ))
 }
 
 /// 删上游：仍被引用时 409 + 引用处；`?force=true`（用户在弹窗里确认过）才连绑定一起删。
@@ -189,13 +197,17 @@ async fn remove_upstream(
             .await
             .map_err(ApiFailure::from)?;
         admin.reload_forwarding().await.map_err(ApiFailure::from)?;
-        return Ok(ok_json(json!({"deleted": true, "bindingsRemoved": removed})));
+        return Ok(ok_json(
+            json!({"deleted": true, "bindingsRemoved": removed}),
+        ));
     }
     match provider::delete_upstream(&admin.store, &id)
         .await
         .map_err(ApiFailure::from)?
     {
-        provider::DeleteOutcome::Deleted => Ok(ok_json(json!({"deleted": true, "bindingsRemoved": 0}))),
+        provider::DeleteOutcome::Deleted => {
+            Ok(ok_json(json!({"deleted": true, "bindingsRemoved": 0})))
+        }
         // 409 那条带引用处：前端弹窗列出引用处（票 17 第 39 条）。
         provider::DeleteOutcome::Referenced(refs) => Err(ApiFailure::new(
             StatusCode::CONFLICT,
@@ -338,7 +350,9 @@ async fn list_models(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiFailure> {
     let admin = admin(&state)?;
-    Ok(ok_json(json!({ "models": models_view(&admin.store, &id).await? })))
+    Ok(ok_json(
+        json!({ "models": models_view(&admin.store, &id).await? }),
+    ))
 }
 
 async fn models_view(store: &Store, id: &str) -> Result<Vec<Value>, ApiFailure> {
@@ -384,7 +398,10 @@ async fn add_manual_model(
         .trim()
         .to_string();
     if model_id.is_empty() {
-        return Err(bad_request("模型 ID 不能为空", "手填模型 ID 的输入框是空的"));
+        return Err(bad_request(
+            "模型 ID 不能为空",
+            "手填模型 ID 的输入框是空的",
+        ));
     }
     let wires = parse_wires(&body)?;
     provider::save_manual_model(&admin.store, &id, &model_id, &wires)
@@ -459,7 +476,9 @@ async fn pick_probe_target(
     body: &Value,
 ) -> Result<(Wire, String), ApiFailure> {
     if let (Some(w), Some(m)) = (
-        body.get("wire").and_then(Value::as_str).and_then(Wire::parse),
+        body.get("wire")
+            .and_then(Value::as_str)
+            .and_then(Wire::parse),
         body.get("model").and_then(Value::as_str),
     ) {
         if !m.trim().is_empty() {
@@ -548,7 +567,10 @@ async fn save_credentials(
     let mut saved = Vec::new();
     if let Some(list) = body.get("credentials").and_then(Value::as_array) {
         for item in list {
-            let wire = item.get("wire").and_then(Value::as_str).unwrap_or("default");
+            let wire = item
+                .get("wire")
+                .and_then(Value::as_str)
+                .unwrap_or("default");
             let key = item.get("key").and_then(Value::as_str).unwrap_or_default();
             if key.trim().is_empty() {
                 continue;
@@ -568,14 +590,11 @@ async fn save_credentials(
 
 /// 请求体 → 上游表。`base` 给了就是编辑（未提到的字段保持原值），否则从预填表或空表起步。
 fn upstream_from_body(body: &Value, base: Option<Upstream>) -> Result<Upstream, ApiFailure> {
-    let preset = body
-        .get("presetId")
-        .and_then(Value::as_str)
-        .and_then(|id| {
-            provider::provider_presets()
-                .into_iter()
-                .find(|p| p.id == id)
-        });
+    let preset = body.get("presetId").and_then(Value::as_str).and_then(|id| {
+        provider::provider_presets()
+            .into_iter()
+            .find(|p| p.id == id)
+    });
     let mut up = match (base, preset) {
         (Some(mut up), _) => {
             up.last_pull = None;
@@ -650,8 +669,7 @@ fn parse_wires(body: &Value) -> Result<Vec<Wire>, ApiFailure> {
     let Some(list) = body.get("wires").and_then(Value::as_array) else {
         return Ok(Vec::new());
     };
-    Ok(list
-        .iter()
+    list.iter()
         .filter_map(Value::as_str)
         .map(|w| {
             Wire::parse(w).ok_or_else(|| {
@@ -661,7 +679,7 @@ fn parse_wires(body: &Value) -> Result<Vec<Wire>, ApiFailure> {
                 )
             })
         })
-        .collect::<Result<Vec<_>, _>>()?)
+        .collect::<Result<Vec<_>, _>>()
 }
 
 fn parse_prices(body: &Value) -> Result<provider::Prices, ApiFailure> {

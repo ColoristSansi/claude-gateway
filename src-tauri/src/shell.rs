@@ -71,12 +71,12 @@ pub fn load_port(data_dir: &Path) -> u16 {
 /// 库里的端口（票 52 起 `settings.port` 是唯一真相）；读不到回 `None`，由 [`load_port`] 兜底。
 pub fn port_from_store(store: &Store) -> Option<u16> {
     let value = tauri::async_runtime::block_on(store.read(|c| {
-        Ok(c.query_row(
-            "SELECT value FROM settings WHERE key='port'",
-            [],
-            |r| r.get::<_, String>(0),
+        Ok(
+            c.query_row("SELECT value FROM settings WHERE key='port'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .ok(),
         )
-        .ok())
     }))
     .ok()
     .flatten()?;
@@ -143,9 +143,7 @@ fn current_port() -> u16 {
 }
 
 /// 读库里的上游 / 目录 / 绑定表，装出转发面（起不来就只挂管理面）。
-async fn build_forwarding(
-    store: &Store,
-) -> Option<Arc<proxy::Gateway>> {
+async fn build_forwarding(store: &Store) -> Option<Arc<proxy::Gateway>> {
     let upstreams = gateway_core::egress::provider::list_upstreams(store).await;
     let catalog = gateway_core::egress::provider::catalog_map(store).await;
     let bindings = gateway_core::binding::load(store).await;
@@ -246,7 +244,10 @@ fn update_tray_status(app: &AppHandle, running: bool, port: u16) {
     }
     if let Some(tray) = app.tray_by_id("main") {
         let _ = tray.set_icon(Some(tray_icon(running)));
-        let _ = tray.set_tooltip(Some(format!("Claude Gateway · {}", status_label(running, port))));
+        let _ = tray.set_tooltip(Some(format!(
+            "Claude Gateway · {}",
+            status_label(running, port)
+        )));
     }
 }
 
@@ -283,12 +284,14 @@ pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
     let admin = match (store.as_ref(), forwarding.as_ref()) {
-        (Some(store), Some(gw)) => {
-            build_admin(app.handle(), &data_dir, store.clone(), &db_path, Some(gw.clone()))
-        }
-        (Some(store), None) => {
-            build_admin(app.handle(), &data_dir, store.clone(), &db_path, None)
-        }
+        (Some(store), Some(gw)) => build_admin(
+            app.handle(),
+            &data_dir,
+            store.clone(),
+            &db_path,
+            Some(gw.clone()),
+        ),
+        (Some(store), None) => build_admin(app.handle(), &data_dir, store.clone(), &db_path, None),
         (None, _) => None,
     };
 
@@ -327,6 +330,57 @@ pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     });
     build_tray(app.handle(), running, port)?;
     Ok(())
+}
+
+/// 前端在**网关根本没在跑**时走的三条 IPC（`/api/*` 那时发不出去）。
+///
+/// 管理面自己那三条 `/api/gateway/*` 是网关在跑时的路径；这两条是同几个动作的无头版。
+#[tauri::command]
+pub async fn gateway_start(app: AppHandle) -> Result<serde_json::Value, String> {
+    let port = current_port();
+    start_gateway(&app, port).await?;
+    Ok(serde_json::json!({ "started": true, "port": port }))
+}
+
+/// 探一个空闲端口（只预填，不写入；std 监听器够用，不必进 runtime）。
+#[tauri::command]
+pub fn gateway_probe_port() -> Result<serde_json::Value, String> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).map_err(|e| e.to_string())?;
+    let suggested = listener.local_addr().map_err(|e| e.to_string())?.port();
+    let current = current_port();
+    let free = std::net::TcpListener::bind(("127.0.0.1", current)).is_ok();
+    Ok(serde_json::json!({
+        "currentPort": current,
+        "currentPortFree": free,
+        "suggestedPort": suggested,
+        "note": "只是预填：确认之后才写入，不静默换端口",
+    }))
+}
+
+/// 用户确认后的换端口：写库 + 同步已生效客户端 + 按新端口重启。
+#[tauri::command]
+pub async fn gateway_change_port(app: AppHandle, port: u16) -> Result<serde_json::Value, String> {
+    let data_dir = store::default_data_dir().map_err(|e| e.to_string())?;
+    let store = Store::open(&data_dir).map_err(|e| e.to_string())?;
+    let env = ClientEnv::production(&data_dir).map_err(|e| e.to_string())?;
+    let outcome = gateway_core::ingress::api::gateway::apply_port_change(
+        &store,
+        &data_dir,
+        &env,
+        current_port(),
+        port,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    stop_gateway(&app);
+    start_gateway(&app, port).await?;
+    Ok(serde_json::json!({
+        "port": outcome.port,
+        "previousPort": outcome.previous_port,
+        "synced": outcome.synced,
+        "failed": outcome.failed,
+        "message": format!("已换到端口 {}，已同步 {} 个客户端", outcome.port, outcome.synced.len()),
+    }))
 }
 
 fn build_tray(app: &AppHandle, running: bool, port: u16) -> tauri::Result<()> {

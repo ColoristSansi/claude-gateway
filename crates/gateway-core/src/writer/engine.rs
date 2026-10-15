@@ -116,16 +116,14 @@ impl Writer {
 
     /// 读 `client_config_state` 里这个「客户端 × 文件」的一行（界面要判「已回官方」与列备份路径）。
     pub async fn recorded(&self, client: &str, rel: &Path) -> Result<Option<RecordedState>> {
-        Ok(
-            state::load(&self.store, client, &rel_key(rel))
-                .await?
-                .map(|r| RecordedState {
-                    last_op: r.last_op,
-                    backup_path: r.backup_path,
-                    existed_at_first_write: r.existed_at_first_write,
-                    last_write_at: r.last_write_at,
-                }),
-        )
+        Ok(state::load(&self.store, client, &rel_key(rel))
+            .await?
+            .map(|r| RecordedState {
+                last_op: r.last_op,
+                backup_path: r.backup_path,
+                existed_at_first_write: r.existed_at_first_write,
+                last_write_at: r.last_write_at,
+            }))
     }
 
     /// 备份目录：`<备份根>\<客户端>`（spec §8.4 第 7 条）。

@@ -118,8 +118,8 @@ async fn keep_mine(
     let admin = admin(&state)?;
     let client = parse_client(&id)?;
     let values = admin.gateway_values().await.map_err(ApiFailure::from)?;
-    let specs = clients::specs(&admin.env, &admin.store, client, &values)
-        .map_err(ApiFailure::from)?;
+    let specs =
+        clients::specs(&admin.env, &admin.store, client, &values).map_err(ApiFailure::from)?;
     let writer = admin.env.writer(&admin.store, client);
     let mut kept = Vec::new();
     for spec in &specs {

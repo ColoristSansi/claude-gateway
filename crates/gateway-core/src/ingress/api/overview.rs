@@ -151,7 +151,7 @@ fn template_for(status: i64, raw: &str) -> Value {
             "retry",
             None,
         ),
-        502 | 503 | 504 => (
+        502..=504 => (
             "连不上上游或上游没及时回",
             "断网 / 上游在维护 / 上游太慢（超时）",
             "重试",
@@ -301,9 +301,8 @@ async fn credential_leak_check(store: &Store, text: &str) -> Option<String> {
     let ids = store
         .read(|c| {
             let mut st = c.prepare("SELECT DISTINCT upstream_id,wire FROM credentials")?;
-            let rows = st.query_map([], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })?;
+            let rows =
+                st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
         })
         .await
@@ -349,12 +348,7 @@ async fn run_acceptance(State(state): State<ApiState>) -> Result<Json<Value>, Ap
         "messages": [{"role": "user", "content": "."}],
     });
     let started = std::time::Instant::now();
-    let sent = admin
-        .http
-        .post(&url)
-        .json(&body)
-        .send()
-        .await;
+    let sent = admin.http.post(&url).json(&body).send().await;
     let elapsed_ms = started.elapsed().as_millis() as u64;
     let (ok, status, raw) = match sent {
         Ok(resp) => {

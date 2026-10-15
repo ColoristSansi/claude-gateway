@@ -42,8 +42,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::binding::BindingTable;
-use crate::obs::{self, BodyLogWindow, LogQuery, BODY_LOG_WINDOW};
 use crate::clients::{ClientEnv, ClientId, GatewayValues};
+use crate::obs::{self, BodyLogWindow, LogQuery, BODY_LOG_WINDOW};
 use crate::store::{settings_keys, Store};
 use crate::writer::claude_code::ModelSlots;
 
@@ -126,7 +126,6 @@ impl AdminCtx {
             real_port: Arc::new(AtomicU16::new(0)),
         }
     }
-
 
     /// 挂上转发面（外壳与集成测试）；改配置的端点会经 [`AdminCtx::reload_forwarding`] 让它
     /// **立刻看到新表**，不必重启网关。
@@ -228,7 +227,7 @@ impl AdminCtx {
 
     /// 绑定表（界面与诊断都要）。
     pub async fn bindings(&self) -> anyhow::Result<BindingTable> {
-        Ok(crate::binding::load(&self.store).await?)
+        crate::binding::load(&self.store).await
     }
 
     /// 探针 / 自检共用一份出站调试日志的目录。
@@ -281,7 +280,6 @@ impl ApiState {
         });
         self
     }
-
 
     /// 带上管理面上下文（外壳与集成测试走这条）。
     pub fn with_admin(mut self, admin: Arc<AdminCtx>) -> Self {
@@ -350,11 +348,90 @@ pub fn router(state: ApiState) -> Router {
         .merge(bindings::routes())
         .merge(clients::routes())
         .merge(gateway::routes())
+        .layer(axum::middleware::from_fn(cors))
         .with_state(state)
+}
+
+/// 管理面的跨源白名单：开发态 Vite（1420）与 Tauri webview 的两个来源。
+///
+/// **不用 `*`**：`/api/*` 能改客户端配置文件，放开给任意网页等于给本机开了个后门。
+/// 只回自己人；不在白名单的来源一个 CORS 头都不给。
+fn allowed_origin(origin: &str) -> bool {
+    matches!(
+        origin,
+        "http://localhost:1420"
+            | "http://127.0.0.1:1420"
+            | "tauri://localhost"
+            | "http://tauri.localhost"
+            | "https://tauri.localhost"
+    )
+}
+
+async fn cors(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let origin = req
+        .headers()
+        .get("origin")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let preflight = req.method() == axum::http::Method::OPTIONS;
+    let mut resp = if preflight {
+        Response::new(axum::body::Body::empty())
+    } else {
+        next.run(req).await
+    };
+    if let Some(origin) = origin.filter(|o| allowed_origin(o)) {
+        let headers = resp.headers_mut();
+        if let Ok(value) = origin.parse() {
+            headers.insert("access-control-allow-origin", value);
+        }
+        headers.insert(
+            "access-control-allow-methods",
+            "GET,POST,PUT,DELETE,OPTIONS".parse().unwrap(),
+        );
+        headers.insert(
+            "access-control-allow-headers",
+            "content-type".parse().unwrap(),
+        );
+        headers.insert("vary", "origin".parse().unwrap());
+    }
+    resp
 }
 
 async fn status(State(state): State<ApiState>) -> Json<GatewayStatus> {
     Json(state.snapshot())
+}
+
+/// 读一条 `settings`（外壳 IPC 在没有 [`AdminCtx`] 时用它）。
+pub async fn setting_of(store: &Store, key: &str) -> Option<String> {
+    let key = key.to_string();
+    store
+        .read(move |c| {
+            Ok(c.query_row(
+                "SELECT value FROM settings WHERE key=?1",
+                rusqlite::params![key],
+                |r| r.get::<_, String>(0),
+            )
+            .ok())
+        })
+        .await
+        .ok()
+        .flatten()
+        .filter(|v| !v.is_empty())
+}
+
+/// 写一条 `settings`。
+pub async fn set_setting_of(store: &Store, key: &str, value: &str) -> anyhow::Result<()> {
+    let (key, value) = (key.to_string(), value.to_string());
+    store
+        .write(move |c| {
+            c.execute(
+                "INSERT INTO settings(key,value) VALUES(?1,?2)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                rusqlite::params![key, value],
+            )?;
+            Ok(())
+        })
+        .await
 }
 
 /// 管理面上下文；没挂（M1 单测那档）就明确报，不 500。
@@ -426,15 +503,21 @@ impl ApiError {
 }
 
 /// 带上 HTTP 状态码的错误信封。
+///
+/// `error` 装箱：`ApiError` 里有几句话（String），不装箱会让每个 `Result<_, ApiFailure>`
+/// 的 Err 变体撑到 150+ 字节（clippy 的 `result_large_err`），handler 遍地都是。
 #[derive(Debug)]
 pub struct ApiFailure {
     pub status: StatusCode,
-    pub error: ApiError,
+    pub error: Box<ApiError>,
 }
 
 impl ApiFailure {
     pub fn new(status: StatusCode, error: ApiError) -> ApiFailure {
-        ApiFailure { status, error }
+        ApiFailure {
+            status,
+            error: Box::new(error),
+        }
     }
 }
 
@@ -442,15 +525,19 @@ impl From<anyhow::Error> for ApiFailure {
     fn from(e: anyhow::Error) -> ApiFailure {
         ApiFailure::new(
             StatusCode::INTERNAL_SERVER_ERROR,
-            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "操作没能完成", "网关内部出错（看原始错误）")
-                .with_raw(e),
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "操作没能完成",
+                "网关内部出错（看原始错误）",
+            )
+            .with_raw(e),
         )
     }
 }
 
 impl IntoResponse for ApiFailure {
     fn into_response(self) -> Response {
-        (self.status, Json(json!({ "error": self.error }))).into_response()
+        (self.status, Json(json!({ "error": self.error.as_ref() }))).into_response()
     }
 }
 
@@ -724,6 +811,4 @@ mod tests {
             assert_eq!(rfc3339_utc(t), want, "epoch {secs}");
         }
     }
-
-
 }

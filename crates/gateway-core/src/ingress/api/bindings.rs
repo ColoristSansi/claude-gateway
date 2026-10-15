@@ -314,9 +314,7 @@ async fn prices_view(store: &Store, upstream: &str, model: &str) -> Result<Value
     let r = provider::resolved_prices(store, upstream, model)
         .await
         .map_err(ApiFailure::from)?;
-    let one = |p: provider::ResolvedPrice| {
-        json!({"usdPerMtok": p.usd_per_mtok, "source": p.source.as_str()})
-    };
+    let one = |p: provider::ResolvedPrice| json!({"usdPerMtok": p.usd_per_mtok, "source": p.source.as_str()});
     Ok(json!({
         "input": one(r.input),
         "output": one(r.output),
@@ -338,7 +336,11 @@ fn str_field(body: &Value, key: &str) -> Result<String, ApiFailure> {
 fn bad(what: impl Into<String>) -> ApiFailure {
     ApiFailure::new(
         StatusCode::BAD_REQUEST,
-        ApiError::new(StatusCode::BAD_REQUEST, what, "检查这一行的三个取值再存一次"),
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            what,
+            "检查这一行的三个取值再存一次",
+        ),
     )
 }
 

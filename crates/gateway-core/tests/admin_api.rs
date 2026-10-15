@@ -95,10 +95,12 @@ async fn mock_upstream() -> String {
     }
 
     async fn chat() -> Json<Value> {
-        Json(json!({"id": "cmpl_mock", "object": "chat.completion", "model": "mock-fast",
+        Json(
+            json!({"id": "cmpl_mock", "object": "chat.completion", "model": "mock-fast",
                     "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"},
                                  "finish_reason": "stop"}],
-                    "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}}))
+                    "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}}),
+        )
     }
     let app = Router::new()
         .route("/models", get(models))
@@ -200,12 +202,11 @@ impl Harness {
 
 /// 起一个能真转发的 proxy（空表也要挂：装配路径与外壳一致）。
 fn proxy_with(store: Store) -> gateway_core::ingress::proxy::Gateway {
-    let gw = gateway_core::ingress::proxy::Gateway::new(
+    gateway_core::ingress::proxy::Gateway::new(
         store,
         std::collections::HashMap::new(),
         gateway_core::binding::BindingTable::default(),
-    );
-    gw
+    )
 }
 
 /// 走完「加上游 → 拉模型 → 自检」三步，回上游 id。
@@ -263,7 +264,12 @@ async fn three_step_path_from_zero_then_acceptance() {
     assert_eq!(badges["ready"], true, "自检过了第一步就该绿");
 
     // ② 绑槽位（目录里选）+ 探针
-    for slot in ["claude-fable", "claude-opus", "claude-sonnet", "claude-haiku"] {
+    for slot in [
+        "claude-fable",
+        "claude-opus",
+        "claude-sonnet",
+        "claude-haiku",
+    ] {
         let (status, body) = h
             .put(
                 &format!("/api/bindings/{slot}"),
@@ -287,7 +293,10 @@ async fn three_step_path_from_zero_then_acceptance() {
         .await;
     assert_eq!(status, 409, "{body}");
     assert!(
-        body["error"]["what"].as_str().unwrap().contains("目录里没有"),
+        body["error"]["what"]
+            .as_str()
+            .unwrap()
+            .contains("目录里没有"),
         "{body}"
     );
 
@@ -297,7 +306,10 @@ async fn three_step_path_from_zero_then_acceptance() {
     assert_eq!(body["client"]["state"], "effective", "{body}");
     let written = std::fs::read_to_string(h.claude_code_file()).expect("切换后文件应当存在");
     assert!(written.contains("ANTHROPIC_BASE_URL"), "{written}");
-    assert!(written.contains(&format!("127.0.0.1:{}", h.gateway.port())), "{written}");
+    assert!(
+        written.contains(&format!("127.0.0.1:{}", h.gateway.port())),
+        "{written}"
+    );
 
     let (_, badges) = h.get("/api/sidebar/badges").await;
     assert_eq!(badges["clientsNotEffective"], 2, "{badges}");
@@ -314,9 +326,14 @@ async fn three_step_path_from_zero_then_acceptance() {
     assert!(acc["logId"].as_i64().is_some(), "{acc}");
 
     // 用量：刚才那次验收在库里留了一行，今日汇总能看见。
-    let (status, usage) = h.get("/api/usage/summary?range=today&dim=virtual_model").await;
+    let (status, usage) = h
+        .get("/api/usage/summary?range=today&dim=virtual_model")
+        .await;
     assert_eq!(status, 200, "{usage}");
-    assert!(usage["totals"]["requests"].as_i64().unwrap() >= 1, "{usage}");
+    assert!(
+        usage["totals"]["requests"].as_i64().unwrap() >= 1,
+        "{usage}"
+    );
     assert_eq!(usage["rows"][0]["key"], "claude-haiku", "{usage}");
 
     // 诊断包：脱敏（密钥明文一个字节都不许出现），且带上上游配置与请求元数据。
@@ -330,8 +347,14 @@ async fn three_step_path_from_zero_then_acceptance() {
     let text = diag["text"].as_str().unwrap();
     assert!(!text.contains("sk-test-secret-DO-NOT-LEAK"), "{text}");
     assert!(text.contains(&mock), "诊断包要带上游地址：{text}");
-    assert!(text.contains("mock-fast") || text.contains("请求元数据"), "{text}");
-    assert!(text.contains("sk-…") || text.contains("…"), "密钥要掩码：{text}");
+    assert!(
+        text.contains("mock-fast") || text.contains("请求元数据"),
+        "{text}"
+    );
+    assert!(
+        text.contains("sk-…") || text.contains("…"),
+        "密钥要掩码：{text}"
+    );
 
     h.stop().await;
 }
@@ -397,7 +420,9 @@ async fn client_states_are_read_from_disk_not_cached() {
     assert_eq!(diff["current"], "http://127.0.0.1:9999", "{diff}");
 
     // 「保留我的修改」：把记录对齐磁盘，之后文件不再被判冲突。
-    let (status, body) = h.post("/api/clients/claude-code/keep-mine", json!({})).await;
+    let (status, body) = h
+        .post("/api/clients/claude-code/keep-mine", json!({}))
+        .await;
     assert_eq!(status, 200, "{body}");
     assert!(body["kept"].as_array().unwrap().len() == 1, "{body}");
 
@@ -415,7 +440,10 @@ async fn client_states_are_read_from_disk_not_cached() {
     // 备份清单列得出来（二次确认弹窗要用）。
     let (status, backups) = h.get("/api/clients/claude-code/backups").await;
     assert_eq!(status, 200, "{backups}");
-    assert!(!backups["backups"].as_array().unwrap().is_empty(), "{backups}");
+    assert!(
+        !backups["backups"].as_array().unwrap().is_empty(),
+        "{backups}"
+    );
 
     h.stop().await;
 }
@@ -453,7 +481,10 @@ async fn port_probe_and_change_syncs_only_effective_clients() {
     assert_eq!(changed["synced"].as_array().unwrap().len(), 1, "{changed}");
     assert_eq!(changed["synced"][0]["id"], "claude-code", "{changed}");
     assert!(
-        changed["message"].as_str().unwrap().contains("已同步 1 个客户端"),
+        changed["message"]
+            .as_str()
+            .unwrap()
+            .contains("已同步 1 个客户端"),
         "{changed}"
     );
     assert_eq!(
@@ -467,7 +498,12 @@ async fn port_probe_and_change_syncs_only_effective_clients() {
     );
 
     // 未生效的那两个一个字节都不动。
-    assert!(!h.root.join("clients").join("codex").join("config.toml").exists());
+    assert!(!h
+        .root
+        .join("clients")
+        .join("codex")
+        .join("config.toml")
+        .exists());
 
     // 端口被占：再换到一个正被占着的端口要报 409。
     let busy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -526,7 +562,10 @@ async fn providers_presets_and_upstream_view_columns() {
     let (status, providers) = h.get("/api/providers").await;
     assert_eq!(status, 200, "{providers}");
     let presets = providers["presets"].as_array().unwrap();
-    assert!(presets.iter().any(|p| p["id"] == "commandcode"), "{providers}");
+    assert!(
+        presets.iter().any(|p| p["id"] == "commandcode"),
+        "{providers}"
+    );
     assert!(
         presets
             .iter()
