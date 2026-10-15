@@ -18,6 +18,7 @@ use std::time::Duration;
 use gateway_core::binding;
 use gateway_core::egress::discovery::*;
 use gateway_core::egress::provider::*;
+use gateway_core::egress::structured;
 use gateway_core::store::Store;
 
 const DEFAULT_ENV: &str =
@@ -757,5 +758,166 @@ async fn ticket58_a_real_cache_write_request_is_logged_and_priced() {
     );
     println!(
         "[t58] cache_write={cache_write} cache_read={cache_read} in={input} out={output} → cost_usd=${cost:.6}（改价后仍是 ${cost:.6}）"
+    );
+}
+
+// ───────────── 票 57 验收 3：结构化输出能力位探针打两条真上游 ─────────────
+
+/// 带敌意提示词的探针在**两条真上游**的各协议面上实测，并给出能力位结论。
+///
+/// 判据不是状态码：`research/structured-output-wires.md` §3.3 实测 commandcode 的 Anthropic
+/// 兼容端点在**6 个变体上全 200 且逐字静默忽略**——所以本测试把**探针原文（提示词 + 上游回答）**
+/// 逐条打出来，那才是「ignore」的证据。
+///
+/// 硬断言只有三条（其余只打印，因为它们的结论取决于上游今天认不认这个面）：
+/// - commandcode 的 Anthropic 面判出 `ignore`（验收要求）；
+/// - 两家的 **Chat 面**判出 `native`（研究 §3.2 实测：敌意提示词被 schema 压过）。
+#[tokio::test]
+#[ignore = "打真上游：cargo test -p gateway-core --test upstream_live -- --ignored --nocapture"]
+async fn ticket57_structured_output_probe_on_live_upstreams() {
+    let env = EnvFile::load();
+    let root = tmp_root("t57-structured");
+    let store = Store::open(&root).expect("开库");
+    let http = reqwest::Client::new();
+
+    let mut oc = live_upstream("opencode", &env.get("OPENCODE_BASE_URL"));
+    // opencode 的 Go 面要求自称 UA + 会话头（票 02 / 19 / 49），不带就是 400 `MissingSessionID`。
+    oc.quirks = vec![
+        Quirk::ClientUserAgent("claude-gateway-prototype/0.0.1".into()),
+        Quirk::SessionIdHeader("x-opencode-session".into()),
+    ];
+    let cc = live_upstream("commandcode", &env.get("COMMANDCODE_BASE_URL"));
+    save_upstream(&store, &oc).await.unwrap();
+    save_upstream(&store, &cc).await.unwrap();
+    store
+        .put_credential("opencode", "default", &env.get("OPENCODE_API_KEY"))
+        .await
+        .unwrap();
+    store
+        .put_credential("commandcode", "default", &env.get("COMMANDCODE_API_KEY"))
+        .await
+        .unwrap();
+
+    // 面上限给宽：opencode 的 Chat 面实测 2～29 秒（票 51 验收 2 记过）。
+    struct Case<'a> {
+        id: &'a str,
+        up: &'a Upstream,
+        wire: Wire,
+        model: &'a str,
+        deadline: Duration,
+        /// `None` = 只打印结论（这个面今天认不认取决于上游）。
+        want: Option<StructuredOutput>,
+    }
+    let cases = [
+        Case {
+            id: "commandcode",
+            up: &cc,
+            wire: Wire::Anthropic,
+            model: "claude-sonnet-5-5",
+            deadline: Duration::from_secs(60),
+            want: Some(StructuredOutput::Ignore),
+        },
+        Case {
+            id: "commandcode",
+            up: &cc,
+            wire: Wire::OpenAiChat,
+            model: "deepseek/deepseek-v4.1-flash",
+            deadline: Duration::from_secs(60),
+            want: Some(StructuredOutput::Native),
+        },
+        Case {
+            id: "opencode",
+            up: &oc,
+            wire: Wire::OpenAiChat,
+            model: "deepseek-v4.1-flash",
+            deadline: Duration::from_secs(120),
+            // 只打印，不硬断言：opencode 的 Go 面**间歇**回 400
+            // `This response_format type is unavailable now`（2026-10-15 22:38 这次实测就撞上）；
+            // 同一份 body 用 curl 直连连发 4 个变体全是 200 且 content = `{"a":"hello"}`
+            // （见票据 Answer 的现场比对），所以结论是 native、那一发 400 是上游自己的调度门。
+            want: None,
+        },
+        // 这两个面只打印：opencode 的 Anthropic 面按研究 §3.3 拿现有凭据是 401（未测出），
+        // commandcode 的 Responses 面认不认 `text.format` 也没实测过。
+        Case {
+            id: "opencode",
+            up: &oc,
+            wire: Wire::Anthropic,
+            model: "claude-haiku-5-5",
+            deadline: Duration::from_secs(60),
+            want: None,
+        },
+        Case {
+            id: "commandcode",
+            up: &cc,
+            wire: Wire::OpenAiResponses,
+            model: "claude-sonnet-5-5",
+            deadline: Duration::from_secs(60),
+            want: None,
+        },
+    ];
+
+    println!("\n===== 票 57：结构化输出能力位探针（带 schema 的最短请求 + 敌意提示词）=====");
+    let mut fails: Vec<String> = Vec::new();
+    for Case {
+        id,
+        up,
+        wire,
+        model,
+        deadline,
+        want,
+    } in cases
+    {
+        let r = structured::probe(&http, &store, up, wire, model, deadline).await;
+        println!(
+            "\n--- {id} / {model} / {} / 上限 {}s ---",
+            wire.as_str(),
+            deadline.as_secs()
+        );
+        println!("提示词原文：{}", r.prompt);
+        println!(
+            "上游回答（status={} / {}ms）：{:?}",
+            r.status, r.elapsed_ms, r.answer
+        );
+        println!(
+            "结论：能力位 = {:?}（{}）",
+            r.mode.map(|m| m.as_str()),
+            r.detail
+        );
+        if let Some(want) = want {
+            if r.mode != Some(want) {
+                fails.push(format!(
+                    "{id} / {model} / {}：期望 {}，实际 {:?}（status={} answer={:?}）",
+                    wire.as_str(),
+                    want.as_str(),
+                    r.mode.map(|m| m.as_str()),
+                    r.status,
+                    r.answer
+                ));
+            }
+        }
+    }
+
+    // 结论落库：能力位按「上游 × 出站协议」各存一份。
+    for id in ["commandcode", "opencode"] {
+        let up = load_upstream(&store, id).await.unwrap().unwrap();
+        for wire in Wire::ALL {
+            println!(
+                "[t57] 库里 {id} / {} → {:?}",
+                wire.as_str(),
+                up.structured_capability(wire)
+                    .map(|c| (c.mode.as_str(), c.source.as_str()))
+            );
+        }
+    }
+    assert!(
+        fails.is_empty(),
+        "结构化输出能力位探针不合格：\n{}",
+        fails.join("\n")
+    );
+    assert!(
+        !dir_contains_bytes(&root, env.get("OPENCODE_API_KEY").as_bytes())
+            && !dir_contains_bytes(&root, env.get("COMMANDCODE_API_KEY").as_bytes()),
+        "库文件里不该出现明文密钥"
     );
 }

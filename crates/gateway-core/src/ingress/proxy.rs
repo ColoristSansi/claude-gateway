@@ -8,7 +8,12 @@
 //! `router()` 是这一面的唯一入口：外壳（票 43 的 `service`）与回放 harness 都挂它，
 //! 不各自拼一套 `/v1/*`。
 
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 use axum::{
     extract::State,
@@ -43,6 +48,9 @@ pub struct Gateway {
     pub bindings: BindingTable,
     /// 日志落点与**出站凭据**的来源（票 42 的 `Store`；密钥 DPAPI 密文入库，明文只在内存）。
     pub store: Store,
+    /// 网关启动时刻：`/api/tags` 与 `/api/show` 的 `modified_at` 缺省值（票 56；绑定的最后
+    /// 修改时间我们没存，spec §4.4 说「无则网关启动时间」）。
+    pub started_at: SystemTime,
     /// 上游静默超过它就向前发一帧 `ping`（票 30 第 6 条）。
     pub ping: Duration,
     /// 探针档（`max_tokens <= PROBE_MAX_TOKENS`）的上游上限（票 26 决定 5）。
@@ -77,6 +85,7 @@ impl Gateway {
             catalog: HashMap::new(),
             bindings,
             store,
+            started_at: SystemTime::now(),
             ping: Duration::from_secs(15),
             probe: binding::PROBE_DEADLINE,
             body_log: Arc::new(crate::obs::BodyLogWindow::new()),
@@ -93,7 +102,7 @@ impl Gateway {
     }
 }
 
-/// 转发面路由（`/v1/*` + 不带 `/v1` 的别名）。
+/// 转发面路由（`/v1/*` + 不带 `/v1` 的别名 + 票 56 的 Ollama `/api/*`）。
 pub fn router() -> Router<Arc<Gateway>> {
     Router::new()
         .route("/v1/messages", post(messages))
@@ -108,6 +117,11 @@ pub fn router() -> Router<Arc<Gateway>> {
         .route("/messages/count_tokens", post(count_tokens))
         .route("/responses", post(responses))
         .route("/models", get(list_models))
+        // 票 56：Ollama 兼容面（`/api/chat` 等五个端点）。
+        .merge(crate::ingress::ollama::router())
+        // `/api/*` 兜底：只吃没被任何具体路由匹配的路径，管理面（票 43 / 53）与原型自用的
+        // `/api/routes` / `/api/echo` 都是具体路由，永远优先（口径差见 `ollama::api_fallback`）。
+        .fallback(crate::ingress::ollama::api_fallback)
 }
 
 /// 入站 Anthropic Messages：Claude Desktop 3P / Claude Code 打的那个端点。
@@ -148,10 +162,7 @@ async fn proxy(
     println!(
         "[in] {} proto={} model={name} profile={} ua={:?} ver={:?} beta={:?}",
         uri.path_and_query().map(|p| p.as_str()).unwrap_or(""),
-        match inbound {
-            Inbound::Anthropic => "anthropic",
-            Inbound::Responses => "responses",
-        },
+        inbound.as_str(),
         profile.id(),
         headers.get("user-agent").and_then(|v| v.to_str().ok()),
         headers
@@ -177,6 +188,28 @@ async fn proxy(
         .get("stream")
         .and_then(|s| s.as_bool())
         .unwrap_or(false);
+    let decoded = match inbound {
+        Inbound::Anthropic => anthropic::decode_request(&body),
+        Inbound::Responses => responses::decode_request(&body),
+        // 只有 `/api/chat` 走 Ollama 解码器，而它不走这里（票 56 自己接的路由）。
+        Inbound::Ollama => crate::ingress::ollama::decode_request(&body),
+    };
+    forward_ir(app, &headers, rt, name, decoded, streaming, inbound).await
+}
+
+/// 转发链的共用尾段（**四个入站协议都走它**）：上游 → 三层校验 → 凭据 → 出站。
+///
+/// 票 56 把这段从 `proxy` 里抽出来，Ollama 面（`/api/chat`）才能复用同一条出站链路，
+/// 而不是自己再拼一套「查凭据 + 早拒 + 转发」。入站协议仍然只决定 decoder 与 encoder。
+pub(crate) async fn forward_ir(
+    app: Arc<Gateway>,
+    headers: &HeaderMap,
+    rt: binding::Binding,
+    name: String,
+    decoded: anyhow::Result<ir::IrRequest>,
+    streaming: bool,
+    inbound: Inbound,
+) -> Response {
     let up = match app.upstreams.get(&rt.upstream_id) {
         Some(u) => u.clone(),
         None => {
@@ -190,10 +223,6 @@ async fn proxy(
     };
     let wire = rt.wire;
 
-    let decoded = match inbound {
-        Inbound::Anthropic => anthropic::decode_request(&body),
-        Inbound::Responses => responses::decode_request(&body),
-    };
     let mut req = match decoded {
         Ok(r) => r,
         Err(e) => {
@@ -233,36 +262,21 @@ async fn proxy(
     let auth = up.auth_for(wire);
 
     // 入站的 Anthropic 协议头必须带过去：`anthropic-beta` 一丢，prompt caching / thinking 就静默失效。
-    let pass = protocol_headers(&headers);
+    let pass = protocol_headers(headers);
+
+    // 日志里的 `client` 是**客户端档案**（票 51/53 按它聚合），不是命中那条绑定的 profile：
+    // 档案里没有这份绑定时 `resolve` 会落回 global 行，`rt.profile` 就变成 Global 了。
+    let client = app
+        .bindings
+        .profile_for(&client_identity(headers))
+        .id()
+        .to_string();
 
     if streaming {
-        upstream::forward(
-            app,
-            &up,
-            wire,
-            auth,
-            &key,
-            req,
-            name,
-            profile.id().to_string(),
-            pass,
-            inbound,
-        )
-        .await
+        upstream::forward(app, &up, wire, auth, &key, req, name, client, pass, inbound).await
     } else {
-        upstream::forward_buffered(
-            app,
-            &up,
-            wire,
-            auth,
-            &key,
-            req,
-            name,
-            profile.id().to_string(),
-            pass,
-            inbound,
-        )
-        .await
+        upstream::forward_buffered(app, &up, wire, auth, &key, req, name, client, pass, inbound)
+            .await
     }
 }
 
@@ -285,7 +299,7 @@ async fn credential(app: &Gateway, upstream_id: &str, wire: Wire) -> Option<Stri
 /// 归属判据是库里的 `client_profiles.match_ua`（`;` 分隔的子串，大小写不敏感）；
 /// 这里只负责把「客户端到底是谁」的线索拼成一串——UA 里带版本号，标识头里带安装 ID，
 /// 两者都可能是判据（Codex 桌面应用就是靠 `x-codex-*` 认出来的，票 32 的真录入站体）。
-fn client_identity(headers: &HeaderMap) -> String {
+pub(crate) fn client_identity(headers: &HeaderMap) -> String {
     const MARKERS: [&str; 6] = [
         "user-agent",
         "x-app",
@@ -318,7 +332,8 @@ fn virtual_model(body: &Value) -> String {
 
 /// 入站请求体落盘（只在 body 日志开关打开时）：落在数据目录的 `inbound.json`。
 /// 覆盖式写一份就够看清「客户端到底发了什么」；历史页归票 53。
-fn dump_inbound(app: &Gateway, body: &Value) {
+/// 票 56：`/api/chat` 也调它——Ollama 客户端的真实请求形状同样只有它说得清。
+pub(crate) fn dump_inbound(app: &Gateway, body: &Value) {
     if !app.body_log_on() {
         return;
     }

@@ -15,16 +15,18 @@ use tauri::menu::{Menu, MenuEvent, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{App, AppHandle, Manager, Window, WindowEvent, Wry};
 
-use gateway_core::ingress::api::rfc3339_utc;
+use gateway_core::dist::autostart::{self, HkcuRun};
+use gateway_core::ingress::api::{rfc3339_utc, Maintenance};
 use gateway_core::ingress::proxy;
 use gateway_core::service::{self, Gateway, GatewayConfig};
 use gateway_core::store::Store;
 
-/// 外壳的常驻状态：网关句柄 + 「网关状态」菜单项（要改文案的那一条）。
+/// 外壳的常驻状态：网关句柄 + 「网关状态」「开机自启」两个要改文案的菜单项。
 #[derive(Default)]
 pub struct Shell {
     gateway: Mutex<Option<Gateway>>,
     status_item: Mutex<Option<MenuItem<Wry>>>,
+    autostart_item: Mutex<Option<MenuItem<Wry>>>,
 }
 
 /// 托盘图标：两种状态色（运行 / 停止）。票 43 只做两态，够表达「在不在跑」。
@@ -67,6 +69,20 @@ pub fn load_port(data_dir: &Path) -> u16 {
         .unwrap_or(service::DEFAULT_PORT)
 }
 
+/// 托盘上「开机自启」那一行的文案（票 62：默认关闭，点一下切换）。
+pub fn autostart_label(enabled: bool) -> String {
+    if enabled {
+        "开机自启：已开启（点一下关闭）".to_string()
+    } else {
+        "开机自启：已关闭（点一下开启）".to_string()
+    }
+}
+
+/// 这次启动是不是 Run 键拉起来的（`--startup`）：是就直接进托盘，不弹窗口。
+pub fn is_startup_launch(argv: &[String]) -> bool {
+    argv.iter().any(|a| a == autostart::STARTUP_FLAG)
+}
+
 /// 数据目录下的日志目录（票 18 §5：`logs\` 放外壳 / 网关自身运行日志）。
 pub fn logs_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("logs")
@@ -97,8 +113,10 @@ pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     // 票 51 起装配路径也是**从库里读**：供应商表 + 上游模型目录 + 绑定表（家族槽位 / 每客户端
     // 档案覆盖）。空库下三张表都是空的，未知模型按入站协议回 `not_found_error` 信封，
     // 而不是 axum 的裸 404，所以空库也照样挂上。
-    let forwarding = match Store::open(&data_dir) {
+    // 同一个库句柄也递给维护面（票 62 的 `/api/settings/autostart`、`/api/export`、`/api/import`）。
+    let (forwarding, maintenance) = match Store::open(&data_dir) {
         Ok(store) => {
+            let maint = Maintenance::new(store.clone(), data_dir.clone());
             let loaded = tauri::async_runtime::block_on(async {
                 let upstreams = gateway_core::egress::provider::list_upstreams(&store).await;
                 let catalog = gateway_core::egress::provider::catalog_map(&store).await;
@@ -113,14 +131,15 @@ pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
                         .collect::<HashMap<_, _>>();
                     let mut gw = proxy::Gateway::new(store, upstreams, bindings);
                     gw.catalog = catalog;
-                    Some(Arc::new(gw))
+                    (Some(Arc::new(gw)), Some(maint))
                 }
                 (u, c, b) => {
                     let e = u.err().or(c.err()).or(b.err()).map(|e| e.to_string());
                     let line = format!("上游 / 绑定表读不出，转发面未挂载：{e:?}");
                     eprintln!("{line}");
                     let _ = append_log(&logs, &line);
-                    None
+                    // 转发面挂了不影响导出 / 导入 / 自启开关：维护面照样挂上。
+                    (None, Some(maint))
                 }
             }
         }
@@ -128,7 +147,7 @@ pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
             let line = format!("库打开失败，转发面未挂载：{e}");
             eprintln!("{line}");
             let _ = append_log(&logs, &line);
-            None
+            (None, None)
         }
     };
 
@@ -137,6 +156,7 @@ pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
         db_path: db_path.clone(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         forwarding,
+        maintenance,
     };
 
     // 网关与外壳同进程（票 18 §2 定案：不是 sidecar）。
@@ -163,8 +183,17 @@ pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     app.manage(Shell {
         gateway: Mutex::new(gateway),
         status_item: Mutex::new(None),
+        autostart_item: Mutex::new(None),
     });
     build_tray(app.handle(), running, port)?;
+
+    // Run 键拉起来的那次（`--startup`）：直接进托盘，不弹窗口。网关照常起。
+    if is_startup_launch(&std::env::args().collect::<Vec<_>>()) {
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.hide();
+        }
+        let _ = append_log(&logs, "开机自启拉起：直接进托盘");
+    }
     Ok(())
 }
 
@@ -185,11 +214,27 @@ fn build_tray(app: &AppHandle, running: bool, port: u16) -> tauri::Result<()> {
         false,
         None::<&str>,
     )?;
+    // 开机自启开关（票 62）：状态直接从注册表读，注册表是唯一真相。
+    let autostart_on = autostart::is_enabled(&HkcuRun::new()).unwrap_or(false);
+    let autostart_item = MenuItem::with_id(
+        app,
+        "autostart",
+        autostart_label(autostart_on),
+        true,
+        None::<&str>,
+    )?;
     let open_logs = MenuItem::with_id(app, "open-logs", "打开日志目录", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &toggle, &status, &open_logs, &quit])?;
+    let menu = Menu::with_items(
+        app,
+        &[&show, &toggle, &status, &autostart_item, &open_logs, &quit],
+    )?;
 
     *app.state::<Shell>().status_item.lock().expect("状态项锁") = Some(status);
+    *app.state::<Shell>()
+        .autostart_item
+        .lock()
+        .expect("自启项锁") = Some(autostart_item);
 
     TrayIconBuilder::with_id("main")
         .icon(tray_icon(running))
@@ -216,9 +261,41 @@ fn on_menu_event(app: &AppHandle, event: MenuEvent) {
     match event.id().as_ref() {
         "show-window" => show_main_window(app),
         "open-logs" => open_logs_dir(),
+        "autostart" => toggle_autostart(app),
         "quit" => quit(app),
         // "desktop-1p3p" 是禁用占位项，点不出事件；其余忽略。
         _ => {}
+    }
+}
+
+/// 托盘上的开机自启开关：读注册表 → 取反 → 写注册表 → 改菜单文案。
+///
+/// 失败（权限 / 注册表异常）只记日志、改回原文案，不弹窗口（托盘点错了不该打断用户）。
+fn toggle_autostart(app: &AppHandle) {
+    let key = HkcuRun::new();
+    let before = autostart::is_enabled(&key).unwrap_or(false);
+    let result = std::env::current_exe()
+        .map_err(anyhow::Error::from)
+        .and_then(|exe| autostart::set_enabled(&key, !before, &exe));
+
+    let log_line = match result {
+        Ok(now) => {
+            if let Some(item) = app
+                .state::<Shell>()
+                .autostart_item
+                .lock()
+                .ok()
+                .and_then(|item| item.clone())
+            {
+                let _ = item.set_text(autostart_label(now));
+            }
+            format!("开机自启切换为 {}", if now { "开启" } else { "关闭" })
+        }
+        Err(e) => format!("开机自启切换失败：{e}"),
+    };
+    eprintln!("{log_line}");
+    if let Ok(data_dir) = gateway_core::store::default_data_dir() {
+        let _ = append_log(&logs_dir(&data_dir), &log_line);
     }
 }
 
@@ -299,6 +376,35 @@ mod tests {
 
         let down = status_label(false, 8787);
         assert!(down.contains("未运行"), "{down}");
+    }
+
+    #[test]
+    fn autostart_label_tells_the_truth_in_both_states() {
+        let off = autostart_label(false);
+        assert!(off.contains("已关闭"), "{off}");
+        assert!(off.contains("开启"), "关闭态要说清点一下会开启：{off}");
+
+        let on = autostart_label(true);
+        assert!(on.contains("已开启"), "{on}");
+        assert!(on.contains("关闭"), "开启态要说清点一下会关闭：{on}");
+        assert_ne!(on, off);
+    }
+
+    #[test]
+    fn startup_flag_is_recognised_in_real_command_lines() {
+        // Run 键里写的那条命令行（带引号的 exe + --startup）。
+        let line = autostart::command_line(Path::new(r"C:\App\claude-gateway.exe"));
+        let argv: Vec<String> = line
+            .split('"')
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim().to_string())
+            .collect();
+        assert!(
+            is_startup_launch(&argv),
+            "Run 键的命令行必须被认出来：{argv:?}"
+        );
+        assert!(!is_startup_launch(&["claude-gateway.exe".to_string()]));
+        assert!(!is_startup_launch(&["--export".into(), "a.json".into()]));
     }
 
     #[test]

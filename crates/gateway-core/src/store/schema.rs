@@ -5,7 +5,8 @@
 //!
 //! v1 = 原型期的形状（`prototype/src/store.rs` 的四张表），v2 = spec §9 的形状，
 //! v3 = 票 49 给 `upstreams` 补「上次自检结果」，v4 = 票 50 补「上次成功拉取时间」，
-//! v5 = 票 51 给 `client_profiles` 补实测 UA 判据，v6 = 票 58 给 `requests` 补 `cache_write`。
+//! v5 = 票 51 给 `client_profiles` 补实测 UA 判据，v6 = 票 57 给 `upstreams` 补结构化输出能力位，
+//! v7 = 票 58 给 `requests` 补 `cache_write`。
 //! 新库也照样从 v1 顺序跑到最新：装一次机就把整条迁移路径走一遍，热路径与升级路径不分叉。
 
 use anyhow::{Context, Result};
@@ -13,7 +14,7 @@ use rusqlite::{Connection, Transaction};
 use std::collections::HashMap;
 
 /// 当前 schema 版本 = 迁移表最后一条。
-pub const SCHEMA_VERSION: i32 = 6;
+pub const SCHEMA_VERSION: i32 = 7;
 
 pub(crate) struct Migration {
     pub(crate) version: i32,
@@ -43,7 +44,12 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 6,
-        apply: v6_cache_write,
+        apply: v6_structured_output_caps,
+    },
+    // 票 58 在集成分支上从 v6 顺延为 v7：票 57 先占了 v6 的结构化输出能力位。
+    Migration {
+        version: 7,
+        apply: v7_cache_write,
     },
 ];
 
@@ -396,13 +402,26 @@ fn v5_profile_match_ua(tx: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
-/// v6（票 58）：`requests` 补 `cache_write`（缓存写 token）。
+/// v6（票 57）：`upstreams` 补**结构化输出能力位**，按「上游 × 出站协议」存成一份 JSON。
+///
+/// 粒度与键都跟着 `auth_json` / `path_templates_json` 走（同样是「上游 × wire」的映射），
+/// 所以是一列 JSON 而不是新表：wire 级事实进上游表（spec §6），不进 quirks。
+/// 缺省值 `'{}'` = 一面都没判过 = 一律按 `native`（缺省态），老库升上来就是干净的缺省。
+fn v6_structured_output_caps(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute_batch(
+        "ALTER TABLE upstreams ADD COLUMN structured_output_json TEXT NOT NULL DEFAULT '{}';",
+    )?;
+    Ok(())
+}
+
+/// v7（票 58）：`requests` 补 `cache_write`（缓存写 token）。
 ///
 /// v2 建的 `requests` 只收了 `input_tokens` / `output_tokens` / `cache_read`（原型期就这三项），
 /// 缓存写一直没列可落（票 33 第 4 节记的已知缺口）。这一列**只加不改**：既有列的名字、类型与
 /// 语义一个都不动，老行的新列是 NULL（= 当时没采，**不是 0**；上游没报与报了 0 是两句不同的话）。
 /// 计价口径另行补在 `obs::resolve_cost`（缓存写按缓存写价），**历史行不重算**（票 33 第 3 节）。
-fn v6_cache_write(tx: &Transaction<'_>) -> Result<()> {
+/// （本迁移在集成分支上从 v6 顺延为 v7：票 57 先占了 v6 的结构化输出能力位。）
+fn v7_cache_write(tx: &Transaction<'_>) -> Result<()> {
     tx.execute_batch("ALTER TABLE requests ADD COLUMN cache_write INTEGER;")?;
     Ok(())
 }

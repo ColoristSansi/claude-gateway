@@ -60,6 +60,9 @@ pub fn decode_request(v: &Value) -> Result<IrRequest> {
         stop: Vec::new(),
         thinking: None,
         metadata: None,
+        // 票 57：`text.format` 归一化进 IR。`text` 的兄弟键（`verbosity`）与其余 Responses
+        // 专有字段一样不透传（见上面那段注释）。
+        format: crate::ir::ResponseFormat::from_responses_request(obj),
         // 刻意**不**透传 Responses 专有字段（`store` / `include` / `reasoning` /
         // `previous_response_id` …）：出站是 Anthropic 或 OpenAI Chat，这些字段对它们
         // 没有意义，严格的上游会直接 400。
@@ -217,7 +220,8 @@ fn call_id(it: &Value) -> String {
         .to_string()
 }
 
-fn parse_arguments(a: Option<&Value>) -> Value {
+/// 工具入参的两种形状（字符串 / 对象）都吃得下：Ollama 入站（`ingress::ollama`）也复用它。
+pub(crate) fn parse_arguments(a: Option<&Value>) -> Value {
     match a {
         Some(Value::String(s)) => serde_json::from_str::<Value>(s).unwrap_or_else(|_| json!({})),
         Some(v) => v.clone(),
@@ -283,7 +287,9 @@ fn decode_tool_choice(v: Option<&Value>) -> Option<Value> {
     }
 }
 
-fn push_block(msgs: &mut Vec<IrMessage>, role: &str, b: IrBlock) {
+/// 同 role 的相邻块并进同一轮：Ollama 的 `role:"tool"` 连续多条必须并成一个 user 轮，
+/// 否则 Anthropic 出站会把每个 `tool_result` 拆到不同的消息里（配对失败）。
+pub(crate) fn push_block(msgs: &mut Vec<IrMessage>, role: &str, b: IrBlock) {
     if let Some(last) = msgs.last_mut() {
         if last.role == role {
             last.blocks.push(b);

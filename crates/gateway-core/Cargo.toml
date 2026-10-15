@@ -18,6 +18,11 @@ futures-util = "0.3"
 bytes = "1"
 rusqlite = { version = "0.40", features = ["bundled"] }
 anyhow = "1"
+# 导出文件的口令加密（票 62）：PBKDF2-HMAC-SHA256 派生 + AES-256-GCM。ring 本来就在 Cargo.lock
+# 里（Tauri 依赖树），不引新 crate、不手搓密码学。
+ring = "0.17"
+# `/api/tags` 的 `digest` = 虚拟模型名的确定性 sha256（spec §4.4）；手写 SHA-256 不值当。
+sha2 = "0.10"
 
 # DPAPI（CryptProtectData / CryptUnprotectData）：密钥只以密文入库（spec §9）。
 # FileSystem：原子替换 ReplaceFileW（spec §8.4 第 1 条）；SystemInformation：备份文件名的本地时间。
@@ -27,6 +32,8 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
     "Win32_System_SystemInformation",
+    # 开机自启（票 62）：HKCU\...\Run 值的读 / 写 / 删。
+    "Win32_System_Registry",
 ] }
 
 # 测试专用开关（票 41）：开它才编 mock 上游与回放 harness 两个 bin，以及回放集成测试。

@@ -284,6 +284,64 @@ async fn read_write_roundtrip_across_spec9_tables() {
     assert!(bad.is_err(), "wire 取值域应被 CHECK 拦住");
 }
 
+/// 票 57 的 v6：`upstreams` 补结构化输出能力位列（按「上游 × 出站协议」存一份 JSON）。
+#[tokio::test]
+async fn v6_adds_the_structured_output_capability_column() {
+    let root = tmp_root("migrate-v6");
+    std::fs::create_dir_all(&root).unwrap();
+    let db = root.join(DB_FILE_NAME);
+    {
+        let mut c = Connection::open(&db).unwrap();
+        super::schema::migrate_upto(&mut c, 5).unwrap();
+        c.execute(
+            "INSERT INTO upstreams(id,name,base_url) VALUES('cc','commandcode','https://cc.example')",
+            [],
+        )
+        .unwrap();
+    }
+
+    let store = Store::open(&root).expect("v5 旧库升上来");
+    assert_eq!(store.read(user_version).await.unwrap(), SCHEMA_VERSION);
+    // 补列之后旧行拿到缺省值：一面都没判过。
+    let cap: String = store
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT structured_output_json FROM upstreams WHERE id='cc'",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(cap, "{}");
+    // 脏值不让整条上游不可用（与 quirks 同一条口径）。
+    store
+        .write(|c| {
+            c.execute(
+                "UPDATE upstreams SET structured_output_json=?1 WHERE id='cc'",
+                rusqlite::params![
+                    "{\"anthropic\":{\"mode\":\"ignore\",\"source\":\"selfcheck\"},\
+                     \"没这个面\":{\"mode\":\"x\"}}"
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let up = crate::egress::provider::load_upstream(&store, "cc")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        up.structured_output(crate::egress::provider::Wire::Anthropic),
+        crate::egress::provider::StructuredOutput::Ignore
+    );
+    assert_eq!(
+        up.structured_capability(crate::egress::provider::Wire::OpenAiChat),
+        None
+    );
+}
+
 /// 造一份**原型期**（v1）的库，再用现版本升上来。
 #[tokio::test]
 async fn upgrades_a_prototype_era_db_in_place() {
@@ -424,17 +482,18 @@ async fn upgrades_a_prototype_era_db_in_place() {
     assert_eq!(n, 4);
 }
 
-/// 票 58（v5 → v6）：`requests` 补 `cache_write`，**旧数据一条不丢、既有列的语义不变**，
+/// 票 58（v6 → v7）：`requests` 补 `cache_write`，**旧数据一条不丢、既有列的语义不变**，
 /// 老行的新列是 NULL（当时没采，不是 0）。
+/// （本迁移在集成分支上从 v6 顺延为 v7：票 57 先占了 v6 的结构化输出能力位。）
 #[tokio::test]
-async fn upgrades_a_v5_db_to_v6_adding_cache_write_without_touching_old_rows() {
-    let root = tmp_root("migrate-v6");
+async fn upgrades_a_v6_db_to_v7_adding_cache_write_without_touching_old_rows() {
+    let root = tmp_root("migrate-v7");
     std::fs::create_dir_all(&root).unwrap();
     let db = root.join(DB_FILE_NAME);
     {
         let mut c = Connection::open(&db).unwrap();
-        // 升到 v5（票 58 之前的最新版）：建表路径与真实旧库一致。
-        super::schema::migrate_upto(&mut c, 5).unwrap();
+        // 升到 v6（票 58 之前的最新版）：建表路径与真实旧库一致。
+        super::schema::migrate_upto(&mut c, 6).unwrap();
         c.execute(
             "INSERT INTO requests(ts,request_id,client,virtual_model,upstream_id,real_model,wire,status,
                                   first_byte_ms,total_ms,input_tokens,output_tokens,cache_read,aborted,error,cost_usd)
@@ -451,7 +510,7 @@ async fn upgrades_a_v5_db_to_v6_adding_cache_write_without_touching_old_rows() {
             [],
         )
         .unwrap();
-        // v5 的 requests 里没有 cache_write 这一列（不是 NULL，是根本不存在）。
+        // v6 的 requests 里没有 cache_write 这一列（不是 NULL，是根本不存在）。
         let has_col: i64 = c
             .query_row(
                 "SELECT count(*) FROM pragma_table_info('requests') WHERE name='cache_write'",
@@ -459,16 +518,16 @@ async fn upgrades_a_v5_db_to_v6_adding_cache_write_without_touching_old_rows() {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(has_col, 0, "v5 的库不该有 cache_write 列");
+        assert_eq!(has_col, 0, "v6 的库不该有 cache_write 列");
         let n: i64 = c
             .query_row("SELECT count(*) FROM requests", [], |r| r.get(0))
             .unwrap();
-        println!("[v6] 升级前：user_version=5，requests {n} 行，列里没有 cache_write");
+        println!("[v7] 升级前：user_version=6，requests {n} 行，列里没有 cache_write");
     }
 
-    let store = Store::open(&root).expect("v5 库升到 v6");
+    let store = Store::open(&root).expect("v6 库升到 v7");
     assert_eq!(store.read(user_version).await.unwrap(), SCHEMA_VERSION);
-    assert_eq!(SCHEMA_VERSION, 6, "本票把最新版推到 v6");
+    assert_eq!(SCHEMA_VERSION, 7, "本票把最新版推到 v7");
 
     // 行数一条不丢，抽样逐列对得上，新列在老行上是 NULL。
     /// 抽样那一行的形状：ts / request_id / virtual_model / 三项 token / cost / cache_write。
@@ -506,7 +565,7 @@ async fn upgrades_a_v5_db_to_v6_adding_cache_write_without_touching_old_rows() {
         .unwrap();
     assert_eq!(rows.len(), 2, "迁移不许丢行");
     println!(
-        "[v6] 升级后：user_version={}，requests {} 行；抽样 {:?} / {:?}",
+        "[v7] 升级后：user_version={}，requests {} 行；抽样 {:?} / {:?}",
         SCHEMA_VERSION,
         rows.len(),
         rows[0],
@@ -554,10 +613,10 @@ async fn upgrades_a_v5_db_to_v6_adding_cache_write_without_touching_old_rows() {
         .unwrap();
     assert_eq!(cw, 3819);
 
-    // 迁移幂等：再开一次仍是 v6，行数不变。
+    // 迁移幂等：再开一次仍是 v7，行数不变。
     drop(store);
     let again = Store::open(&root).expect("再开");
-    assert_eq!(again.read(user_version).await.unwrap(), 6);
+    assert_eq!(again.read(user_version).await.unwrap(), 7);
     let n: i64 = again
         .read(|c| Ok(c.query_row("SELECT count(*) FROM requests", [], |r| r.get(0))?))
         .await
