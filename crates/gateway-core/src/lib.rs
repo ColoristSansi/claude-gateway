@@ -29,6 +29,7 @@
 
 pub mod anthropic;
 pub mod binding;
+pub mod dist;
 pub mod egress;
 pub mod ingress;
 pub mod ir;

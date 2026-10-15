@@ -10,6 +10,8 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 gateway-core = { path = "../crates/gateway-core" }
 serde_json = "1"
+# 维护动作（票 62）逐层报错：与内核同一套错误类型，命令行能打出完整因果链（`{e:#}`）。
+anyhow = "1"
 # tray-icon：托盘常驻（票 18 §2）；image-png：托盘图标两态换图要在运行时解码 PNG
 # （tauri.conf.json 里的配置图标由 tauri-build 在编译期解码，运行时不走这条路）。
 tauri = { version = "2", features = ["tray-icon", "image-png"] }

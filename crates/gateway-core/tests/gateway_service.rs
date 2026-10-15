@@ -16,6 +16,8 @@ fn config(port: u16, db_path: &str) -> GatewayConfig {
         // 票 43 的验收只测管理面与生命周期；转发面由票 41 的回放套件起 harness 单测（见
         // tests/replay.rs），票 51 接了真绑定表之后再从这里挂上。
         forwarding: None,
+        // 维护面（票 62）在 tests/dist_api.rs 里单独挂：那一格要真库与真数据目录。
+        maintenance: None,
     }
 }
 
