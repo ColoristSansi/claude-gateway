@@ -22,6 +22,8 @@ export type LogRow = {
   input_tokens: number | null;
   output_tokens: number | null;
   cache_read: number | null;
+  /** 缓存写（票 58）：上游报了才有，没报是 null（不是 0）。 */
+  cache_write: number | null;
   aborted: boolean;
   error: string | null;
   cost_usd: number | null;

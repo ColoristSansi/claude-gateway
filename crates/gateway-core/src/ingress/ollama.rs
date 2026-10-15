@@ -545,6 +545,8 @@ pub struct OllamaAssembler {
     usage_in: Option<u64>,
     usage_out: Option<u64>,
     cache_read: Option<u64>,
+    /// 缓存写（票 58）：Ollama 词表里没有这一项、**不回给客户端**，但日志行要记（上游报了才有）。
+    cache_write: Option<u64>,
     ended: bool,
     error: Option<(String, String)>,
     stop_reason: Option<String>,
@@ -591,11 +593,12 @@ impl OllamaAssembler {
                 input_tokens,
                 output_tokens,
                 cache_read_input_tokens,
-                ..
+                cache_creation_input_tokens,
             } => {
                 self.usage_in = input_tokens.or(self.usage_in);
                 self.usage_out = output_tokens.or(self.usage_out);
                 self.cache_read = cache_read_input_tokens.or(self.cache_read);
+                self.cache_write = cache_creation_input_tokens.or(self.cache_write);
             }
             IrEvent::Stop { reason } => self.stop_reason = Some(reason),
             IrEvent::Error { kind, message } => {
@@ -616,8 +619,15 @@ impl OllamaAssembler {
         self.error.clone()
     }
 
-    pub fn usage(&self) -> (Option<u64>, Option<u64>, Option<u64>) {
-        (self.usage_in, self.usage_out, self.cache_read)
+    /// 四项 usage：`(输入, 输出, 缓存读, 缓存写)`（票 58）；Ollama 的**响应体**只回前两项
+    /// （词表里没有缓存字段），第四项只进日志行。
+    pub fn usage(&self) -> (Option<u64>, Option<u64>, Option<u64>, Option<u64>) {
+        (
+            self.usage_in,
+            self.usage_out,
+            self.cache_read,
+            self.cache_write,
+        )
     }
 
     /// 一个完整的 `ChatResponse`（官方非流式示例的字段与顺序）。
@@ -1299,7 +1309,7 @@ mod tests {
             a.push(ev);
         }
         assert!(a.ended() && a.error().is_none());
-        assert_eq!(a.usage(), (Some(9), Some(4), None));
+        assert_eq!(a.usage(), (Some(9), Some(4), None, None));
         let body = a.body("claude-haiku");
         assert_eq!(body["model"], "claude-haiku");
         assert_eq!(body["done"], true);

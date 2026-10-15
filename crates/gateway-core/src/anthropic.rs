@@ -386,6 +386,8 @@ pub struct AnthropicAssembler {
     usage_in: Option<u64>,
     usage_out: Option<u64>,
     cache_read: Option<u64>,
+    /// 缓存写（Anthropic 的 `cache_creation_input_tokens`）：只进日志行与计价（票 58）。
+    cache_write: Option<u64>,
     ended: bool,
     error: Option<(String, String)>,
     stop_reason: Option<String>,
@@ -434,11 +436,12 @@ impl AnthropicAssembler {
                 input_tokens,
                 output_tokens,
                 cache_read_input_tokens,
-                ..
+                cache_creation_input_tokens,
             } => {
                 self.usage_in = input_tokens.or(self.usage_in);
                 self.usage_out = output_tokens.or(self.usage_out);
                 self.cache_read = cache_read_input_tokens.or(self.cache_read);
+                self.cache_write = cache_creation_input_tokens.or(self.cache_write);
             }
             IrEvent::Stop { reason } => self.stop_reason = Some(reason),
             IrEvent::Error { kind, message } => {
@@ -468,8 +471,14 @@ impl AnthropicAssembler {
         self.error.clone()
     }
 
-    pub fn usage(&self) -> (Option<u64>, Option<u64>, Option<u64>) {
-        (self.usage_in, self.usage_out, self.cache_read)
+    /// 四项 usage：`(输入, 输出, 缓存读, 缓存写)`。上游没报的项是 `None`（**不编 0**，票 58）。
+    pub fn usage(&self) -> (Option<u64>, Option<u64>, Option<u64>, Option<u64>) {
+        (
+            self.usage_in,
+            self.usage_out,
+            self.cache_read,
+            self.cache_write,
+        )
     }
 
     pub fn message(&self, model: &str) -> Value {
@@ -708,6 +717,38 @@ mod tests {
         assert_eq!(m["usage"]["output_tokens"], 2);
         assert!(m["usage"].get("cache_read_input_tokens").is_none());
     }
+
+    /// 票 58：Anthropic 侧的缓存写字段，**用真录帧**
+    /// （`tests/fixtures/cache-write/anthropic.sse`，2026-10-15 真打 commandcode `/messages`
+    /// + `claude-sonnet-5-5`，system 带 `cache_control: ephemeral`）。
+    ///
+    /// 实测（帧文件就是独立来源）：缓存写报在 `message_delta.usage.cache_creation_input_tokens`
+    /// = **3819**，同帧还有嵌套的 `cache_creation.ephemeral_5m_input_tokens: 3819`——**不数嵌套那层**
+    /// （顶层那个才是上游给的总数，嵌套是它的拆分）。缓存读同帧 0、输入 9、输出 13。
+    #[test]
+    fn anthropic_cache_creation_input_tokens_lands_in_cache_write() {
+        let mut parser = sse::SseParser::default();
+        let mut frames = parser.push(REAL_CACHE_WRITE_ANTHROPIC.as_bytes());
+        frames.extend(parser.finish());
+        assert!(frames.len() >= 3, "真录帧不该这么少：{}", frames.len());
+
+        let mut asm = AnthropicAssembler::default();
+        for f in &frames {
+            for ev in AnthropicDecoder.decode(f) {
+                asm.push(ev);
+            }
+        }
+        assert!(asm.ended(), "真录帧到 message_stop，必须算完整应答");
+        assert_eq!(
+            asm.usage(),
+            (Some(9), Some(13), Some(0), Some(3819)),
+            "(输入, 输出, 缓存读, 缓存写)"
+        );
+    }
+
+    /// 真录帧的字节（录制工具 `tests/record.ps1` 原样落盘；只读、不许改）。
+    const REAL_CACHE_WRITE_ANTHROPIC: &str =
+        include_str!("../tests/fixtures/cache-write/anthropic.sse");
 
     #[test]
     fn thinking_without_signature_is_dropped() {

@@ -74,22 +74,53 @@ fn row(upstream: &str, model: &str, ts: i64) -> RequestLog {
 /// 缓存读 2000 × $0.30/Mtok = $0.0006，合计 $0.0111（手算的独立来源，不是本函数算的）。
 #[test]
 fn cost_is_sum_of_the_three_parts_at_known_prices() {
-    let c = resolve_cost(&prices_known(), Some(1000), Some(500), Some(2000)).unwrap();
+    let c = resolve_cost(&prices_known(), Some(1000), Some(500), Some(2000), None).unwrap();
     assert!((c - 0.0111).abs() < 1e-12, "实际 {c}");
 
     // 没有缓存读 → 只有前两项
-    let c = resolve_cost(&prices_known(), Some(1000), Some(500), None).unwrap();
+    let c = resolve_cost(&prices_known(), Some(1000), Some(500), None, None).unwrap();
     assert!((c - 0.0105).abs() < 1e-12, "实际 {c}");
 }
 
-/// 缓存读缺价 → **退输入价**（票 33 第 4 节）；缓存写本期不计（不在这条路径上）。
+/// 缓存读缺价 → **退输入价**（票 33 第 4 节）；缓存写不在这条路径上（没这一项 token）。
 #[test]
 fn cache_read_falls_back_to_input_price_when_it_has_none() {
     let mut p = prices_known();
     p.cache_read.usd_per_mtok = None;
-    let c = resolve_cost(&p, Some(0), Some(0), Some(2000)).unwrap();
+    let c = resolve_cost(&p, Some(0), Some(0), Some(2000), None).unwrap();
     // 2000 × $3/Mtok = $0.006
     assert!((c - 0.006).abs() < 1e-12, "实际 {c}");
+}
+
+/// 票 58：缓存写按**缓存写价**单独算，四项相加。
+///
+/// 手算（独立来源，帧文件 `tests/fixtures/cache-write/anthropic.sse` 那份真录请求的形状）：
+/// 输入 1000 × $3/Mtok = $0.003；输出 500 × $15/Mtok = $0.0075；
+/// 缓存读 2000 × $0.30/Mtok = $0.0006；缓存写 4000 × $3.75/Mtok = $0.015 → 合计 **$0.0261**。
+#[test]
+fn cost_adds_cache_write_at_its_own_price() {
+    let mut p = prices_known();
+    p.cache_write = ResolvedPrice {
+        usd_per_mtok: Some(3.75),
+        source: provider::PriceSource::Manual,
+    };
+    let c = resolve_cost(&p, Some(1000), Some(500), Some(2000), Some(4000)).unwrap();
+    assert!((c - 0.0261).abs() < 1e-12, "实际 {c}");
+}
+
+/// 票 58：缓存写**没有缓存写价**就是缺价 → 整条不算（票 33 第 4 节只给缓存读留了「退输入价」，
+/// 缓存写没有退路，不许拿输入价顶替）。
+#[test]
+fn cache_write_without_its_price_leaves_the_row_unpriced() {
+    let p = prices_known(); // cache_write 价是 Unknown
+    assert_eq!(
+        resolve_cost(&p, Some(1000), Some(500), None, Some(4000)),
+        None,
+        "缺缓存写价不能拿输入价顶替，也不能半算"
+    );
+    // 上游报了 0 个缓存写 token（不是 None）→ 这一项不拖累整条。
+    let c = resolve_cost(&p, Some(1000), Some(500), None, Some(0)).unwrap();
+    assert!((c - 0.0105).abs() < 1e-12, "实际 {c}");
 }
 
 /// 口径两条（票 33 第 1、3 节）：缺价 → 整个 `cost_usd` 留空、不计入总额；
@@ -97,19 +128,19 @@ fn cache_read_falls_back_to_input_price_when_it_has_none() {
 #[test]
 fn unknown_price_or_unknown_tokens_yield_no_cost() {
     assert_eq!(
-        resolve_cost(&prices_unknown(), Some(1000), Some(500), None),
+        resolve_cost(&prices_unknown(), Some(1000), Some(500), None, None),
         None,
         "一分钱都算不出来时不该编一个 0"
     );
     assert_eq!(
-        resolve_cost(&prices_known(), None, None, None),
+        resolve_cost(&prices_known(), None, None, None, None),
         None,
         "token 未知就不算成本"
     );
     // 只缺输出价：这一笔也整条不计（不半算）
     let mut p = prices_known();
     p.output.usd_per_mtok = None;
-    assert_eq!(resolve_cost(&p, Some(1000), Some(500), None), None);
+    assert_eq!(resolve_cost(&p, Some(1000), Some(500), None, None), None);
 }
 
 /// 到点自关：窗口拨短，过了就是关。
@@ -217,6 +248,85 @@ async fn cost_is_frozen_at_write_time_and_not_recomputed() {
         (fresh - 0.105).abs() < 1e-12,
         "新价下应为 $0.105，实际 {fresh}"
     );
+}
+
+/// 票 58：带缓存写的一行落库并计入成本，且**改价不追古**（历史行的数值一动不动）。
+///
+/// 手算（独立来源）：输入 1000 × $3/Mtok = $0.003；输出 500 × $15/Mtok = $0.0075；
+/// 缓存写 4000 × $3.75/Mtok = $0.015 → **$0.0255**。四项价全抬 10 倍后，新的一发是 **$0.255**。
+#[tokio::test]
+async fn cache_write_lands_in_the_db_with_cost_and_is_never_recomputed() {
+    let root = tmp_root("freeze-cache-write");
+    let store = Store::open(&root).unwrap();
+    provider::save_upstream(&store, &upstream("u1"))
+        .await
+        .unwrap();
+    provider::save_manual_model(&store, "u1", "real-model", &[])
+        .await
+        .unwrap();
+    provider::set_manual_prices(
+        &store,
+        "u1",
+        "real-model",
+        &Prices {
+            input: Some(3.0),
+            output: Some(15.0),
+            cache_read: Some(0.30),
+            cache_write: Some(3.75),
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut r = row("u1", "real-model", 1_000_000_000);
+    r.cache_write = Some(4000);
+    log(&store, &r).await.unwrap();
+
+    let before = list(&store, &LogQuery::default()).await.unwrap();
+    assert_eq!(before[0]["cache_write"], json!(4000), "缓存写必须落库");
+    assert_eq!(before[0]["cache_read"], Value::Null, "没报的项留 NULL");
+    let cost_before = before[0]["cost_usd"].as_f64().unwrap();
+    assert!((cost_before - 0.0255).abs() < 1e-12, "实际 {cost_before}");
+
+    // 四项价全抬 10 倍 + 换一份快照：历史行必须一动不动（票 33 第 3 节）。
+    provider::set_manual_prices(
+        &store,
+        "u1",
+        "real-model",
+        &Prices {
+            input: Some(30.0),
+            output: Some(150.0),
+            cache_read: Some(3.0),
+            cache_write: Some(37.5),
+        },
+    )
+    .await
+    .unwrap();
+    provider::import_catalog_snapshot(
+        &store,
+        r#"{"u1":{"models":{"real-model":{"name":"x","cost":{"input":99,"output":99,"cache_write":99}}}}}"#,
+    )
+    .await
+    .unwrap();
+
+    let after = list(&store, &LogQuery::default()).await.unwrap();
+    assert_eq!(
+        after[0]["cost_usd"].as_f64().unwrap(),
+        cost_before,
+        "改价 / 刷新快照不许追古"
+    );
+
+    // 同一条上游的同一条模型，下一发按新价（说明价是「当时」读的）。
+    let mut r2 = row("u1", "real-model", 1_000_000_100);
+    r2.cache_write = Some(4000);
+    log(&store, &r2).await.unwrap();
+    let rows = list(&store, &LogQuery::default()).await.unwrap();
+    let fresh = rows[0]["cost_usd"].as_f64().unwrap();
+    assert!(
+        (fresh - 0.255).abs() < 1e-12,
+        "新价下应为 $0.255，实际 {fresh}"
+    );
+    assert_eq!(rows[0]["cache_write"], json!(4000), "新行也带着缓存写");
 }
 
 /// 快照兜底：手工没填的项回退 models.dev 快照（票 33 第 1 节）。
@@ -558,4 +668,74 @@ async fn usage_summary_counts_unpriced_and_unknown_tokens_separately() {
 
 fn upstream(id: &str) -> provider::Upstream {
     provider::Upstream::new(id, id, "http://127.0.0.1:1")
+}
+
+/// 票 58：「N 次无价格 / N 次 token 未知」两个计数把 `cache_write` 算进去，汇总也带这一列。
+///
+/// - 只报了缓存写的行**不是**「token 未知」（否则会被说成「上游没回 usage」）；
+/// - 有缓存写 token 但**没有缓存写价**的行算「无价格」（整条不计入总额）。
+#[tokio::test]
+async fn usage_summary_counts_cache_write_rows_and_totals_it() {
+    let root = tmp_root("usage-cache-write");
+    let store = Store::open(&root).unwrap();
+    provider::save_upstream(&store, &upstream("u1"))
+        .await
+        .unwrap();
+    // 四项价都填的目录条目 + 只填前三项的目录条目。
+    for (model, cache_write) in [("four", Some(3.75)), ("three", None)] {
+        provider::save_manual_model(&store, "u1", model, &[])
+            .await
+            .unwrap();
+        provider::set_manual_prices(
+            &store,
+            "u1",
+            model,
+            &Prices {
+                input: Some(3.0),
+                output: Some(15.0),
+                cache_read: Some(0.30),
+                cache_write,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let now = unix_now();
+    // ① 只报缓存写（别的都没报）→ 不是 token 未知；4000 × $3.75/Mtok = $0.015
+    let mut a = row("u1", "four", now - 60);
+    a.input_tokens = None;
+    a.output_tokens = None;
+    a.cache_read = None;
+    a.cache_write = Some(4000);
+    log(&store, &a).await.unwrap();
+    // ② 有缓存写 token，但目录没填第四项价 → 整条无价格
+    let mut b = row("u1", "three", now - 120);
+    b.input_tokens = None;
+    b.output_tokens = None;
+    b.cache_read = None;
+    b.cache_write = Some(10);
+    log(&store, &b).await.unwrap();
+
+    let today = usage_summary(&store, "today", "virtual_model")
+        .await
+        .unwrap();
+    assert_eq!(today["totals"]["requests"], 2, "{today}");
+    assert_eq!(
+        today["totals"]["token_unknown"], 0,
+        "只报了缓存写不该算 token 未知：{today}"
+    );
+    assert_eq!(
+        today["totals"]["no_price"], 1,
+        "缺缓存写价那一行算无价格：{today}"
+    );
+    assert_eq!(today["totals"]["cache_write"], 4010, "{today}");
+    let c = today["totals"]["cost_usd"].as_f64().unwrap();
+    assert!((c - 0.015).abs() < 1e-12, "实际 {c}：{today}");
+
+    // 两个虚拟模型名相同（`row()` 的默认）→ 一组；分组行也带这一列。
+    let rows = today["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{today}");
+    assert_eq!(rows[0]["key"], "claude-haiku", "{today}");
+    assert_eq!(rows[0]["cache_write"], 4010, "分组行也要带缓存写：{today}");
 }

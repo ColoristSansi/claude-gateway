@@ -43,6 +43,12 @@
 > `tests/replay.rs::client_profile_override_and_models_exposure`；解析与落库另见
 > `tests/binding_table.rs`。原型里没有档案概念，那半仍不必补。
 
+- **`: 票 58 的 cache_write 帧`**：`tests/fixtures/cache-write/` 两份是 2026-10-15 真打
+  commandcode 录下的**单侧帧**（Anthropic 面与 Chat 面各一份；请求带 >1024 token 的前缀触发
+  缓存创建，所以录到的缓存写非零）。它们**不进回放矩阵**——那 15 格测的是「入站协议 × 出站
+  wire」的转换，这两份只验 usage 字段名的映射，由 `src/anthropic.rs` 与 `src/openai.rs` 的
+  单元测试用 `include_str!` 直接读真录字节并断言。台账因此不为它们加行。
+
 ## quirk 双向守卫与豁免
 
 - 枚举值 ⇄ fixture 的 `quirks` 标签双向守卫在 `src/egress/provider.rs` 的四份单元测试里
