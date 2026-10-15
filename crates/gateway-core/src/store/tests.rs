@@ -424,6 +424,147 @@ async fn upgrades_a_prototype_era_db_in_place() {
     assert_eq!(n, 4);
 }
 
+/// 票 58（v5 → v6）：`requests` 补 `cache_write`，**旧数据一条不丢、既有列的语义不变**，
+/// 老行的新列是 NULL（当时没采，不是 0）。
+#[tokio::test]
+async fn upgrades_a_v5_db_to_v6_adding_cache_write_without_touching_old_rows() {
+    let root = tmp_root("migrate-v6");
+    std::fs::create_dir_all(&root).unwrap();
+    let db = root.join(DB_FILE_NAME);
+    {
+        let mut c = Connection::open(&db).unwrap();
+        // 升到 v5（票 58 之前的最新版）：建表路径与真实旧库一致。
+        super::schema::migrate_upto(&mut c, 5).unwrap();
+        c.execute(
+            "INSERT INTO requests(ts,request_id,client,virtual_model,upstream_id,real_model,wire,status,
+                                  first_byte_ms,total_ms,input_tokens,output_tokens,cache_read,aborted,error,cost_usd)
+             VALUES(1750000000,'req-old','claude-code','claude-haiku','cc','claude-sonnet-5-5','anthropic',200,
+                    11,22,1000,500,80,0,NULL,0.0105)",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO requests(ts,request_id,client,virtual_model,upstream_id,real_model,wire,status,
+                                  first_byte_ms,total_ms,input_tokens,output_tokens,cache_read,aborted,error,cost_usd)
+             VALUES(1750000100,'req-old-2','codex','claude-opus','cc','claude-opus-5','anthropic',502,
+                    33,44,NULL,NULL,NULL,1,'上游 502',NULL)",
+            [],
+        )
+        .unwrap();
+        // v5 的 requests 里没有 cache_write 这一列（不是 NULL，是根本不存在）。
+        let has_col: i64 = c
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('requests') WHERE name='cache_write'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_col, 0, "v5 的库不该有 cache_write 列");
+        let n: i64 = c
+            .query_row("SELECT count(*) FROM requests", [], |r| r.get(0))
+            .unwrap();
+        println!("[v6] 升级前：user_version=5，requests {n} 行，列里没有 cache_write");
+    }
+
+    let store = Store::open(&root).expect("v5 库升到 v6");
+    assert_eq!(store.read(user_version).await.unwrap(), SCHEMA_VERSION);
+    assert_eq!(SCHEMA_VERSION, 6, "本票把最新版推到 v6");
+
+    // 行数一条不丢，抽样逐列对得上，新列在老行上是 NULL。
+    /// 抽样那一行的形状：ts / request_id / virtual_model / 三项 token / cost / cache_write。
+    type SampleRow = (
+        i64,
+        String,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<f64>,
+        Option<i64>,
+    );
+    let rows: Vec<SampleRow> = store
+        .read(|c| {
+            let mut st = c.prepare(
+                "SELECT ts,request_id,virtual_model,input_tokens,output_tokens,cache_read,cost_usd,cache_write
+                       FROM requests ORDER BY id",
+            )?;
+            let rows = st.query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                ))
+            })?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2, "迁移不许丢行");
+    println!(
+        "[v6] 升级后：user_version={}，requests {} 行；抽样 {:?} / {:?}",
+        SCHEMA_VERSION,
+        rows.len(),
+        rows[0],
+        rows[1]
+    );
+    assert_eq!(
+        rows[0],
+        (
+            1_750_000_000,
+            "req-old".into(),
+            Some("claude-haiku".into()),
+            Some(1000),
+            Some(500),
+            Some(80),
+            Some(0.0105),
+            None,
+        ),
+        "老行的既有列一个字都不许变，新列是 NULL"
+    );
+    assert_eq!(rows[1].1, "req-old-2");
+    assert_eq!(rows[1].6, None, "当时无价的老行仍是 NULL");
+    assert_eq!(rows[1].7, None);
+
+    // 迁移后新行能带缓存写（列真的可用）。
+    store
+        .write(|c| {
+            c.execute(
+                "INSERT INTO requests(ts,request_id,virtual_model,input_tokens,cache_read,cache_write)
+                 VALUES(1750000200,'req-new','claude-haiku',9,0,3819)",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let cw: i64 = store
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT cache_write FROM requests WHERE request_id='req-new'",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(cw, 3819);
+
+    // 迁移幂等：再开一次仍是 v6，行数不变。
+    drop(store);
+    let again = Store::open(&root).expect("再开");
+    assert_eq!(again.read(user_version).await.unwrap(), 6);
+    let n: i64 = again
+        .read(|c| Ok(c.query_row("SELECT count(*) FROM requests", [], |r| r.get(0))?))
+        .await
+        .unwrap();
+    assert_eq!(n, 3);
+}
+
 /// 判据是「不阻塞 tokio runtime」：写库在专属写线程上，读在 blocking 池上，都不在 runtime 线程上跑。
 #[tokio::test]
 async fn writes_and_reads_run_off_the_runtime_thread() {

@@ -109,7 +109,8 @@ impl ClientAssembler {
         }
     }
 
-    fn usage(&self) -> (Option<u64>, Option<u64>, Option<u64>) {
+    /// 四项 usage：`(输入, 输出, 缓存读, 缓存写)`（票 58）。
+    fn usage(&self) -> (Option<u64>, Option<u64>, Option<u64>, Option<u64>) {
         match self {
             ClientAssembler::A(a) => a.usage(),
             ClientAssembler::R(a) => a.usage(),
@@ -336,7 +337,7 @@ pub async fn forward_buffered(
     }
 
     let total_ms = t0.elapsed().as_millis() as i64;
-    let (usage_in, usage_out, cache_read) = asm.usage();
+    let (usage_in, usage_out, cache_read, cache_write) = asm.usage();
     let failure = match (asm.error(), transport) {
         (Some((kind, message)), _) => Some((StatusCode::BAD_GATEWAY, kind, message)),
         (None, Some(message)) => Some((StatusCode::BAD_GATEWAY, "api_error".into(), message)),
@@ -364,6 +365,7 @@ pub async fn forward_buffered(
         input_tokens: usage_in,
         output_tokens: usage_out,
         cache_read,
+        cache_write,
         aborted: failure.is_some(),
         error: failure.as_ref().map(|(_, _, m)| m.clone()),
         body: log_body(&app, &body),
@@ -609,11 +611,12 @@ impl Pump {
                     input_tokens,
                     output_tokens,
                     cache_read_input_tokens,
-                    ..
+                    cache_creation_input_tokens,
                 } => {
                     self.row.input_tokens = input_tokens.or(self.row.input_tokens);
                     self.row.output_tokens = output_tokens.or(self.row.output_tokens);
                     self.row.cache_read = cache_read_input_tokens.or(self.row.cache_read);
+                    self.row.cache_write = cache_creation_input_tokens.or(self.row.cache_write);
                 }
                 IrEvent::Eos | IrEvent::Error { .. } => self.terminated = true,
                 _ => {}

@@ -5,7 +5,7 @@
 //!
 //! v1 = 原型期的形状（`prototype/src/store.rs` 的四张表），v2 = spec §9 的形状，
 //! v3 = 票 49 给 `upstreams` 补「上次自检结果」，v4 = 票 50 补「上次成功拉取时间」，
-//! v5 = 票 51 给 `client_profiles` 补实测 UA 判据。
+//! v5 = 票 51 给 `client_profiles` 补实测 UA 判据，v6 = 票 58 给 `requests` 补 `cache_write`。
 //! 新库也照样从 v1 顺序跑到最新：装一次机就把整条迁移路径走一遍，热路径与升级路径不分叉。
 
 use anyhow::{Context, Result};
@@ -13,7 +13,7 @@ use rusqlite::{Connection, Transaction};
 use std::collections::HashMap;
 
 /// 当前 schema 版本 = 迁移表最后一条。
-pub const SCHEMA_VERSION: i32 = 5;
+pub const SCHEMA_VERSION: i32 = 6;
 
 pub(crate) struct Migration {
     pub(crate) version: i32,
@@ -40,6 +40,10 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 5,
         apply: v5_profile_match_ua,
+    },
+    Migration {
+        version: 6,
+        apply: v6_cache_write,
     },
 ];
 
@@ -389,5 +393,16 @@ fn v5_profile_match_ua(tx: &Transaction<'_>) -> Result<()> {
          UPDATE client_profiles SET match_ua='claude-cli/' WHERE id='claude-code' AND match_ua='';
          UPDATE client_profiles SET match_ua='codex_exec/;x-codex-' WHERE id='codex' AND match_ua='';",
     )?;
+    Ok(())
+}
+
+/// v6（票 58）：`requests` 补 `cache_write`（缓存写 token）。
+///
+/// v2 建的 `requests` 只收了 `input_tokens` / `output_tokens` / `cache_read`（原型期就这三项），
+/// 缓存写一直没列可落（票 33 第 4 节记的已知缺口）。这一列**只加不改**：既有列的名字、类型与
+/// 语义一个都不动，老行的新列是 NULL（= 当时没采，**不是 0**；上游没报与报了 0 是两句不同的话）。
+/// 计价口径另行补在 `obs::resolve_cost`（缓存写按缓存写价），**历史行不重算**（票 33 第 3 节）。
+fn v6_cache_write(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute_batch("ALTER TABLE requests ADD COLUMN cache_write INTEGER;")?;
     Ok(())
 }

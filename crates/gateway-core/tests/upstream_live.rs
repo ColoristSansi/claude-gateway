@@ -615,3 +615,147 @@ async fn ticket50_opencode_pull_flow_uses_the_credentialed_list() {
         "库文件里不该出现明文密钥"
     );
 }
+
+// ───────────────── 票 58 验收 2：真打一发带缓存写的请求，看它落库并计价 ─────────────────
+
+/// 票 58 验收 2（**联网**，默认不跑）：真打 commandcode 的 Anthropic 面一发带
+/// `cache_control: ephemeral` 的请求，走**产品侧同一条转发路径**（`forward_buffered`）——
+/// 断言 ① 上游报的缓存写 token 落进了 `requests.cache_write`；② 四项价（含缓存写）
+/// 算出 `cost_usd`；③ 随后把四项价全抬 10 倍 + 换快照，**这一行的数值一动不动**（不追古）。
+///
+/// 每次跑都换前缀：Anthropic 的 prompt cache 按前缀命中，同一个前缀第二次只会报 `cache_read`，
+/// 换一个才有「缓存创建」可测（真打的成本是几十个 token 的钱）。
+#[tokio::test]
+#[ignore = "打真上游：cargo test -p gateway-core --test upstream_live -- --ignored --nocapture"]
+async fn ticket58_a_real_cache_write_request_is_logged_and_priced() {
+    use gateway_core::binding::BindingTable;
+    use gateway_core::egress::provider::AuthScheme;
+    use gateway_core::egress::upstream::{forward_buffered, Inbound};
+    use gateway_core::ingress::proxy::Gateway;
+    use gateway_core::obs::{self, LogQuery};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    let env = EnvFile::load();
+    let base = env.get("COMMANDCODE_BASE_URL");
+    let key = env.get("COMMANDCODE_API_KEY");
+    let root = tmp_root("t58");
+    let store = Store::open(&root).expect("开库");
+
+    let up = live_upstream("commandcode", &base);
+    save_upstream(&store, &up).await.unwrap();
+    save_manual_model(
+        &store,
+        "commandcode",
+        "claude-sonnet-5-5",
+        &[Wire::Anthropic],
+    )
+    .await
+    .unwrap();
+    // 手工四项价都手填（含第四项缓存写）——本票要证的就是第四项真的参与计价。
+    let prices = Prices {
+        input: Some(3.0),
+        output: Some(15.0),
+        cache_read: Some(0.30),
+        cache_write: Some(3.75),
+    };
+    set_manual_prices(&store, "commandcode", "claude-sonnet-5-5", &prices)
+        .await
+        .unwrap();
+
+    let salt = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let filler: Vec<String> = (0..1200).map(|i| format!("token{i}")).collect();
+    let prefix = format!("You are a careful assistant ({salt}). {}", filler.join(" "));
+    let ir = gateway_core::anthropic::decode_request(&serde_json::json!({
+        "model": "claude-sonnet-5-5",
+        "max_tokens": 16,
+        "stream": true,
+        "system": [{"type": "text", "text": prefix, "cache_control": {"type": "ephemeral"}}],
+        "messages": [{"role": "user", "content": "say hi"}],
+    }))
+    .unwrap();
+
+    let app = Arc::new(Gateway::new(
+        store.clone(),
+        HashMap::new(),
+        BindingTable::default(),
+    ));
+    let resp = forward_buffered(
+        app,
+        &up,
+        Wire::Anthropic,
+        AuthScheme::Bearer,
+        &key,
+        ir,
+        "claude-haiku".into(),
+        "claude-code".into(),
+        Vec::new(),
+        Inbound::Anthropic,
+    )
+    .await;
+    assert_eq!(resp.status(), 200, "真上游这一发必须是 200");
+
+    let rows = obs::list(&store, &LogQuery::default()).await.unwrap();
+    let row = rows.first().expect("这一发必须落库").clone();
+    println!("\n[t58] 真打一发：{row}");
+    let cache_write = row["cache_write"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("cache_write 必须落库（不是 NULL）：{row}"));
+    assert!(cache_write > 0, "带 cache_control 的一发该有缓存写：{row}");
+    let cache_read = row["cache_read"].as_i64().unwrap_or(0);
+    let input = row["input_tokens"].as_i64().unwrap_or(0);
+    let output = row["output_tokens"].as_i64().unwrap_or(0);
+
+    // 独立手算：行里的四项 token × 手填的四项价（每百万 token 美元）。
+    let per_mtok = |t: i64, p: f64| t as f64 * p / 1_000_000.0;
+    let want = per_mtok(input, 3.0)
+        + per_mtok(output, 15.0)
+        + per_mtok(cache_read, 0.30)
+        + per_mtok(cache_write, 3.75);
+    let cost = row["cost_usd"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("四项价都有 → 成本必须算得出来：{row}"));
+    assert!(
+        (cost - want).abs() < 1e-12,
+        "成本 {cost} 与手算 {want} 不一致：{row}"
+    );
+
+    // 历史不重算：四项价全抬 10 倍 + 换一份快照，这一行一动不动。
+    set_manual_prices(
+        &store,
+        "commandcode",
+        "claude-sonnet-5-5",
+        &Prices {
+            input: Some(30.0),
+            output: Some(150.0),
+            cache_read: Some(3.0),
+            cache_write: Some(37.5),
+        },
+    )
+    .await
+    .unwrap();
+    import_catalog_snapshot(
+        &store,
+        r#"{"commandcode":{"models":{"claude-sonnet-5-5":{"name":"x","cost":{"input":99,"output":99,"cache_write":99}}}}}"#,
+    )
+    .await
+    .unwrap();
+    let after = obs::list(&store, &LogQuery::default()).await.unwrap();
+    assert_eq!(
+        after[0]["cost_usd"].as_f64().unwrap(),
+        cost,
+        "改价 / 刷新快照不许追古"
+    );
+    assert_eq!(after[0]["cache_write"].as_i64().unwrap(), cache_write);
+
+    assert!(
+        !dir_contains_bytes(&root, key.as_bytes()),
+        "库文件里不该出现明文密钥"
+    );
+    println!(
+        "[t58] cache_write={cache_write} cache_read={cache_read} in={input} out={output} → cost_usd=${cost:.6}（改价后仍是 ${cost:.6}）"
+    );
+}

@@ -109,6 +109,8 @@ pub struct RequestLog {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub cache_read: Option<u64>,
+    /// 缓存写（票 58）：上游报才记，没报就是 `None`（**不编 0**）。
+    pub cache_write: Option<u64>,
     pub aborted: bool,
     pub error: Option<String>,
     /// 出站请求体：只有 body 日志开关开着时才是 `Some`。
@@ -129,9 +131,9 @@ pub async fn log(store: &Store, row: &RequestLog) -> Result<()> {
             let tx = c.transaction()?;
             tx.execute(
                 "INSERT INTO requests(ts,request_id,virtual_model,client,upstream_id,real_model,wire,status,
-                                      first_byte_ms,total_ms,input_tokens,output_tokens,cache_read,
+                                      first_byte_ms,total_ms,input_tokens,output_tokens,cache_read,cache_write,
                                       aborted,error,cost_usd)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
                 params![
                     ts,
                     request_id,
@@ -146,6 +148,7 @@ pub async fn log(store: &Store, row: &RequestLog) -> Result<()> {
                     row.input_tokens.map(|v| v as i64),
                     row.output_tokens.map(|v| v as i64),
                     row.cache_read.map(|v| v as i64),
+                    row.cache_write.map(|v| v as i64),
                     row.aborted as i64,
                     row.error,
                     cost,
@@ -168,21 +171,29 @@ pub async fn log(store: &Store, row: &RequestLog) -> Result<()> {
 /// 价格读失败（库抖动）也退成 `None`：宁可这一行标「无价格」，也不让日志写不进去。
 fn cost_for(c: &Connection, row: &RequestLog) -> Option<f64> {
     let prices = provider::resolved_prices_from(c, &row.upstream_id, &row.real_model).ok()?;
-    resolve_cost(&prices, row.input_tokens, row.output_tokens, row.cache_read)
+    resolve_cost(
+        &prices,
+        row.input_tokens,
+        row.output_tokens,
+        row.cache_read,
+        row.cache_write,
+    )
 }
 
 /// 成本口径（票 33 第 1、3、4 节），纯函数好断言：
 ///
-/// - `token 未知`（三项全空）→ `None`；**不用本地估算反算**。
+/// - `token 未知`（四项全空）→ `None`；**不用本地估算反算**。
 /// - 缺价 → 整条 `None`（**不计入总额**，不半算、不记 0）。
-/// - `cache_read` 缺缓存读价则**退输入价**；`cache_write` 本期不计（票 58 补列后再算）。
+/// - `cache_read` 缺缓存读价则**退输入价**；`cache_write` 按**缓存写价**算，没有缓存写价
+///   就是缺价（票 33 第 4 节只给缓存读留了退路，缓存写没有这一条 → 不拿输入价顶替）。
 pub fn resolve_cost(
     prices: &ResolvedPrices,
     input: Option<u64>,
     output: Option<u64>,
     cache_read: Option<u64>,
+    cache_write: Option<u64>,
 ) -> Option<f64> {
-    if input.is_none() && output.is_none() && cache_read.is_none() {
+    if input.is_none() && output.is_none() && cache_read.is_none() && cache_write.is_none() {
         return None;
     }
     // 一项 = 有 token 就必须有价；没 token 的项（含 0）不拖累整条。
@@ -195,7 +206,8 @@ pub fn resolve_cost(
     let cache_price = prices.cache_read.value().or_else(|| prices.input.value());
     let total = part(input, prices.input.value())?
         + part(output, prices.output.value())?
-        + part(cache_read, cache_price)?;
+        + part(cache_read, cache_price)?
+        + part(cache_write, prices.cache_write.value())?;
     Some(total)
 }
 
@@ -277,16 +289,17 @@ fn row_json(r: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
         "input_tokens": r.get::<_, Option<i64>>(11)?,
         "output_tokens": r.get::<_, Option<i64>>(12)?,
         "cache_read": r.get::<_, Option<i64>>(13)?,
-        "aborted": r.get::<_, i64>(14)? != 0,
-        "error": r.get::<_, Option<String>>(15)?,
-        "cost_usd": r.get::<_, Option<f64>>(16)?,
-        "body": r.get::<_, Option<String>>(17)?,
+        "cache_write": r.get::<_, Option<i64>>(14)?,
+        "aborted": r.get::<_, i64>(15)? != 0,
+        "error": r.get::<_, Option<String>>(16)?,
+        "cost_usd": r.get::<_, Option<f64>>(17)?,
+        "body": r.get::<_, Option<String>>(18)?,
     }))
 }
 
 const ROW_COLUMNS: &str = "r.id,r.ts,r.request_id,r.virtual_model,r.client,r.upstream_id,r.real_model,r.wire,
-       r.status,r.first_byte_ms,r.total_ms,r.input_tokens,r.output_tokens,r.cache_read,r.aborted,r.error,
-       r.cost_usd,b.request_body";
+       r.status,r.first_byte_ms,r.total_ms,r.input_tokens,r.output_tokens,r.cache_read,r.cache_write,
+       r.aborted,r.error,r.cost_usd,b.request_body";
 
 /// 日志查询（时间倒序）。`limit` 缺省 = [`DEFAULT_PAGE`]，上限 500（一页别把界面压死）。
 pub async fn list(store: &Store, query: &LogQuery) -> Result<Vec<Value>> {
@@ -415,9 +428,10 @@ fn range_start(range: &str, now: i64) -> Result<i64> {
     })
 }
 
-/// 上游没回 usage 的判据：三项 token 全空 = 「token 未知」（票 33 第 3 节）。
+/// 上游没回 usage 的判据：**四项** token 全空 = 「token 未知」（票 33 第 3 节；票 58 把
+/// `cache_write` 也算进来——上游只报了缓存写、别的都没报，同样不该说成「token 未知」的反面）。
 const TOKEN_UNKNOWN_SQL: &str =
-    "input_tokens IS NULL AND output_tokens IS NULL AND cache_read IS NULL";
+    "input_tokens IS NULL AND output_tokens IS NULL AND cache_read IS NULL AND cache_write IS NULL";
 
 /// 概览要的用量汇总：范围内按维度分组的花费 / 请求数 / token + 总计，
 /// 另计「N 次无价格 / N 次 token 未知」（两者都**不计入总额**，票 33 第 1 节）。
@@ -429,6 +443,7 @@ pub async fn usage_summary(store: &Store, range: &str, dim: &str) -> Result<Valu
     let aggregates = format!(
         "SUM(cost_usd), COUNT(*),
          COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(cache_read),0),
+         COALESCE(SUM(cache_write),0),
          SUM(CASE WHEN cost_usd IS NULL AND NOT ({TOKEN_UNKNOWN_SQL}) THEN 1 ELSE 0 END),
          SUM(CASE WHEN {TOKEN_UNKNOWN_SQL} THEN 1 ELSE 0 END)"
     );
@@ -452,8 +467,9 @@ pub async fn usage_summary(store: &Store, range: &str, dim: &str) -> Result<Valu
                         "input_tokens": r.get::<_, i64>(2)?,
                         "output_tokens": r.get::<_, i64>(3)?,
                         "cache_read": r.get::<_, i64>(4)?,
-                        "no_price": r.get::<_, i64>(5)?,
-                        "token_unknown": r.get::<_, i64>(6)?,
+                        "cache_write": r.get::<_, i64>(5)?,
+                        "no_price": r.get::<_, i64>(6)?,
+                        "token_unknown": r.get::<_, i64>(7)?,
                     }))
                 })?)
             };
@@ -467,8 +483,9 @@ pub async fn usage_summary(store: &Store, range: &str, dim: &str) -> Result<Valu
                         "input_tokens": r.get::<_, i64>(3)?,
                         "output_tokens": r.get::<_, i64>(4)?,
                         "cache_read": r.get::<_, i64>(5)?,
-                        "no_price": r.get::<_, i64>(6)?,
-                        "token_unknown": r.get::<_, i64>(7)?,
+                        "cache_write": r.get::<_, i64>(6)?,
+                        "no_price": r.get::<_, i64>(7)?,
+                        "token_unknown": r.get::<_, i64>(8)?,
                     }))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
