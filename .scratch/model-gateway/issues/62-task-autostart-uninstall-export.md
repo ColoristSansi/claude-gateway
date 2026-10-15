@@ -25,7 +25,7 @@ Blocked by: 45, 54
 
 ## Answer
 
-2026-10-15 完成。基于集成分支 tip `2dfe335`（已含票 39–57 里已合的），实现 commit `9d4aeb2`，合并 commit `23064c0`（把票 53 日志面 / 票 57 结构化输出的 tip 合进来，冲突就地解决）。
+2026-10-15 完成。实现 commit `9d4aeb2`；收工前把集成分支 tip 合了两轮（票 53/57 的 `2dfe335` → `23064c0`，票 56 的 `a42b7a7` → `589cd8d`），冲突就地解决（维护面与日志面共用同一份错误体与 Maint 句柄；`Cargo.toml` 依赖表两边都留）。当前分支 tip = `589cd8d`，门禁在它上面重跑为绿。
 
 ### 做了什么
 
@@ -182,7 +182,7 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run
 `pwsh -File ./check.ps1 -Quick -Replay` → **`全部通过。`**（exit 0）：
 
 ```
-unit：shell 7 + core lib 136（含 dist:: 15 条）+ dist 6 + dist_api 5 + provider_table 19 + 结构化输出 14 + …
+unit：shell 7 + core lib 152（含 dist:: 15 条）+ dist 6 + dist_api 5 + provider_table 19 + 结构化输出 14 + Ollama 面 12 + …
 replay：22 用例全过；回放器 5 单测全过
 我自己的用例在输出里逐条可见：
   dist::autostart::tests::default_is_off_and_only_an_explicit_switch_writes_a_value
