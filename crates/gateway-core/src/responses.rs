@@ -217,7 +217,8 @@ fn call_id(it: &Value) -> String {
         .to_string()
 }
 
-fn parse_arguments(a: Option<&Value>) -> Value {
+/// 工具入参的两种形状（字符串 / 对象）都吃得下：Ollama 入站（`ingress::ollama`）也复用它。
+pub(crate) fn parse_arguments(a: Option<&Value>) -> Value {
     match a {
         Some(Value::String(s)) => serde_json::from_str::<Value>(s).unwrap_or_else(|_| json!({})),
         Some(v) => v.clone(),
@@ -283,7 +284,9 @@ fn decode_tool_choice(v: Option<&Value>) -> Option<Value> {
     }
 }
 
-fn push_block(msgs: &mut Vec<IrMessage>, role: &str, b: IrBlock) {
+/// 同 role 的相邻块并进同一轮：Ollama 的 `role:"tool"` 连续多条必须并成一个 user 轮，
+/// 否则 Anthropic 出站会把每个 `tool_result` 拆到不同的消息里（配对失败）。
+pub(crate) fn push_block(msgs: &mut Vec<IrMessage>, role: &str, b: IrBlock) {
     if let Some(last) = msgs.last_mut() {
         if last.role == role {
             last.blocks.push(b);
