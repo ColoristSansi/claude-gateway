@@ -6,6 +6,7 @@
 import { useState, type ReactNode } from 'react';
 
 import { api, ApiError, type ErrorShape } from './api';
+import { setCurrency, useCurrency, type Currency } from './currency';
 
 /** 后端的错误模板长这样；别的东西（字符串 / Error）也接得住。 */
 function isShape(value: unknown): value is ErrorShape {
@@ -142,13 +143,15 @@ export function formatTime(secs: number | null | undefined): string {
   return new Date(secs * 1000).toLocaleString();
 }
 
-/** 美元 → 人民币（币种以人民币为主、可切美元；不足 ¥0.01 显示 `<¥0.01`）。 */
+/**
+ * 美元 → 当前币种（票 33 第 2 节：库内美元为锚、界面人民币为主、可切美元）。
+ * 金额**两位小数**；不足一个最小单位显示 `<¥0.01` / `<$0.01`；没价显示「未知」（不是 0）。
+ */
 export function money(usd: number | null | undefined, rate: number | null, currency: 'CNY' | 'USD' = 'CNY'): string {
   if (usd === null || usd === undefined) return '未知';
-  if (currency === 'USD') return `$${usd.toFixed(2)}`;
-  const cny = usd * (rate ?? 7.1);
-  if (cny > 0 && cny < 0.01) return '<¥0.01';
-  return `¥${cny.toFixed(2)}`;
+  const [symbol, value] = currency === 'USD' ? ['$', usd] : ['¥', usd * (rate ?? 7.1)];
+  if (value > 0 && value < 0.01) return `<${symbol}0.01`;
+  return `${symbol}${value.toFixed(2)}`;
 }
 
 export function json(value: unknown): string {
@@ -158,4 +161,18 @@ export function json(value: unknown): string {
   } catch {
     return String(value);
   }
+}
+
+/** 币种切换（全局显示态，票 33 第 2 节；用量 / 概览 / 日志三处跟随同一个选择）。 */
+export function CurrencySwitch() {
+  const currency = useCurrency();
+  return (
+    <label title="库内以美元为锚；人民币按设置页的汇率换算（不联网）">
+      币种
+      <select value={currency} onChange={(e) => setCurrency(e.target.value as Currency)}>
+        <option value="CNY">人民币</option>
+        <option value="USD">美元</option>
+      </select>
+    </label>
+  );
 }

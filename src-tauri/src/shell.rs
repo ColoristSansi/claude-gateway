@@ -551,9 +551,33 @@ pub fn stop_gateway(app: &AppHandle) {
     }
 }
 
-/// 关窗 = 隐藏到托盘，网关继续跑；只有托盘「退出」才真停（票 18 §2）。
+/// 关窗行为（票 59 设置页那一项）：`hide`（默认，隐藏到托盘、网关继续跑）/
+/// `quit`（退出应用，网关跟着停）。**只有显式写了 `quit` 才不隐藏**——读不到库、设置项缺失
+/// 都按票 18 §2 的默认（隐藏）。
+fn hides_on_close(action: Option<&str>) -> bool {
+    action != Some(gateway_core::ingress::api::settings::TRAY_QUIT)
+}
+
+/// 从库里读关窗行为（读不到就是 `None`，按隐藏处理）。
+fn tray_close_action() -> Option<String> {
+    // shortcut: 每次关窗开一次库读一条设置。关窗是低频动作，为它常驻一个库句柄不值当；
+    // 真要热更新得给外壳挂一个共享的 Store（那是另一票的事）。
+    let dir = store::default_data_dir().ok()?;
+    let store = Store::open(&dir).ok()?;
+    tauri::async_runtime::block_on(gateway_core::ingress::api::setting_of(
+        &store,
+        gateway_core::store::settings_keys::TRAY_CLOSE_ACTION,
+    ))
+}
+
+/// 关窗：默认隐藏到托盘（网关继续跑，票 18 §2）；设置页选了「关窗退出应用」就真退。
 pub fn on_window_event(window: &Window, event: &WindowEvent) {
     if let WindowEvent::CloseRequested { api, .. } = event {
+        if !hides_on_close(tray_close_action().as_deref()) {
+            // 不拦这一次关闭，交给退出流程（`RunEvent::Exit` 里停网关）。
+            window.app_handle().exit(0);
+            return;
+        }
         api.prevent_close();
         let _ = window.hide();
     }
@@ -562,6 +586,15 @@ pub fn on_window_event(window: &Window, event: &WindowEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn close_hides_unless_the_setting_says_quit() {
+        // 默认（没这一项）/ 认不出的值都隐藏；只有显式 `quit` 才退出。
+        assert!(hides_on_close(None));
+        assert!(hides_on_close(Some("hide")));
+        assert!(hides_on_close(Some("sleep")));
+        assert!(!hides_on_close(Some("quit")));
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("cg-shell-test-{}-{name}", std::process::id()));

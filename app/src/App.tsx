@@ -18,7 +18,9 @@ import { ClientsPage } from './pages/ClientsPage';
 import { LogsPage } from './pages/LogsPage';
 import { ModelsPage } from './pages/ModelsPage';
 import { OverviewPage } from './pages/OverviewPage';
+import { SettingsPage } from './pages/SettingsPage';
 import { UpstreamsPage } from './pages/UpstreamsPage';
+import { UsagePage } from './pages/UsagePage';
 
 type PageDef = {
   slug: PageSlug;
@@ -52,9 +54,9 @@ const PAGES: PageDef[] = [
   { slug: 'upstreams', title: '上游', badge: 'upstreams', render: (ctx) => <UpstreamsPage ctx={ctx} /> },
   { slug: 'models', title: '模型与映射', render: (ctx) => <ModelsPage ctx={ctx} /> },
   { slug: 'clients', title: '客户端', badge: 'clients', render: (ctx) => <ClientsPage ctx={ctx} /> },
-  { slug: 'logs', title: '日志与调试', render: () => <LogsPage /> },
-  { slug: 'usage', title: '用量与成本', owner: '票 59' },
-  { slug: 'settings', title: '设置', owner: '票 59' },
+  { slug: 'logs', title: '日志与调试', render: (ctx) => <LogsPage confirm={ctx.confirm} /> },
+  { slug: 'usage', title: '用量与成本', render: () => <UsagePage /> },
+  { slug: 'settings', title: '设置', render: () => <SettingsPage /> },
 ];
 
 function currentHash(): { slug: PageSlug; hint: string | null } {

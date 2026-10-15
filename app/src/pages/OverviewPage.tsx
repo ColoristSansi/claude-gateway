@@ -4,12 +4,15 @@
 import { useCallback, useEffect, useState } from 'react';
 
 import { api, type AcceptanceResult, type RecentError, type UsageSummary } from '../api';
-import { ErrorBlock, formatTime, money, Pill } from '../components';
+import { CurrencySwitch, ErrorBlock, formatTime, money, Pill } from '../components';
+import { useCurrency } from '../currency';
 import type { ShellCtx } from '../App';
 
 type Step = { key: string; title: string; done: boolean; detail: string; page: 'upstreams' | 'models' | 'clients'; hint: string };
 
 export function OverviewPage({ ctx }: { ctx: ShellCtx }) {
+  // 币种是全局显示态（票 33 第 2 节）：概览与用量页、日志页跟随同一个选择。
+  const currency = useCurrency();
   const [errors, setErrors] = useState<RecentError[]>([]);
   const [usage, setUsage] = useState<UsageSummary | null>(null);
   const [acceptance, setAcceptance] = useState<AcceptanceResult | null>(null);
@@ -102,7 +105,10 @@ export function OverviewPage({ ctx }: { ctx: ShellCtx }) {
 
   return (
     <section className="page">
-      <h2>概览</h2>
+      <header className="page-head">
+        <h2>概览</h2>
+        <CurrencySwitch />
+      </header>
 
       <ol className="checklist">
         {steps.map((s) => (
@@ -160,7 +166,7 @@ export function OverviewPage({ ctx }: { ctx: ShellCtx }) {
                 </li>
                 <li>
                   <span>花费</span>
-                  <b>{money(usage.totals.cost_usd, usage.rate)}</b>
+                  <b>{money(usage.totals.cost_usd, usage.rate, currency)}</b>
                 </li>
                 <li>
                   <span>输入 / 输出 token</span>
@@ -189,7 +195,7 @@ export function OverviewPage({ ctx }: { ctx: ShellCtx }) {
                       <tr key={r.key}>
                         <td>{r.key ?? '（未知）'}</td>
                         <td>{r.requests}</td>
-                        <td>{money(r.cost_usd, usage.rate)}</td>
+                        <td>{money(r.cost_usd, usage.rate, currency)}</td>
                       </tr>
                     ))}
                   </tbody>

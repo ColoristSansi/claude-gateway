@@ -384,12 +384,23 @@ pub async fn forward_buffered(
     let mut parser = SseParser::default();
     let mut asm = ClientAssembler::new(inbound, req.freeform_tools.clone());
     let mut transport = None;
+    // 响应侧记录的决定在**开流时**定一次（票 59）：窗口中途到点也不该把这一发记成半截。
+    let recording = app.body_log_on();
+    let mut sse_raw = String::new();
+    let mut frames: Vec<obs::FrameLog> = Vec::new();
     {
         let mut bytes = resp.bytes_stream();
         while let Some(chunk) = bytes.next().await {
             match chunk {
                 Ok(c) => {
+                    if recording && sse_raw.len() < MAX_SSE_BYTES {
+                        sse_raw.push_str(&String::from_utf8_lossy(&c));
+                    }
                     for f in parser.push(&c) {
+                        if recording && frames.len() < MAX_FRAMES {
+                            let seq = frames.len() as i64;
+                            frames.push(frame_log(seq, t0.elapsed().as_millis() as i64, &f));
+                        }
                         for ev in dec.decode(&f) {
                             asm.push(ev);
                         }
@@ -442,7 +453,9 @@ pub async fn forward_buffered(
         cache_write,
         aborted: failure.is_some(),
         error: failure.as_ref().map(|(_, _, m)| m.clone()),
-        body: log_body(&app, &body),
+        body: recording.then(|| body.to_string()),
+        response_body: recording.then_some(sse_raw),
+        frames,
     };
     let _ = obs::log(&app.store, &row).await;
 
@@ -588,6 +601,7 @@ pub async fn forward(
         Wire::OpenAiChat => Decoder::O(OpenAiDecoder::default()),
         Wire::OpenAiResponses => return wire_not_implemented(wire, inbound, &up.id),
     };
+    let recording = app.body_log_on();
     let pump = Pump {
         inner: Box::pin(resp.bytes_stream()),
         parser: SseParser::default(),
@@ -601,6 +615,8 @@ pub async fn forward(
         ping: app.ping,
         probe: app.probe,
         store: app.store.clone(),
+        recording,
+        sse_raw: String::new(),
         row: RequestLog {
             ts: 0,
             virtual_model: client_model,
@@ -609,7 +625,7 @@ pub async fn forward(
             real_model: req.model.clone(),
             wire: wire.as_str().into(),
             status: 200,
-            body: log_body(&app, &body),
+            body: recording.then(|| body.to_string()),
             ..Default::default()
         },
     };
@@ -689,12 +705,40 @@ struct Pump {
     probe: Duration,
     store: Store,
     row: RequestLog,
+    /// body 开关开着时才记的响应侧（票 59）：原始 SSE 文本 + 逐帧元数据。
+    recording: bool,
+    /// 上游回来的原始字节（按文本累积）：详情第三段「原始 SSE 文本」就是它。
+    sse_raw: String,
+}
+
+/// 帧与原文的上限（票 59）：一条长回复可以几千帧、几兆字节，全存会把库撑爆。
+/// shortcut: 超出就丢后面的帧 / 原文尾部（够看清形状与错误现场）；要全量另开票。
+const MAX_FRAMES: usize = 500;
+const MAX_SSE_BYTES: usize = 256 * 1024;
+
+/// 一帧 → 详情三段里的那行（时间戳相对本次请求开始）。
+fn frame_log(seq: i64, at_ms: i64, f: &sse::Frame) -> obs::FrameLog {
+    let event = f.event.clone();
+    obs::FrameLog {
+        seq,
+        at_ms,
+        summary: truncate(&f.data, 200),
+        raw: sse::frame(event.as_deref().unwrap_or("message"), &f.data),
+        event,
+    }
 }
 
 impl Pump {
     fn handle(&mut self, f: &sse::Frame, out: &mut String) {
+        self.record(f);
         for ev in self.dec.decode(f) {
             match &ev {
+                // Anthropic 的输入 token 在 `message_start` 里报（非流式那条路早就取了它，
+                // 流式这条路原先漏了）：只在 `message_delta` 重复报一次时才落库，
+                // 上游不重复报就整条输入 token 变 NULL、用量页少算一半。
+                IrEvent::Start { input_tokens, .. } => {
+                    self.row.input_tokens = input_tokens.or(self.row.input_tokens);
+                }
                 IrEvent::Usage {
                     input_tokens,
                     output_tokens,
@@ -714,6 +758,11 @@ impl Pump {
     }
 
     fn pump(&mut self, chunk: &[u8]) -> String {
+        // 帧边界由解析器切，但「原始 SSE 文本」要的是**上游原样字节**（含注释帧、CRLF），
+        // 所以另攒一份：解析后的帧重建不出原样的分隔符。
+        if self.recording && self.sse_raw.len() < MAX_SSE_BYTES {
+            self.sse_raw.push_str(&String::from_utf8_lossy(chunk));
+        }
         let frames = self.parser.push(chunk);
         let mut out = String::new();
         for f in &frames {
@@ -723,6 +772,16 @@ impl Pump {
             self.first_byte_ms = Some(self.t0.elapsed().as_millis() as i64);
         }
         out
+    }
+
+    /// 记一帧（只在该次请求开着 body 开关时；上限见 [`MAX_FRAMES`]）。
+    fn record(&mut self, f: &sse::Frame) {
+        if !self.recording || self.row.frames.len() >= MAX_FRAMES {
+            return;
+        }
+        let seq = self.row.frames.len() as i64;
+        let at_ms = self.t0.elapsed().as_millis() as i64;
+        self.row.frames.push(frame_log(seq, at_ms, f));
     }
 
     /// 上游断在终态之前：必须给客户端一个 error 帧，不能静默收尾。
@@ -759,6 +818,9 @@ impl Pump {
         self.row.aborted |= aborted;
         self.row.first_byte_ms = self.first_byte_ms.unwrap_or(-1);
         self.row.total_ms = self.t0.elapsed().as_millis() as i64;
+        if self.recording {
+            self.row.response_body = Some(std::mem::take(&mut self.sse_raw));
+        }
         write_log(&self.store, self.row.clone());
     }
 }
@@ -769,7 +831,10 @@ fn write_log(store: &Store, row: RequestLog) {
     let store = store.clone();
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         handle.spawn(async move {
-            let _ = obs::log(&store, &row).await;
+            // 写失败要留痕：静默丢掉一行日志，界面会以为「这次请求没发生」。
+            if let Err(e) = obs::log(&store, &row).await {
+                eprintln!("[warn] 请求日志写不进去：{e}");
+            }
         });
     }
 }
@@ -810,11 +875,6 @@ async fn log_plain(
         },
     )
     .await;
-}
-
-/// body 日志：开关没开或已到点就是 None（默认只记元数据，票 11 的日志定案）。
-fn log_body(app: &Gateway, body: &Value) -> Option<String> {
-    app.body_log_on().then(|| body.to_string())
 }
 
 fn first_user_text(req: &IrRequest) -> String {

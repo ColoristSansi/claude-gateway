@@ -6,7 +6,7 @@
 //! v1 = 原型期的形状（`prototype/src/store.rs` 的四张表），v2 = spec §9 的形状，
 //! v3 = 票 49 给 `upstreams` 补「上次自检结果」，v4 = 票 50 补「上次成功拉取时间」，
 //! v5 = 票 51 给 `client_profiles` 补实测 UA 判据，v6 = 票 57 给 `upstreams` 补结构化输出能力位，
-//! v7 = 票 58 给 `requests` 补 `cache_write`。
+//! v7 = 票 58 给 `requests` 补 `cache_write`，v8 = 票 59 给帧时间轴建 `request_frames`。
 //! 新库也照样从 v1 顺序跑到最新：装一次机就把整条迁移路径走一遍，热路径与升级路径不分叉。
 
 use anyhow::{Context, Result};
@@ -14,7 +14,7 @@ use rusqlite::{Connection, Transaction};
 use std::collections::HashMap;
 
 /// 当前 schema 版本 = 迁移表最后一条。
-pub const SCHEMA_VERSION: i32 = 7;
+pub const SCHEMA_VERSION: i32 = 8;
 
 pub(crate) struct Migration {
     pub(crate) version: i32,
@@ -50,6 +50,10 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 7,
         apply: v7_cache_write,
+    },
+    Migration {
+        version: 8,
+        apply: v8_request_frames,
     },
 ];
 
@@ -423,5 +427,33 @@ fn v6_structured_output_caps(tx: &Transaction<'_>) -> Result<()> {
 /// （本迁移在集成分支上从 v6 顺延为 v7：票 57 先占了 v6 的结构化输出能力位。）
 fn v7_cache_write(tx: &Transaction<'_>) -> Result<()> {
     tx.execute_batch("ALTER TABLE requests ADD COLUMN cache_write INTEGER;")?;
+    Ok(())
+}
+
+/// v8（票 59）：日志详情第三段「帧时间轴」的落点——新表 `request_frames`。
+///
+/// spec §9 的表草案里**没有**帧 / 事件的落点（`.scratch/model-gateway/frontend.md` §⑤.5 记的
+/// 就是这个缺口），票 53 也只落了出站请求体。这里按票 59 的自定落点落成一表：
+/// **一帧一行**（时间戳 + 事件类型 + 摘要 + 可展开的原文），随 `requests` 外键级联删、
+/// 与保留期清理同路。
+///
+/// 「**原始 SSE 文本**」不另建列：`request_bodies.response_body` 在 v2 就建好了、一直是 NULL，
+/// 现在存**字节原样的整条上游 SSE**（同一张表、同一个 `request_id` 主键、同一套级联），
+/// 只有 body 开关开着时才有行（响应内容也是内容，与请求体同一个闸门）。
+fn v8_request_frames(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute_batch(
+        "CREATE TABLE request_frames(
+             request_id INTEGER NOT NULL REFERENCES requests(id) ON DELETE CASCADE,
+             -- 帧序号（0 起，按到达顺序）
+             seq INTEGER NOT NULL,
+             -- 相对本次请求开始的毫秒数
+             at_ms INTEGER NOT NULL,
+             -- `event:` 那一行；没有就是 NULL
+             event TEXT,
+             summary TEXT NOT NULL DEFAULT '',
+             -- 该帧原文（从解析结果重建）
+             raw TEXT,
+             PRIMARY KEY(request_id, seq));",
+    )?;
     Ok(())
 }
