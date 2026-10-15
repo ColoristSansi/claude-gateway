@@ -3,10 +3,11 @@
 //! 分工：网关本体在 `gateway_core::service`（不依赖 Tauri），本模块只决定
 //! 「什么时候起、什么时候停、托盘上怎么写」。
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use tauri::image::Image;
@@ -15,7 +16,9 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{App, AppHandle, Manager, Window, WindowEvent, Wry};
 
 use gateway_core::ingress::api::rfc3339_utc;
+use gateway_core::ingress::proxy;
 use gateway_core::service::{self, Gateway, GatewayConfig};
+use gateway_core::store::Store;
 
 /// 外壳的常驻状态：网关句柄 + 「网关状态」菜单项（要改文案的那一条）。
 #[derive(Default)]
@@ -89,12 +92,29 @@ pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
 
     let db_path = data_dir.join(gateway_core::store::DB_FILE_NAME);
     let port = load_port(&data_dir);
+
+    // 转发面 `/v1/*` 接进同一个进程（票 44 交付）：库由外壳开，落点就是上面那个 db_path。
+    // 供应商表与绑定表此刻是空的（归票 49 / 51）——空表下未知模型按入站协议回
+    // `not_found_error` 信封，而不是 axum 的裸 404，所以空表也照样挂上。
+    let forwarding = match Store::open(&data_dir) {
+        Ok(store) => Some(Arc::new(proxy::Gateway::new(
+            store,
+            HashMap::new(),
+            Vec::new(),
+        ))),
+        Err(e) => {
+            let line = format!("库打开失败，转发面未挂载：{e}");
+            eprintln!("{line}");
+            let _ = append_log(&logs, &line);
+            None
+        }
+    };
+
     let config = GatewayConfig {
         port,
         db_path: db_path.clone(),
         version: env!("CARGO_PKG_VERSION").to_string(),
-        // 转发面（`/v1/*`）的状态：供应商表与绑定表来自票 49 / 51，外壳这里先只起管理面。
-        forwarding: None,
+        forwarding,
     };
 
     // 网关与外壳同进程（票 18 §2 定案：不是 sidecar）。
