@@ -689,6 +689,8 @@ pub struct ResponsesAssembler {
     usage_in: Option<u64>,
     usage_out: Option<u64>,
     cache_read: Option<u64>,
+    /// 缓存写（票 58）：入站是 Responses 的客户端走 Anthropic 上游时，这一项也得进日志行。
+    cache_write: Option<u64>,
     ended: bool,
     error: Option<(String, String)>,
     blocks: Vec<AsmBlock>,
@@ -731,11 +733,12 @@ impl ResponsesAssembler {
                 input_tokens,
                 output_tokens,
                 cache_read_input_tokens,
-                ..
+                cache_creation_input_tokens,
             } => {
                 self.usage_in = input_tokens.or(self.usage_in);
                 self.usage_out = output_tokens.or(self.usage_out);
                 self.cache_read = cache_read_input_tokens.or(self.cache_read);
+                self.cache_write = cache_creation_input_tokens.or(self.cache_write);
             }
             IrEvent::Error { kind, message } => {
                 if self.error.is_none() {
@@ -762,8 +765,14 @@ impl ResponsesAssembler {
         self.error.clone()
     }
 
-    pub fn usage(&self) -> (Option<u64>, Option<u64>, Option<u64>) {
-        (self.usage_in, self.usage_out, self.cache_read)
+    /// 四项 usage：`(输入, 输出, 缓存读, 缓存写)`（票 58）；上游没报的是 `None`。
+    pub fn usage(&self) -> (Option<u64>, Option<u64>, Option<u64>, Option<u64>) {
+        (
+            self.usage_in,
+            self.usage_out,
+            self.cache_read,
+            self.cache_write,
+        )
     }
 
     pub fn response(&self, model: &str) -> Value {

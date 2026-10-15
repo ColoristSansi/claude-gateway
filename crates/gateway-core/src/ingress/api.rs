@@ -1,15 +1,23 @@
-//! 管理 API：前端与外壳读的 `/api/*`（spec §3 / §10），与转发面 `/api` 之外的 `/v1/*` 分开挂。
+//! 管理 API：前端与外壳读的 `/api/*`（spec §3 / §10），与转发面 `/v1/*` 分开挂。
 //!
-//! 只读快照 + 两个开关动作，不碰请求路径；转发路径上只有转换，没有业务。
+//! 票 43 只落了 `GET /api/status` 一格；票 52 把前端四页（概览 / 上游 / 模型与映射 / 客户端）
+//! 需要的聚合与动作端点补齐。**路径与语义对齐 `.scratch/model-gateway/frontend.md` §③ 那张
+//! 反推表**，不另起一套命名。
 //!
-//! 票 53 在这里挂日志与用量基础（日志页与概览要的那半）：
+//! - 只读聚合在 [`overview`] / [`upstreams`] / [`bindings`] / [`clients`]；
+//! - 端口与启停（只有外壳做得了）在 [`gateway`]，经 [`GatewayControl`] 转给外壳；
+//! - 业务能力**全部复用已有公开 API**：`egress::provider`（票 49）、`egress::discovery`（票 50）、
+//!   `binding`（票 51）、`writer` 三客户端（票 45–48）、`clients`（本票的装配层）。这里不重写。
+//! - 界面侧只看到掩码：`/api/*` 的响应里**永远没有密钥明文**（spec §9 / 票 17 第 82 条）。
+//!
+//! 票 53 在这里挂日志与用量基础（日志页与概览要的那半，合并时原样保留）：
 //!
 //! | 端点 | 用途 |
 //! | --- | --- |
 //! | `GET /api/logs` | 元数据表格：时间倒序 50 条 + 四个筛选 + 模型名 / 请求 ID 搜索 + 翻页 |
 //! | `GET /api/logs/filters` | 筛选下拉的候选值（库里真出现过的） |
 //! | `GET/POST /api/logs/body-recording` | body 开关（默认关、开启需隐私确认、1 小时自动关） |
-//! | `GET /api/usage/summary` | 概览要的今日 / 近 7 天 × 虚拟模型 / 上游 |
+//! | `GET /api/usage/summary` | 概览要的今日 / 近 7 天 × 虚拟模型 / 上游（票 53 的统计层） |
 //!
 //! 详情四段（`GET /api/logs/:requestId`）、五个时间范围与按天明细归票 59。
 //!
@@ -36,8 +44,15 @@
 //! 检查 / 下载 / 安装是 Tauri updater 插件的事（要 AppHandle），所以外壳递进来一个
 //! [`crate::dist::update::UpdateSource`]；**没递进来同样是 503**。
 
+pub mod bindings;
+pub mod clients;
+pub mod gateway;
+pub mod overview;
+pub mod upstreams;
+
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -47,13 +62,205 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 
+use crate::binding::BindingTable;
+use crate::clients::{ClientEnv, ClientId, GatewayValues};
 use crate::dist::autostart::{self, HkcuRun};
 use crate::dist::update::UpdateSource;
 use crate::dist::{bundle, DPAPI_MIGRATION_WARNING};
 use crate::obs::{self, BodyLogWindow, LogQuery, BODY_LOG_WINDOW};
-use crate::store::Store;
+use crate::store::{settings_keys, Store};
+use crate::writer::claude_code::ModelSlots;
+
+/// 客户端填的占位 key（网关不校验入站凭据；真实上游凭据在网关侧、只以掩码出界面）。
+pub const PLACEHOLDER_API_KEY: &str = "claude-gateway-local";
+
+/// 外壳要替网关做的两件事（管理 API 跑在网关进程里，重启自己得靠外壳）。
+pub trait GatewayControl: Send + Sync {
+    /// 网关没在跑时把它拉起来（未运行横幅的「启动网关」）。
+    fn start(&self) -> Result<(), String>;
+    /// 换端口：外壳停掉旧监听、按新端口再起（**用户确认过才调**，不静默换端口）。
+    fn restart(&self, port: u16) -> Result<(), String>;
+}
+
+/// 什么都不做的实现（回放 harness / 单测：管理面照样能用，只是启停没有落点）。
+#[derive(Debug, Default)]
+pub struct NoopControl;
+
+impl GatewayControl for NoopControl {
+    fn start(&self) -> Result<(), String> {
+        Err("这一档没有外壳（无头模式），请在应用里点「启动网关」".to_string())
+    }
+
+    fn restart(&self, _port: u16) -> Result<(), String> {
+        Err("这一档没有外壳（无头模式），换端口后请手动重启".to_string())
+    }
+}
+
+/// 管理面的业务上下文：库、客户端的三个配置根、外壳句柄、出站 HTTP 客户端。
+///
+/// `ApiState` 里它是 `Option`：M1 那条「只挂管理面」的路（`forwarding = None` 的单测）
+/// 不带它，`/api/*` 的聚合端点会明确报「这一档没有管理面」而不是 500。
+pub struct AdminCtx {
+    pub store: Store,
+    pub data_dir: PathBuf,
+    pub env: ClientEnv,
+    pub control: Arc<dyn GatewayControl>,
+    pub http: reqwest::Client,
+    pub version: String,
+    pub db_path: String,
+    /// 转发面（票 41 的 [`crate::ingress::proxy::Gateway`]）：改完配置热重载那三张表用它。
+    proxy: Option<Arc<crate::ingress::proxy::Gateway>>,
+    /// 真正绑上的端口（`service::start` 绑定后写入）；0 = 还不知道，回退 `settings.port`。
+    real_port: Arc<AtomicU16>,
+}
+
+/// 手写 `Debug`：上下文里有库句柄与凭据入口，**绝不打印内容**。
+impl std::fmt::Debug for AdminCtx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdminCtx")
+            .field("data_dir", &self.data_dir)
+            .field("version", &self.version)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AdminCtx {
+    /// 装一个管理面上下文（出站 HTTP 客户端在这里建：外壳不必自己引 reqwest）。
+    pub fn new(
+        store: Store,
+        data_dir: PathBuf,
+        env: ClientEnv,
+        control: Arc<dyn GatewayControl>,
+        version: impl Into<String>,
+        db_path: impl Into<String>,
+    ) -> AdminCtx {
+        AdminCtx {
+            store,
+            data_dir,
+            env,
+            control,
+            // 单次请求的上限比探针档（20 秒）宽：拉 /models 与验收都要留余量，各自另有超时。
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(120))
+                .build()
+                .unwrap_or_default(),
+            version: version.into(),
+            db_path: db_path.into(),
+            proxy: None,
+            real_port: Arc::new(AtomicU16::new(0)),
+        }
+    }
+
+    /// 挂上转发面（外壳与集成测试）；改配置的端点会经 [`AdminCtx::reload_forwarding`] 让它
+    /// **立刻看到新表**，不必重启网关。
+    pub fn with_proxy(mut self, proxy: Arc<crate::ingress::proxy::Gateway>) -> AdminCtx {
+        self.proxy = Some(proxy);
+        self
+    }
+
+    /// 上游 / 目录 / 绑定表改过之后重载转发面（没有挂转发面就是空操作：M1 那一档）。
+    pub async fn reload_forwarding(&self) -> anyhow::Result<()> {
+        match &self.proxy {
+            Some(gw) => gw.reload().await,
+            None => Ok(()),
+        }
+    }
+
+    /// 监听绑定后由 [`crate::service::start`] 写进来：**实际端口的唯一真相**。
+    pub fn set_real_port(&self, port: u16) {
+        self.real_port.store(port, Ordering::SeqCst);
+    }
+
+    /// 读一条 `settings`（没有就是 `None`）。
+    pub async fn setting(&self, key: &str) -> Option<String> {
+        let key = key.to_string();
+        self.store
+            .read(move |c| {
+                Ok(c.query_row(
+                    "SELECT value FROM settings WHERE key=?1",
+                    rusqlite::params![key],
+                    |r| r.get::<_, String>(0),
+                )
+                .ok())
+            })
+            .await
+            .ok()
+            .flatten()
+            .filter(|v| !v.is_empty())
+    }
+
+    /// 写一条 `settings`。
+    pub async fn set_setting(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        let (key, value) = (key.to_string(), value.to_string());
+        self.store
+            .write(move |c| {
+                c.execute(
+                    "INSERT INTO settings(key,value) VALUES(?1,?2)
+                     ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    rusqlite::params![key, value],
+                )?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// 当前端口：**实际绑上的那个**优先（测试与「端口写进库但还没重启」两种情况都靠它），
+    /// 其次 `settings.port`（票 42 的表；外壳启动时也读它）。
+    pub async fn port(&self) -> u16 {
+        let real = self.real_port.load(Ordering::SeqCst);
+        if real != 0 {
+            return real;
+        }
+        self.setting(settings_keys::PORT)
+            .await
+            .and_then(|v| v.parse::<u16>().ok())
+            .filter(|p| *p != 0)
+            .unwrap_or(crate::service::DEFAULT_PORT)
+    }
+
+    pub async fn base_url(&self) -> String {
+        format!("http://{}:{}", crate::service::HOST, self.port().await)
+    }
+
+    /// 汇率（人民币为主、可切美元；库内美元为锚）。
+    pub async fn exchange_rate(&self) -> f64 {
+        self.setting(settings_keys::USD_CNY_RATE)
+            .await
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|r| *r > 0.0)
+            .unwrap_or(7.10)
+    }
+
+    /// 写进客户端的那几个值：地址跟端口走，模型清单按档案解析（票 51 的覆盖）。
+    pub async fn gateway_values(&self) -> anyhow::Result<GatewayValues> {
+        let table = crate::binding::load(&self.store).await?;
+        let exposed = table.exposed_for(crate::binding::Profile::Codex);
+        let default_model = exposed
+            .iter()
+            .find(|m| m.is_family && m.binding.is_some())
+            .map(|m| m.name.clone())
+            .unwrap_or_else(|| crate::binding::FAMILY_SLOTS[0].to_string());
+        Ok(GatewayValues {
+            base_url: self.base_url().await,
+            api_key: PLACEHOLDER_API_KEY.to_string(),
+            models: ModelSlots::default(),
+            exposed,
+            default_model,
+        })
+    }
+
+    /// 绑定表（界面与诊断都要）。
+    pub async fn bindings(&self) -> anyhow::Result<BindingTable> {
+        crate::binding::load(&self.store).await
+    }
+
+    /// 探针 / 自检共用一份出站调试日志的目录。
+    pub fn log_root(&self) -> PathBuf {
+        crate::writer::WriteRoots::with_data_dir(&self.data_dir, &self.data_dir).log_root
+    }
+}
 
 /// 维护动作（开机自启 / 导出 / 导入）要的东西：库 + 数据目录。
 ///
@@ -121,12 +328,14 @@ pub struct ApiState {
     port: u16,
     started_at: SystemTime,
     running: Arc<AtomicBool>,
+    admin: Option<Arc<AdminCtx>>,
     logs: Option<LogsState>,
     maint: Option<Maintenance>,
     /// 自动升级（票 61）：外壳把 Tauri updater 插件接进来才有，没有就 503。
     updater: Option<Arc<dyn UpdateSource>>,
 }
 
+/// 日志面的两个句柄（票 53；与转发路径共用同一个 body 窗口实例）。
 #[derive(Clone)]
 struct LogsState {
     store: Store,
@@ -142,20 +351,30 @@ impl ApiState {
             port,
             started_at: SystemTime::now(),
             running: Arc::new(AtomicBool::new(true)),
+            admin: None,
             logs: None,
             maint: None,
             updater: None,
         }
     }
 
-    /// 把转发面的日志库与 body 窗口接过来（票 53）。同一个窗口实例，所以日志页上的开关
-    /// 就是转发路径读的那个开关。
+    /// 票 53：把转发面的日志库与 body 窗口接过来（日志页上的开关就是转发路径读的那个）。
     pub fn attach_logs(mut self, forwarding: &crate::ingress::proxy::Gateway) -> Self {
         self.logs = Some(LogsState {
             store: forwarding.store.clone(),
             body_log: forwarding.body_log.clone(),
         });
         self
+    }
+
+    /// 带上管理面上下文（外壳与集成测试走这条）。
+    pub fn with_admin(mut self, admin: Arc<AdminCtx>) -> Self {
+        self.admin = Some(admin);
+        self
+    }
+
+    pub fn admin(&self) -> Option<&Arc<AdminCtx>> {
+        self.admin.as_ref()
     }
 
     /// 挂上维护面（票 62，外壳启动时调）。
@@ -206,6 +425,10 @@ impl ApiState {
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
             db_path: self.db_path.clone(),
+            data_dir: self
+                .admin
+                .as_ref()
+                .map(|a| a.data_dir.to_string_lossy().to_string()),
         }
     }
 }
@@ -220,12 +443,14 @@ pub struct GatewayStatus {
     pub started_at: String,
     pub uptime_seconds: u64,
     pub db_path: String,
+    /// 数据目录（设置页与诊断包要用；没挂管理面时为 `null`）。
+    pub data_dir: Option<String>,
 }
 
 pub fn router(state: ApiState) -> Router {
     Router::new()
         .route("/api/status", get(status))
-        // 票 53：日志页（表 / 筛选候选 / body 开关）与概览的用量汇总。
+        // 票 53：日志页（表 / 筛选候选 / body 开关）与概览的用量汇总（合并时原样保留）。
         .route("/api/logs", get(logs))
         .route("/api/logs/filters", get(log_filters))
         .route(
@@ -245,7 +470,58 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/update/status", get(update_status))
         .route("/api/update/check", post(update_check))
         .route("/api/update/install", post(update_install))
+        .merge(overview::routes())
+        .merge(upstreams::routes())
+        .merge(bindings::routes())
+        .merge(clients::routes())
+        .merge(gateway::routes())
+        .layer(axum::middleware::from_fn(cors))
         .with_state(state)
+}
+
+/// 管理面的跨源白名单：开发态 Vite（1420）与 Tauri webview 的两个来源。
+///
+/// **不用 `*`**：`/api/*` 能改客户端配置文件，放开给任意网页等于给本机开了个后门。
+/// 只回自己人；不在白名单的来源一个 CORS 头都不给。
+fn allowed_origin(origin: &str) -> bool {
+    matches!(
+        origin,
+        "http://localhost:1420"
+            | "http://127.0.0.1:1420"
+            | "tauri://localhost"
+            | "http://tauri.localhost"
+            | "https://tauri.localhost"
+    )
+}
+
+async fn cors(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let origin = req
+        .headers()
+        .get("origin")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let preflight = req.method() == axum::http::Method::OPTIONS;
+    let mut resp = if preflight {
+        Response::new(axum::body::Body::empty())
+    } else {
+        next.run(req).await
+    };
+    if let Some(origin) = origin.filter(|o| allowed_origin(o)) {
+        let headers = resp.headers_mut();
+        if let Ok(value) = origin.parse() {
+            headers.insert("access-control-allow-origin", value);
+        }
+        headers.insert(
+            "access-control-allow-methods",
+            "GET,POST,PUT,DELETE,OPTIONS".parse().unwrap(),
+        );
+        headers.insert(
+            "access-control-allow-headers",
+            "content-type".parse().unwrap(),
+        );
+        headers.insert("vary", "origin".parse().unwrap());
+    }
+    resp
 }
 
 async fn status(State(state): State<ApiState>) -> Json<GatewayStatus> {
@@ -482,6 +758,169 @@ async fn dist_info() -> Json<DistInfo> {
     })
 }
 
+/// 读一条 `settings`（外壳 IPC 在没有 [`AdminCtx`] 时用它）。
+pub async fn setting_of(store: &Store, key: &str) -> Option<String> {
+    let key = key.to_string();
+    store
+        .read(move |c| {
+            Ok(c.query_row(
+                "SELECT value FROM settings WHERE key=?1",
+                rusqlite::params![key],
+                |r| r.get::<_, String>(0),
+            )
+            .ok())
+        })
+        .await
+        .ok()
+        .flatten()
+        .filter(|v| !v.is_empty())
+}
+
+/// 写一条 `settings`。
+pub async fn set_setting_of(store: &Store, key: &str, value: &str) -> anyhow::Result<()> {
+    let (key, value) = (key.to_string(), value.to_string());
+    store
+        .write(move |c| {
+            c.execute(
+                "INSERT INTO settings(key,value) VALUES(?1,?2)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                rusqlite::params![key, value],
+            )?;
+            Ok(())
+        })
+        .await
+}
+
+/// 管理面上下文；没挂（M1 单测那档）就明确报，不 500。
+pub(crate) fn admin(state: &ApiState) -> Result<Arc<AdminCtx>, ApiFailure> {
+    state.admin.clone().ok_or_else(|| {
+        ApiFailure::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "这一档只挂了管理面骨架（没有库与客户端配置根）",
+                "网关是以无头 / 单测形态起的，没有 `/api/*` 的聚合上下文",
+            ),
+        )
+    })
+}
+
+/// 错误模板（spec §10 错误表达）：**发生了什么 + 可能原因 + 一个主按钮 + 复制诊断**。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiError {
+    /// 发生了什么（一句话，人话）。
+    pub what: String,
+    /// 可能原因。
+    pub likely_cause: String,
+    /// 主按钮（前端拿它渲染一颗按钮；`null` = 只提示）。
+    pub action: Option<ApiAction>,
+    /// 原始错误原文（可展开）。
+    pub raw: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiAction {
+    pub label: String,
+    /// 动作类型（前端据此换页 / 重试 / 起网关 / 换端口）。
+    pub kind: String,
+    /// 换页类动作的目标页（`upstreams` / `models` / `clients` / `overview`）。
+    pub page: Option<String>,
+}
+
+impl ApiError {
+    pub fn new(
+        status: StatusCode,
+        what: impl Into<String>,
+        likely_cause: impl Into<String>,
+    ) -> ApiError {
+        let _ = status;
+        ApiError {
+            what: what.into(),
+            likely_cause: likely_cause.into(),
+            action: None,
+            raw: None,
+        }
+    }
+
+    pub fn with_action(mut self, label: &str, kind: &str, page: Option<&str>) -> ApiError {
+        self.action = Some(ApiAction {
+            label: label.to_string(),
+            kind: kind.to_string(),
+            page: page.map(str::to_string),
+        });
+        self
+    }
+
+    pub fn with_raw(mut self, raw: impl std::fmt::Display) -> ApiError {
+        self.raw = Some(raw.to_string());
+        self
+    }
+}
+
+/// 带上 HTTP 状态码的错误信封。
+///
+/// `error` 装箱：`ApiError` 里有几句话（String），不装箱会让每个 `Result<_, ApiFailure>`
+/// 的 Err 变体撑到 150+ 字节（clippy 的 `result_large_err`），handler 遍地都是。
+#[derive(Debug)]
+pub struct ApiFailure {
+    pub status: StatusCode,
+    pub error: Box<ApiError>,
+}
+
+impl ApiFailure {
+    pub fn new(status: StatusCode, error: ApiError) -> ApiFailure {
+        ApiFailure {
+            status,
+            error: Box::new(error),
+        }
+    }
+}
+
+impl From<anyhow::Error> for ApiFailure {
+    fn from(e: anyhow::Error) -> ApiFailure {
+        ApiFailure::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "操作没能完成",
+                "网关内部出错（看原始错误）",
+            )
+            .with_raw(e),
+        )
+    }
+}
+
+impl IntoResponse for ApiFailure {
+    fn into_response(self) -> Response {
+        (self.status, Json(json!({ "error": self.error.as_ref() }))).into_response()
+    }
+}
+
+/// `Json<T>` 之外还要给一件「原始结果也带上」的：直接透传 serde 值。
+pub(crate) fn ok_json(value: Value) -> Json<Value> {
+    Json(value)
+}
+
+/// 128 位随机 id（本地用，不做密码学）：探针 / 验收请求的 requestId 前缀。
+pub fn random_id(prefix: &str) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id() as u128;
+    format!("{prefix}-{:x}{:x}", nanos, pid)
+}
+
+/// 现在（Unix 秒）。
+pub fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// `GET /api/logs` 的查询串。空串当没传（界面清空输入框时就是空串）。
 #[derive(Debug, Default, Deserialize)]
 struct LogParams {
@@ -656,8 +1095,6 @@ fn failed_status(code: StatusCode, message: String) -> Response {
         .into_response()
 }
 
-/// `SystemTime` → `YYYY-MM-DDTHH:MM:SSZ`（UTC）。
-///
 /// 手写历法换算（Howard Hinnant 的 civil_from_days），不为一个时间戳引日期库。
 /// 外壳写自己的运行日志时也用这一份，时间格式全局一致。
 pub fn rfc3339_utc(t: SystemTime) -> String {
@@ -680,6 +1117,35 @@ pub fn rfc3339_utc(t: SystemTime) -> String {
     let year = yoe + era * 400 + i64::from(month <= 2);
 
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}Z")
+}
+
+/// 一个端口此刻是不是空的（换端口探测用它）。
+pub async fn port_is_free(port: u16) -> bool {
+    tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port)))
+        .await
+        .is_ok()
+}
+
+/// 探一个空闲端口（操作系统挑，**只预填、不写入**）。
+pub async fn probe_free_port() -> Option<u16> {
+    let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .ok()?;
+    listener.local_addr().ok().map(|a| a.port())
+}
+
+/// 客户端 id → 档案 / 配置根的转发，省得每个 handler 都写一遍 match。
+pub(crate) fn parse_client(id: &str) -> Result<ClientId, ApiFailure> {
+    ClientId::parse(id).ok_or_else(|| {
+        ApiFailure::new(
+            StatusCode::NOT_FOUND,
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                format!("没有这个客户端：{id}"),
+                "客户端只有 claude-desktop / claude-code / codex 三个",
+            ),
+        )
+    })
 }
 
 #[cfg(test)]

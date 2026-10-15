@@ -238,7 +238,14 @@ impl OpenAiDecoder {
                 cache_read_input_tokens: u
                     .pointer("/prompt_tokens_details/cached_tokens")
                     .and_then(|t| t.as_u64()),
-                cache_creation_input_tokens: None,
+                // 缓存写（票 58）：真录帧里它报在 usage **顶层**的 `cache_creation_input_tokens`
+                // （`tests/fixtures/cache-write/openai.sse`，2026-10-15 实测 2623），名字与 Anthropic
+                // 侧同名——OpenAI 官方词表里根本没有这个字段，所以按实测落，不照抄文档猜。
+                // 同一上游的 deepseek 面另有 `prompt_tokens_details.cache_write_tokens`
+                // （实测两次都恒为 0，拿不出「非零」的证据）→ **不读它**，免得把没验证过的形状当口径。
+                cache_creation_input_tokens: u
+                    .get("cache_creation_input_tokens")
+                    .and_then(|t| t.as_u64()),
             });
         }
 
@@ -327,5 +334,76 @@ fn map_finish_reason(r: &str) -> &str {
         "tool_calls" | "function_call" => "tool_use",
         "content_filter" => "end_turn",
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 真录帧的字节（录制工具 `tests/record.ps1` 原样落盘；只读、不许改）。
+    const REAL_CACHE_WRITE_OPENAI: &str = include_str!("../tests/fixtures/cache-write/openai.sse");
+
+    /// 票 58：OpenAI Chat 侧的缓存写字段，**用真录帧**
+    /// （`tests/fixtures/cache-write/openai.sse`，2026-10-15 真打 commandcode `/chat/completions`
+    /// + `gpt-6-luna`，system 是 >1024 token 的前缀 → 触发缓存创建）。
+    ///
+    /// 实测（帧文件就是独立来源）：`usage.cache_creation_input_tokens` = **2623**（顶层），
+    /// `prompt_tokens` 2626、`completion_tokens` 6、`prompt_tokens_details.cached_tokens` 0。
+    /// ——**不是** OpenAI 文档里的名字（那边没有缓存写这一项），名字与 Anthropic 侧同名。
+    #[test]
+    fn openai_cache_creation_input_tokens_lands_in_cache_write() {
+        let mut parser = sse::SseParser::default();
+        let mut frames = parser.push(REAL_CACHE_WRITE_OPENAI.as_bytes());
+        frames.extend(parser.finish());
+
+        let mut dec = OpenAiDecoder::default();
+        let mut usage = None;
+        for f in &frames {
+            for ev in dec.decode(f) {
+                if let IrEvent::Usage {
+                    input_tokens,
+                    output_tokens,
+                    cache_read_input_tokens,
+                    cache_creation_input_tokens,
+                } = ev
+                {
+                    usage = Some((
+                        input_tokens,
+                        output_tokens,
+                        cache_read_input_tokens,
+                        cache_creation_input_tokens,
+                    ));
+                }
+            }
+        }
+        assert_eq!(
+            usage,
+            Some((Some(2626), Some(6), Some(0), Some(2623))),
+            "(输入, 输出, 缓存读, 缓存写)"
+        );
+    }
+
+    /// 上游没报缓存写时是 `None`（**不编 0**）：这一帧没有 `cache_creation_input_tokens` 键。
+    #[test]
+    fn absent_cache_creation_stays_none() {
+        let mut dec = OpenAiDecoder::default();
+        let evs = dec.decode(&sse::Frame {
+            event: None,
+            data: r#"{"usage":{"prompt_tokens":10,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":4}}}"#
+                .into(),
+        });
+        let usage = evs
+            .into_iter()
+            .find_map(|e| match e {
+                IrEvent::Usage {
+                    cache_read_input_tokens,
+                    cache_creation_input_tokens,
+                    ..
+                } => Some((cache_read_input_tokens, cache_creation_input_tokens)),
+                _ => None,
+            })
+            .expect("这一帧该给出 Usage 事件");
+        assert_eq!(usage, (Some(4), None));
     }
 }

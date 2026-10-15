@@ -38,11 +38,17 @@ function money(usd: number | null, rate: number | null, currency: 'cny' | 'usd')
 }
 
 function tokens(row: LogRow): string {
-  if (row.input_tokens === null && row.output_tokens === null && row.cache_read === null) {
+  if (
+    row.input_tokens === null &&
+    row.output_tokens === null &&
+    row.cache_read === null &&
+    row.cache_write === null
+  ) {
     return 'token 未知';
   }
   const parts = [`入 ${row.input_tokens ?? '?'}`, `出 ${row.output_tokens ?? '?'}`];
   if (row.cache_read) parts.push(`缓存读 ${row.cache_read}`);
+  if (row.cache_write) parts.push(`缓存写 ${row.cache_write}`);
   return parts.join(' · ');
 }
 

@@ -20,6 +20,8 @@ fn config(port: u16, db_path: &str) -> GatewayConfig {
         maintenance: None,
         // 升级面（票 61）要 Tauri updater 插件，只有外壳递得进来；这里不挂（端点是 503）。
         updater: None,
+        // 票 43 的验收只测管理面与生命周期：不带票 52 的 AdminCtx（那套由 tests/admin_api.rs 覆盖）。
+        admin: None,
     }
 }
 

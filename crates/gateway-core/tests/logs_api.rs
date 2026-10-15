@@ -136,6 +136,8 @@ async fn logs_table_sorts_filters_searches_and_pages() {
             r.status = 502;
             r.aborted = true;
             r.request_id = Some("req-known-0001".into());
+            // 票 58：缓存写这一列也要从 `/api/logs` 出得来。
+            r.cache_write = Some(3819);
         }
         obs::log(&api.store, &r).await.expect("写日志");
     }
@@ -149,6 +151,10 @@ async fn logs_table_sorts_filters_searches_and_pages() {
     assert_eq!(rows[0]["client"], "codex");
     assert_eq!(rows[0]["request_id"], "req-known-0001");
     assert_eq!(rows[0]["aborted"], true);
+    assert_eq!(
+        rows[0]["cache_write"], 3819,
+        "缓存写这一列要从 /api/logs 出得来（票 58）：{rows:?}"
+    );
     assert_eq!(v["limit"], 50);
     assert!(v["next_cursor"].is_i64(), "满了就该给游标：{v}");
     assert_eq!(v["retention_days"], 7);
@@ -300,6 +306,8 @@ async fn usage_summary_serves_today_and_7d_for_the_overview() {
     assert_eq!(v["totals"]["requests"], 2);
     assert_eq!(v["totals"]["no_price"], 1);
     assert_eq!(v["totals"]["token_unknown"], 0);
+    // 票 58：汇总四列 token（含缓存写）都在；这两个计数把缓存写也算进「token 未知」的判据。
+    assert_eq!(v["totals"]["cache_write"], 0, "{v}");
     let cost = v["totals"]["cost_usd"].as_f64().unwrap();
     assert!((cost - 0.0105).abs() < 1e-12, "今日只算那一条有价的：{v}");
     assert_eq!(v["rate"], 7.10);
@@ -310,6 +318,7 @@ async fn usage_summary_serves_today_and_7d_for_the_overview() {
         .find(|r| r["key"] == "claude-haiku")
         .expect("按虚拟模型分组");
     assert_eq!(haiku["requests"], 1);
+    assert_eq!(haiku["cache_write"], 0, "分组行也带这一列：{haiku}");
     let opus = v["rows"]
         .as_array()
         .unwrap()

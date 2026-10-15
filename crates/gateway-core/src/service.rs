@@ -15,7 +15,7 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
-use crate::ingress::api::{ApiState, GatewayStatus};
+use crate::ingress::api::{AdminCtx, ApiState, GatewayStatus};
 
 /// 只监听回环：网关是本机客户端的私有上游（spec §3）。
 pub const HOST: &str = "127.0.0.1";
@@ -37,6 +37,9 @@ pub struct GatewayConfig {
     /// 升级面（票 61）：检查更新 / 下载 / 静默安装走 Tauri 的 updater 插件，由外壳实现
     /// [`crate::dist::update::UpdateSource`] 后递进来。`None` = `/api/update/*` 是 503。
     pub updater: Option<Arc<dyn crate::dist::update::UpdateSource>>,
+    /// 管理面 `/api/*` 的业务上下文（库 + 三个客户端的配置根 + 外壳句柄，票 52）。
+    /// `None` = 只挂 `/api/status` 那一条（M1 单测那档）。
+    pub admin: Option<Arc<AdminCtx>>,
 }
 
 #[derive(Debug)]
@@ -130,22 +133,25 @@ pub async fn start(cfg: GatewayConfig) -> Result<Gateway, StartError> {
         source: e,
     })?;
 
-    let state = ApiState::new(
+    let mut api_state = ApiState::new(
         cfg.version,
         cfg.db_path.to_string_lossy().into_owned(),
         addr.port(),
     );
     // 票 62：维护面（导出 / 导入 / 自启开关）跟着库走，不管转发面挂没挂。
-    let state = match cfg.maintenance {
-        Some(maint) => state.with_maintenance(maint),
-        None => state,
-    };
+    if let Some(maint) = cfg.maintenance {
+        api_state = api_state.with_maintenance(maint);
+    }
     // 票 61：升级面（检查更新 / 静默安装）同样由外壳递进来；没递进来就是 503。
-    let state = match cfg.updater {
-        Some(updater) => state.with_updater(updater),
-        None => state,
-    };
-    let state = Arc::new(state);
+    if let Some(updater) = cfg.updater {
+        api_state = api_state.with_updater(updater);
+    }
+    if let Some(admin) = cfg.admin.clone() {
+        // 绑定成功之后才知道真端口（`port = 0` 是操作系统挑的）：写回管理面上下文。
+        admin.set_real_port(addr.port());
+        api_state = api_state.with_admin(admin);
+    }
+    let state = Arc::new(api_state);
     // 票 53：保留期清理表跟着网关起——启动立刻扫一次（把上次退出后攒下的老行清掉），之后每小时一次。
     // 只在转发面挂了的时候起（没有库就没有日志可清）。
     if let Some(gateway) = &cfg.forwarding {

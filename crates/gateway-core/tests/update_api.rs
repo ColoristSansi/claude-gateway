@@ -123,6 +123,8 @@ async fn start(tag: &str, updater: Option<Arc<dyn UpdateSource>>) -> (u16, servi
         version: "0.1.0".to_string(),
         forwarding: None,
         maintenance: None,
+        // 管理面聚合（票 52）在这一格里不挂：只测升级接口面。
+        admin: None,
         updater,
     })
     .await
