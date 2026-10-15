@@ -525,9 +525,9 @@ async fn upgrades_a_v6_db_to_v7_adding_cache_write_without_touching_old_rows() {
         println!("[v7] 升级前：user_version=6，requests {n} 行，列里没有 cache_write");
     }
 
-    let store = Store::open(&root).expect("v6 库升到 v7");
+    let store = Store::open(&root).expect("v6 库升到最新");
     assert_eq!(store.read(user_version).await.unwrap(), SCHEMA_VERSION);
-    assert_eq!(SCHEMA_VERSION, 7, "本票把最新版推到 v7");
+    assert_eq!(SCHEMA_VERSION, 8, "票 59 把最新版推到 v8（帧表）");
 
     // 行数一条不丢，抽样逐列对得上，新列在老行上是 NULL。
     /// 抽样那一行的形状：ts / request_id / virtual_model / 三项 token / cost / cache_write。
@@ -613,15 +613,99 @@ async fn upgrades_a_v6_db_to_v7_adding_cache_write_without_touching_old_rows() {
         .unwrap();
     assert_eq!(cw, 3819);
 
-    // 迁移幂等：再开一次仍是 v7，行数不变。
+    // 迁移幂等：再开一次仍是最新版，行数不变。
     drop(store);
     let again = Store::open(&root).expect("再开");
-    assert_eq!(again.read(user_version).await.unwrap(), 7);
+    assert_eq!(again.read(user_version).await.unwrap(), SCHEMA_VERSION);
     let n: i64 = again
         .read(|c| Ok(c.query_row("SELECT count(*) FROM requests", [], |r| r.get(0))?))
         .await
         .unwrap();
     assert_eq!(n, 3);
+}
+
+/// 票 59：v7 → v8 只加一张 `request_frames`，既有数据一个字节不动；帧随请求行级联删。
+#[tokio::test]
+async fn upgrades_a_v7_db_to_v8_adding_the_frame_table() {
+    let root = tmp_root("migrate-v8");
+    std::fs::create_dir_all(&root).unwrap();
+    let db = root.join(DB_FILE_NAME);
+    {
+        let mut c = Connection::open(&db).unwrap();
+        super::schema::migrate_upto(&mut c, 7).unwrap();
+        c.execute(
+            "INSERT INTO requests(ts,request_id,virtual_model,input_tokens,output_tokens,cache_read,
+                                  cache_write,aborted,cost_usd)
+             VALUES(1750000000,'req-old','claude-haiku',1000,500,80,3819,0,0.01454325)",
+            [],
+        )
+        .unwrap();
+        // v7 的库里没有帧表（票 59 才建）。
+        let has: i64 = c
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='request_frames'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has, 0, "v7 的库不该有 request_frames");
+        println!("[v8] 升级前：user_version=7，requests 1 行，没有 request_frames");
+    }
+
+    let store = Store::open(&root).expect("v7 库升到 v8");
+    assert_eq!(store.read(user_version).await.unwrap(), 8);
+    // 老行逐列不变（含票 58 的缓存写与冻结的成本）。
+    let kept: (String, Option<i64>, Option<i64>, Option<f64>) = store
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT request_id,cache_write,input_tokens,cost_usd FROM requests",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(kept.0, "req-old");
+    assert_eq!(kept.1, Some(3819));
+    assert_eq!(kept.2, Some(1000));
+    assert!((kept.3.unwrap() - 0.01454325).abs() < 1e-12, "{kept:?}");
+    println!("[v8] 升级后：user_version=8，请求行仍在；{}", kept.0);
+
+    // 新表真的可用，并且靠外键随请求行一起走。
+    store
+        .write(|c| {
+            let id: i64 = c.query_row("SELECT id FROM requests", [], |r| r.get(0))?;
+            c.execute(
+                "INSERT INTO request_frames(request_id,seq,at_ms,event,summary,raw)
+                 VALUES(?1,0,3,'message_start','{...}','event: message_start\\n\\n')",
+                rusqlite::params![id],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let frames: i64 = store
+        .read(|c| Ok(c.query_row("SELECT count(*) FROM request_frames", [], |r| r.get(0))?))
+        .await
+        .unwrap();
+    assert_eq!(frames, 1);
+    store
+        .write(|c| {
+            c.execute("DELETE FROM requests", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let left: i64 = store
+        .read(|c| Ok(c.query_row("SELECT count(*) FROM request_frames", [], |r| r.get(0))?))
+        .await
+        .unwrap();
+    assert_eq!(left, 0, "帧要随请求行级联删（清空日志与保留期清理都靠它）");
+
+    // 幂等：再开一次仍是 v8。
+    drop(store);
+    let again = Store::open(&root).expect("再开");
+    assert_eq!(again.read(user_version).await.unwrap(), 8);
 }
 
 /// 判据是「不阻塞 tokio runtime」：写库在专属写线程上，读在 blocking 池上，都不在 runtime 线程上跑。

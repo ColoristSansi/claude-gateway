@@ -662,7 +662,17 @@ async fn usage_summary_counts_unpriced_and_unknown_tokens_separately() {
     assert_eq!(week["rows"][0]["key"], "u1");
 
     // 范围 / 维度取值域之外的，报错而不是悄悄给一份错的。
-    assert!(usage_summary(&store, "30d", "virtual_model").await.is_err());
+    // （票 59 起 `30d` / `all` / `custom` 也认——五个范围共用 `usage` 一份实现。）
+    let month = usage_summary(&store, "30d", "virtual_model").await.unwrap();
+    assert_eq!(
+        month["totals"]["requests"], 5,
+        "9 天前那条也在近 30 天里：{month}"
+    );
+    let all = usage_summary(&store, "all", "client").await.unwrap();
+    assert_eq!(all["totals"]["requests"], 5, "{all}");
+    assert!(usage_summary(&store, "last-year", "virtual_model")
+        .await
+        .is_err());
     assert!(usage_summary(&store, "today", "pizza").await.is_err());
 }
 
@@ -738,4 +748,251 @@ async fn usage_summary_counts_cache_write_rows_and_totals_it() {
     assert_eq!(rows.len(), 1, "{today}");
     assert_eq!(rows[0]["key"], "claude-haiku", "{today}");
     assert_eq!(rows[0]["cache_write"], 4010, "分组行也要带缓存写：{today}");
+}
+
+// ───────────────────────── 票 59：五段范围 / 三维度 / 按天明细 / 详情四段 ─────────────────────────
+
+/// 时间窗的日边界按**本机本地时区自然日**（票 33 第 5 节）。期望值取历法本身
+/// （用 .NET `DateTimeOffset` 独立算过）：东八区 `now = 2026-10-15T00:00:00Z`（本地 08:00），
+/// 本地那一天的 0 点 = UTC `2026-10-14T16:00:00Z`。
+#[test]
+fn range_windows_use_local_natural_days() {
+    let offset = 8 * 3_600; // 东八区
+    let now = 1_792_022_400; // 2026-10-15T00:00:00Z
+    let local_midnight = 1_791_993_600; // 2026-10-14T16:00:00Z
+
+    let (from, to) = range_window("today", now, offset, None, None).unwrap();
+    assert_eq!(to, None, "今日 = 到现在为止");
+    assert_eq!(from, local_midnight);
+
+    let (from7, _) = range_window("7d", now, offset, None, None).unwrap();
+    assert_eq!(from7, local_midnight - 6 * 86_400, "近 7 天含今天那一天");
+    let (from30, _) = range_window("30d", now, offset, None, None).unwrap();
+    assert_eq!(from30, local_midnight - 29 * 86_400);
+    let (from_all, _) = range_window("all", now, offset, None, None).unwrap();
+    assert_eq!(from_all, 0, "全部 = 从纪元起");
+    assert!(range_window("last-year", now, offset, None, None).is_err());
+
+    // 换个时区（UTC）时同一刻的「今天」从 UTC 0 点算起：日边界真的跟着本机时区走。
+    let (utc_from, _) = range_window("today", now, 0, None, None).unwrap();
+    assert_eq!(utc_from, 1_792_022_400, "UTC 下今天就是 UTC 那天");
+}
+
+/// 自定义区间：[from, to] 两个**本地日期**，`to` 含当天（右端是它下一天的起点）。
+#[test]
+fn custom_range_covers_whole_local_days_including_the_end_date() {
+    let offset = 8 * 3_600;
+    let (from, to) = range_window(
+        "custom",
+        1_792_022_400,
+        offset,
+        Some("2026-10-01"),
+        Some("2026-10-15"),
+    )
+    .unwrap();
+    // 本地 10-01 0 点 → UTC 09-30 16:00 = 1_790_784_000（.NET 独立算过）。
+    assert_eq!(from, 1_790_784_000);
+    // 右端 = 本地 10-16 0 点（左闭右开，10-15 全天在内）= 1_792_080_000。
+    assert_eq!(to, Some(1_792_080_000));
+    assert!(to.unwrap() - from == 15 * 86_400);
+
+    // 只给 from = 从那天到此刻；日期写坏 / 起止倒置都要报错，不静默全量。
+    let (_, open) =
+        range_window("custom", 1_792_022_400, offset, Some("2026-10-01"), None).unwrap();
+    assert_eq!(open, None);
+    assert!(range_window("custom", 1_792_022_400, offset, None, None).is_err());
+    assert!(range_window("custom", 1_792_022_400, offset, Some("2026/10/01"), None).is_err());
+    assert!(
+        range_window(
+            "custom",
+            1_792_022_400,
+            offset,
+            Some("2026-10-15"),
+            Some("2026-10-01")
+        )
+        .is_err(),
+        "结束早于开始要报错，不能悄悄给空表"
+    );
+}
+
+/// 用量页：三维度各自一组、按天明细按**本地自然日**分桶、五个范围都认。
+#[tokio::test]
+async fn usage_report_groups_by_every_dimension_and_lists_local_days() {
+    let root = tmp_root("usage-report");
+    let store = Store::open(&root).unwrap();
+    provider::save_upstream(&store, &upstream("u1"))
+        .await
+        .unwrap();
+    provider::save_manual_model(&store, "u1", "priced", &[])
+        .await
+        .unwrap();
+    provider::set_manual_prices(
+        &store,
+        "u1",
+        "priced",
+        &Prices {
+            input: Some(3.0),
+            output: Some(15.0),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let now = unix_now();
+    let day = 86_400;
+    // 今天两条（不同客户端 / 虚拟模型），昨天一条，40 天前一条（只进「全部」）。
+    for (ts, vm, client) in [
+        (now - 60, "claude-haiku", "claude-code"),
+        (now - 120, "claude-opus", "codex"),
+        (now - day, "claude-haiku", "codex"),
+        (now - 40 * day, "claude-haiku", "claude-code"),
+    ] {
+        let mut r = row("u1", "priced", ts);
+        r.virtual_model = vm.into();
+        r.client = Some(client.into());
+        r.cache_read = None;
+        log(&store, &r).await.unwrap();
+    }
+
+    // 三维度都验：同一份数据换个维度就是另一种分组键。
+    let by_model = usage(&store, "all", "virtual_model", None, None)
+        .await
+        .unwrap();
+    assert_eq!(by_model["totals"]["requests"], 4, "{by_model}");
+    assert_eq!(by_model["rows"].as_array().unwrap().len(), 2);
+    let keys: Vec<&str> = by_model["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["key"].as_str().unwrap())
+        .collect();
+    assert_eq!(keys, vec!["claude-haiku", "claude-opus"], "按花费降序");
+
+    let by_up = usage(&store, "all", "upstream", None, None).await.unwrap();
+    assert_eq!(by_up["rows"].as_array().unwrap().len(), 1, "{by_up}");
+    assert_eq!(by_up["rows"][0]["key"], "u1");
+
+    let by_client = usage(&store, "all", "client", None, None).await.unwrap();
+    let clients: Vec<&str> = by_client["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["key"].as_str().unwrap())
+        .collect();
+    assert_eq!(clients, vec!["claude-code", "codex"], "{by_client}");
+
+    // 近 30 天不含那条 40 天前的；今日只算今天的两条。
+    assert_eq!(
+        usage(&store, "30d", "virtual_model", None, None)
+            .await
+            .unwrap()["totals"]["requests"],
+        3
+    );
+    assert_eq!(
+        usage(&store, "today", "virtual_model", None, None)
+            .await
+            .unwrap()["totals"]["requests"],
+        2
+    );
+
+    // 按天明细：三条各一天（今天 / 昨天 / 40 天前），日期串按**本地**自然日给。
+    let daily = by_model["daily"].as_array().unwrap();
+    assert_eq!(daily.len(), 3, "{by_model}");
+    let offset = local_offset_secs();
+    let want_today = {
+        let d = civil_from_days((now + offset).div_euclid(day));
+        format!("{:04}-{:02}-{:02}", d.0, d.1, d.2)
+    };
+    assert_eq!(daily[2]["day"], want_today, "最后一行是今天：{by_model}");
+    assert_eq!(daily[2]["requests"], 2);
+    assert_eq!(daily[0]["requests"], 1, "最早那天是 40 天前：{by_model}");
+    // 每天的花费 = 那一天的行之和（两条有价的 → $0.021）。
+    assert!((daily[2]["cost_usd"].as_f64().unwrap() - 0.021).abs() < 1e-12);
+
+    // 自定义区间：只要昨天那一天 → 1 条。
+    let yesterday = {
+        let d = civil_from_days((now + offset).div_euclid(day) - 1);
+        format!("{:04}-{:02}-{:02}", d.0, d.1, d.2)
+    };
+    let custom = usage(
+        &store,
+        "custom",
+        "virtual_model",
+        Some(&yesterday),
+        Some(&yesterday),
+    )
+    .await
+    .unwrap();
+    assert_eq!(custom["totals"]["requests"], 1, "{custom}");
+    assert_eq!(custom["daily"].as_array().unwrap().len(), 1);
+    assert_eq!(custom["daily"][0]["day"], yesterday);
+}
+
+/// 详情三段的数据源：概要 / 请求与响应体 / 帧时间轴；`id` 认行 id 也认 `request_id`。
+#[tokio::test]
+async fn log_detail_serves_summary_bodies_and_frames_by_both_keys() {
+    let root = tmp_root("log-detail");
+    let store = Store::open(&root).unwrap();
+    let mut r = row("u1", "priced", unix_now() - 30);
+    r.request_id = Some("req-known".into());
+    r.error = Some("上游 502：bad gateway".into());
+    r.status = 502;
+    r.aborted = true;
+    r.body = Some(r#"{"model":"出站请求体"}"#.into());
+    r.response_body = Some("event: message_start\ndata: {\"type\":\"message_start\"}\n\n".into());
+    r.frames = vec![
+        FrameLog {
+            seq: 0,
+            at_ms: 3,
+            event: Some("message_start".into()),
+            summary: "{\"type\":\"message_start\"}".into(),
+            raw: "event: message_start\ndata: {\"type\":\"message_start\"}\n\n".into(),
+        },
+        FrameLog {
+            seq: 1,
+            at_ms: 41,
+            event: Some("message_stop".into()),
+            summary: "{\"type\":\"message_stop\"}".into(),
+            raw: "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".into(),
+        },
+    ];
+    log(&store, &r).await.unwrap();
+
+    // 按 request_id 取。
+    let by_rid = log_detail(&store, "req-known").await.unwrap().unwrap();
+    assert_eq!(by_rid["summary"]["request_id"], "req-known");
+    assert_eq!(by_rid["summary"]["status"], 502);
+    assert_eq!(by_rid["bodies"]["request"], r#"{"model":"出站请求体"}"#);
+    assert!(by_rid["bodies"]["response"]
+        .as_str()
+        .unwrap()
+        .contains("message_start"));
+    let frames = by_rid["frames"].as_array().unwrap();
+    assert_eq!(frames.len(), 2, "两帧按 seq 排序：{by_rid}");
+    assert_eq!(frames[0]["event"], "message_start");
+    assert_eq!(frames[0]["seq"], 0);
+    assert_eq!(frames[1]["at_ms"], 41);
+    assert!(frames[1]["raw"].as_str().unwrap().contains("message_stop"));
+
+    // 按行 id 取（界面从列表跳过来用的是这把钥匙）。
+    let id = by_rid["summary"]["id"].as_i64().unwrap().to_string();
+    let by_id = log_detail(&store, &id).await.unwrap().unwrap();
+    assert_eq!(by_id["summary"]["request_id"], "req-known");
+
+    // 查不到是 None（管理面翻 404），不是一份空详情。
+    assert!(log_detail(&store, "req-nope").await.unwrap().is_none());
+
+    // 清空日志：行、body、帧一起走（外键级联），回删掉的行数。
+    assert_eq!(clear_logs(&store).await.unwrap(), 1);
+    assert!(log_detail(&store, "req-known").await.unwrap().is_none());
+    let bodies: i64 = store
+        .read(|c| Ok(c.query_row("SELECT COUNT(*) FROM request_bodies", [], |r| r.get(0))?))
+        .await
+        .unwrap();
+    let frames_left: i64 = store
+        .read(|c| Ok(c.query_row("SELECT COUNT(*) FROM request_frames", [], |r| r.get(0))?))
+        .await
+        .unwrap();
+    assert_eq!((bodies, frames_left), (0, 0), "body 与帧要跟着请求行走");
 }

@@ -15,6 +15,14 @@
 //!
 //! 时区口径：日边界按**本机本地时区自然日**（spec §9），所以这里自己算本地偏移，
 //! 不引时间库。
+//!
+//! 票 59 在查询面补齐两件事：
+//!
+//! - **用量页的五段范围 × 三维度 + 按天明细**（[`usage`] / [`range_window`]）：概览那份
+//!   （今日 / 近 7 天）走的是同一个实现，两边不会各算一套。
+//! - **详情三段的数据源**（[`log_detail`]）：概要 / 请求与响应体 / 帧时间轴。上游那侧
+//!   （`egress::upstream`）在 body 开关开着时顺手记下**原始 SSE 文本**与逐帧元数据，
+//!   落点是 `request_bodies.response_body` + 新表 `request_frames`（迁移 v8，见 `store::schema`）。
 
 use std::sync::{atomic::AtomicU64, atomic::Ordering, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -115,6 +123,31 @@ pub struct RequestLog {
     pub error: Option<String>,
     /// 出站请求体：只有 body 日志开关开着时才是 `Some`。
     pub body: Option<String>,
+    /// 上游回来的**原始 SSE 文本**（票 59 详情第三段「可切原始 SSE 文本」）：
+    /// 同样只有 body 日志开关开着时才是 `Some`（响应内容也是内容）。
+    pub response_body: Option<String>,
+    /// 帧时间轴（票 59 详情第三段）：与 `response_body` 同一个闸门，关了就是空表。
+    pub frames: Vec<FrameLog>,
+}
+
+/// 上游流里的一帧（票 59）：时间戳 + 事件类型 + 摘要 + 可展开的原文。
+///
+/// 落点是自己的一张表（`request_frames`，迁移 v8）：spec §9 的表草案里**没有**帧的落点
+/// （`.scratch/model-gateway/frontend.md` §⑤.5 标的就是这个缺口），一帧一行比把整条时间轴
+/// 塞进 JSON 列更好查（按 seq 排序、随 `requests` 级联删）。原文那半另存 `request_bodies.response_body`
+/// ——那里是**字节原样**的整条 SSE，帧上的 `raw` 是从解析结果重建的（见 `sse::frame`）。
+#[derive(Debug, Clone, Default)]
+pub struct FrameLog {
+    /// 帧序号（0 起，按到达顺序）。
+    pub seq: i64,
+    /// 相对本次请求开始（`t0`）的毫秒数。
+    pub at_ms: i64,
+    /// 事件名（`event:` 那一行；没有就是 `None`）。
+    pub event: Option<String>,
+    /// 摘要：数据部分的前若干字符（界面表格里那一列）。
+    pub summary: String,
+    /// 该帧的原文（从解析结果重建：`event:` + `data:` + 空行）。
+    pub raw: String,
 }
 
 /// 写一行请求日志：现生成请求 ID、按**当时价**冻结 `cost_usd`，body 有就顺带写进 `request_bodies`。
@@ -154,11 +187,25 @@ pub async fn log(store: &Store, row: &RequestLog) -> Result<()> {
                     cost,
                 ],
             )?;
-            if let Some(body) = &row.body {
+            // 请求行的 id 只在这里读一次：`last_insert_rowid()` 会被后面每一条 INSERT 改写
+            // （帧表不是 rowid 别名），**不能**在循环里反复调它。
+            let row_id = tx.last_insert_rowid();
+            if row.body.is_some() || row.response_body.is_some() {
                 tx.execute(
-                    "INSERT INTO request_bodies(request_id,request_body) VALUES(last_insert_rowid(),?1)",
-                    params![body],
-                )?;
+                    "INSERT INTO request_bodies(request_id,request_body,response_body)
+                     VALUES(?1,?2,?3)",
+                    params![row_id, row.body, row.response_body],
+                )
+                .map_err(|e| anyhow::anyhow!("写 request_bodies 失败：{e}"))?;
+            }
+            // 帧时间轴（票 59）：与 body 同一个闸门，一帧一行，随 requests 级联删。
+            for f in &row.frames {
+                tx.execute(
+                    "INSERT INTO request_frames(request_id,seq,at_ms,event,summary,raw)
+                     VALUES(?1,?2,?3,?4,?5,?6)",
+                    params![row_id, f.seq, f.at_ms, f.event, f.summary, f.raw],
+                )
+                .map_err(|e| anyhow::anyhow!("写 request_frames(seq={}) 失败：{e}", f.seq))?;
             }
             tx.commit()?;
             Ok(())
@@ -405,7 +452,7 @@ pub fn spawn_purge_sweeper(store: Store) {
     });
 }
 
-// ───────────────────────── 用量汇总（概览要的那半） ─────────────────────────
+// ───────────────────────── 用量汇总（概览与用量页共用一份） ─────────────────────────
 
 /// 用量维度（票 33 第 6 节：归集口径是虚拟模型，上游与客户端只作另一维度）。
 fn dim_column(dim: &str) -> Result<&'static str> {
@@ -413,19 +460,62 @@ fn dim_column(dim: &str) -> Result<&'static str> {
         "virtual_model" => "r.virtual_model",
         "upstream" => "r.upstream_id",
         "client" => "r.client",
-        other => bail!("未知的用量维度：{other}"),
+        other => bail!("未知的用量维度：{other}（virtual_model / upstream / client）"),
     })
 }
 
-/// 时间范围起点（Unix 秒，本地自然日边界）。**票 53 只做概览要的今日 / 近 7 天**，
-/// 近 30 天 / 全部 / 自定义区间与按天明细归票 59（`/api/usage`）。
-fn range_start(range: &str, now: i64) -> Result<i64> {
-    let today = local_day_start(now, local_offset_secs());
+/// 时间范围的窗口 `[from, to)`（Unix 秒；`to = None` = 一直到现在）。
+///
+/// 日边界按**本机本地时区自然日**（spec §9 / 票 33 第 5 节）：把本地墙上时间折算成 UTC 秒
+/// 再取整到天。`custom` 的 `from` / `to` 是界面给的本地日期 `YYYY-MM-DD`，**`to` 含当天**
+/// ——右端取下一天的起点（左闭右开，边界那一秒不会归错天）。
+///
+/// `offset_secs` 由调用方给（产品里是 [`local_offset_secs`]）：测试要能钉住一个固定时区。
+pub fn range_window(
+    range: &str,
+    now: i64,
+    offset_secs: i64,
+    from_date: Option<&str>,
+    to_date: Option<&str>,
+) -> Result<(i64, Option<i64>)> {
+    let today = local_day_start(now, offset_secs);
     Ok(match range {
-        "today" => today,
-        "7d" => today - 6 * 86_400,
-        other => bail!("本端点只做 today / 7d（其余范围归票 59）：{other}"),
+        "today" => (today, None),
+        "7d" => (today - 6 * 86_400, None),
+        "30d" => (today - 29 * 86_400, None),
+        // 「全部」= 从纪元起（`requests.ts` 就是 Unix 秒，没有比 1970 更早的行）。
+        "all" => (0, None),
+        "custom" => {
+            let from = from_date
+                .filter(|d| !d.trim().is_empty())
+                .ok_or_else(|| anyhow::anyhow!("自定义区间要给开始日期 from（YYYY-MM-DD）"))?;
+            let from = local_date_start(from, offset_secs)?;
+            let to = match to_date.filter(|d| !d.trim().is_empty()) {
+                Some(d) => Some(local_date_start(d, offset_secs)? + 86_400),
+                None => None,
+            };
+            if let Some(to) = to {
+                if to <= from {
+                    bail!("自定义区间的结束日期早于开始日期");
+                }
+            }
+            (from, to)
+        }
+        other => bail!("未知的时间范围：{other}（today / 7d / 30d / all / custom）"),
     })
+}
+
+/// `YYYY-MM-DD`（**本地**日期）→ 那天本地 0 点的 Unix 秒。
+fn local_date_start(date: &str, offset_secs: i64) -> Result<i64> {
+    let bad = || anyhow::anyhow!("日期要写成 YYYY-MM-DD：{date}");
+    let mut it = date.trim().split('-');
+    let y: i64 = it.next().ok_or_else(bad)?.parse().map_err(|_| bad())?;
+    let m: i64 = it.next().ok_or_else(bad)?.parse().map_err(|_| bad())?;
+    let d: i64 = it.next().ok_or_else(bad)?.parse().map_err(|_| bad())?;
+    if it.next().is_some() || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return Err(bad());
+    }
+    Ok(days_from_civil(y, m, d) * 86_400 - offset_secs)
 }
 
 /// 上游没回 usage 的判据：**四项** token 全空 = 「token 未知」（票 33 第 3 节；票 58 把
@@ -433,63 +523,85 @@ fn range_start(range: &str, now: i64) -> Result<i64> {
 const TOKEN_UNKNOWN_SQL: &str =
     "input_tokens IS NULL AND output_tokens IS NULL AND cache_read IS NULL AND cache_write IS NULL";
 
-/// 概览要的用量汇总：范围内按维度分组的花费 / 请求数 / token + 总计，
-/// 另计「N 次无价格 / N 次 token 未知」（两者都**不计入总额**，票 33 第 1 节）。
-pub async fn usage_summary(store: &Store, range: &str, dim: &str) -> Result<Value> {
-    let col = dim_column(dim)?;
-    let from = range_start(range, unix_now())?;
-    // 「无价格」是**价格缺失**那一类；token 未知另算一格，两处不重复计（票 33 第 1 节的
-    // 两个计数是两句不同的话）。
-    let aggregates = format!(
+/// 分组 / 总计共用的八项聚合（顺序：花费、请求数、四项 token、无价格、token 未知）。
+///
+/// 「无价格」是**价格缺失**那一类；token 未知另算一格，两处不重复计（票 33 第 1 节的
+/// 两个计数是两句不同的话），两者都**不计入总额**。
+fn usage_aggregates() -> String {
+    format!(
         "SUM(cost_usd), COUNT(*),
          COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(cache_read),0),
          COALESCE(SUM(cache_write),0),
          SUM(CASE WHEN cost_usd IS NULL AND NOT ({TOKEN_UNKNOWN_SQL}) THEN 1 ELSE 0 END),
          SUM(CASE WHEN {TOKEN_UNKNOWN_SQL} THEN 1 ELSE 0 END)"
-    );
-    let rows_sql = format!(
-        "SELECT {col} AS k, {aggregates}
-           FROM requests r WHERE r.ts >= ?1
-          GROUP BY k
-          ORDER BY (SUM(cost_usd) IS NULL), SUM(cost_usd) DESC, k"
-    );
-    let totals_sql = format!("SELECT {aggregates} FROM requests r WHERE r.ts >= ?1");
-    let (rows_sql, totals_sql) = (rows_sql, totals_sql);
+    )
+}
 
-    let (rows, totals) = store
+/// 八项聚合 → JSON（分组行与总计同一套字段）。
+fn totals_json(r: &rusqlite::Row<'_>, base: usize) -> rusqlite::Result<Value> {
+    Ok(json!({
+        "cost_usd": r.get::<_, Option<f64>>(base)?,
+        "requests": r.get::<_, i64>(base + 1)?,
+        "input_tokens": r.get::<_, i64>(base + 2)?,
+        "output_tokens": r.get::<_, i64>(base + 3)?,
+        "cache_read": r.get::<_, i64>(base + 4)?,
+        "cache_write": r.get::<_, i64>(base + 5)?,
+        "no_price": r.get::<_, i64>(base + 6)?,
+        "token_unknown": r.get::<_, i64>(base + 7)?,
+    }))
+}
+
+/// 用量报表（票 59 的完整粒度）：五个时间范围 × 三个维度 + **按天明细** + 总计。
+///
+/// 概览要的那份（今日 / 近 7 天 × 两维）走的是**同一个实现**（[`usage_summary`] 是它的薄壳），
+/// 免得概览与用量页各算一套（`.scratch/model-gateway/frontend.md` §③ 第 10 / 39 条的附注）。
+pub async fn usage(
+    store: &Store,
+    range: &str,
+    dim: &str,
+    from_date: Option<&str>,
+    to_date: Option<&str>,
+) -> Result<Value> {
+    let col = dim_column(dim)?;
+    let offset = local_offset_secs();
+    let (from, to) = range_window(range, unix_now(), offset, from_date, to_date)?;
+    // 右端缺省用 `i64::MAX`：一条 SQL 就够，不必按有没有右端拼两种语句。
+    let upper = to.unwrap_or(i64::MAX);
+    let agg = usage_aggregates();
+    let rows_sql = format!(
+        "SELECT {col} AS k, {agg} FROM requests r WHERE r.ts >= ?1 AND r.ts < ?2
+          GROUP BY k ORDER BY (SUM(cost_usd) IS NULL), SUM(cost_usd) DESC, k"
+    );
+    let totals_sql = format!("SELECT {agg} FROM requests r WHERE r.ts >= ?1 AND r.ts < ?2");
+    // 按天：`ts + 本地偏移` 落到「本地自然日序号」，再折回那天的 0 点（左闭右开，跨时区不串天）。
+    let daily_sql = format!(
+        "SELECT ((r.ts + ?3) / 86400) AS d, {agg} FROM requests r WHERE r.ts >= ?1 AND r.ts < ?2
+          GROUP BY d ORDER BY d"
+    );
+
+    let (rows, totals, daily) = store
         .read(move |c| {
-            let read_totals = |sql: &str| -> Result<Value> {
-                let mut st = c.prepare(sql)?;
-                Ok(st.query_row(params![from], |r| {
-                    Ok(json!({
-                        "cost_usd": r.get::<_, Option<f64>>(0)?,
-                        "requests": r.get::<_, i64>(1)?,
-                        "input_tokens": r.get::<_, i64>(2)?,
-                        "output_tokens": r.get::<_, i64>(3)?,
-                        "cache_read": r.get::<_, i64>(4)?,
-                        "cache_write": r.get::<_, i64>(5)?,
-                        "no_price": r.get::<_, i64>(6)?,
-                        "token_unknown": r.get::<_, i64>(7)?,
-                    }))
-                })?)
-            };
+            let mut st = c.prepare(&totals_sql)?;
+            let totals = st.query_row(params![from, upper], |r| totals_json(r, 0))?;
             let mut st = c.prepare(&rows_sql)?;
             let rows = st
-                .query_map(params![from], |r| {
-                    Ok(json!({
-                        "key": r.get::<_, Option<String>>(0)?,
-                        "cost_usd": r.get::<_, Option<f64>>(1)?,
-                        "requests": r.get::<_, i64>(2)?,
-                        "input_tokens": r.get::<_, i64>(3)?,
-                        "output_tokens": r.get::<_, i64>(4)?,
-                        "cache_read": r.get::<_, i64>(5)?,
-                        "cache_write": r.get::<_, i64>(6)?,
-                        "no_price": r.get::<_, i64>(7)?,
-                        "token_unknown": r.get::<_, i64>(8)?,
-                    }))
+                .query_map(params![from, upper], |r| {
+                    let mut v = totals_json(r, 1)?;
+                    v["key"] = json!(r.get::<_, Option<String>>(0)?);
+                    Ok(v)
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok((rows, read_totals(&totals_sql)?))
+            let mut st = c.prepare(&daily_sql)?;
+            let daily = st
+                .query_map(params![from, upper, offset], |r| {
+                    let day: i64 = r.get(0)?;
+                    let mut v = totals_json(r, 1)?;
+                    let (y, m, d) = civil_from_days(day);
+                    v["day"] = json!(format!("{y:04}-{m:02}-{d:02}"));
+                    Ok(v)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok((rows, totals, daily))
         })
         .await?;
 
@@ -497,9 +609,17 @@ pub async fn usage_summary(store: &Store, range: &str, dim: &str) -> Result<Valu
         "range": range,
         "dim": dim,
         "from": from,
-        "rows": rows,
+        "to": to,
         "totals": totals,
+        "rows": rows,
+        "daily": daily,
     }))
+}
+
+/// 概览要的那半（票 53 的接口不动）：今日 / 近 7 天 × 虚拟模型 / 上游。
+/// 票 59 起 `range` 也认 `30d` / `all` / `custom`——两边共用 [`usage`] 一份实现。
+pub async fn usage_summary(store: &Store, range: &str, dim: &str) -> Result<Value> {
+    usage(store, range, dim, None, None).await
 }
 
 /// 库内一律美元为锚，界面按**当前汇率**换算（票 33 第 2 节）。回 `None` = 库里没这一项。
@@ -582,4 +702,126 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let doy = (153 * mp + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     era * 146_097 + doe - 719_468
+}
+
+/// 1970-01-01 起的天数 → 公历年月日（`days_from_civil` 的逆；按天明细的日期串用它）。
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + i64::from(m <= 2), m, d)
+}
+
+// ───────────────────────── 详情四段与清空（票 59） ─────────────────────────
+
+/// 详情里的那一行（元数据；字段与日志列表同一套形状）。
+const DETAIL_COLUMNS: &str = "r.id,r.ts,r.request_id,r.virtual_model,r.client,r.upstream_id,r.real_model,
+     r.wire,r.status,r.first_byte_ms,r.total_ms,r.input_tokens,r.output_tokens,r.cache_read,r.cache_write,
+     r.aborted,r.error,r.cost_usd";
+
+/// 一条请求的详情三段（**概要 / 请求与响应体 / 帧时间轴**；第四段「错误信息」由管理面
+/// 在 `error` 上补模板，模板口径与概览「最近错误」共用一份）。
+///
+/// `id` 认两种写法：纯数字 = 行 id（界面跳转用的那把钥匙），其余 = `request_id`。
+/// 找不到回 `Ok(None)`（管理面翻成 404，不是空详情）。
+pub async fn log_detail(store: &Store, id: &str) -> Result<Option<Value>> {
+    let key = id.trim().to_string();
+    let by_row_id = key.parse::<i64>().ok();
+    let detail = store
+        .read(move |c| {
+            use rusqlite::OptionalExtension;
+            let sql = format!(
+                "SELECT {DETAIL_COLUMNS} FROM requests r WHERE {} ORDER BY r.id DESC LIMIT 1",
+                if by_row_id.is_some() {
+                    "r.id = ?1"
+                } else {
+                    "r.request_id = ?1"
+                }
+            );
+            let lookup: SqlValue = match by_row_id {
+                Some(n) => SqlValue::Integer(n),
+                None => SqlValue::Text(key.clone()),
+            };
+            let row = c
+                .query_row(&sql, params![lookup], |r| {
+                    Ok(json!({
+                        "id": r.get::<_, i64>(0)?,
+                        "ts": r.get::<_, i64>(1)?,
+                        "request_id": r.get::<_, Option<String>>(2)?,
+                        "virtual_model": r.get::<_, Option<String>>(3)?,
+                        "client": r.get::<_, Option<String>>(4)?,
+                        "upstream": r.get::<_, Option<String>>(5)?,
+                        "real_model": r.get::<_, Option<String>>(6)?,
+                        "wire": r.get::<_, Option<String>>(7)?,
+                        "status": r.get::<_, Option<i64>>(8)?,
+                        "first_byte_ms": r.get::<_, Option<i64>>(9)?,
+                        "total_ms": r.get::<_, Option<i64>>(10)?,
+                        "input_tokens": r.get::<_, Option<i64>>(11)?,
+                        "output_tokens": r.get::<_, Option<i64>>(12)?,
+                        "cache_read": r.get::<_, Option<i64>>(13)?,
+                        "cache_write": r.get::<_, Option<i64>>(14)?,
+                        "aborted": r.get::<_, i64>(15)? != 0,
+                        "error": r.get::<_, Option<String>>(16)?,
+                        "cost_usd": r.get::<_, Option<f64>>(17)?,
+                    }))
+                })
+                .optional()?;
+            let Some(row) = row else {
+                return Ok(None);
+            };
+            let row_id = row["id"].as_i64().unwrap_or(0);
+            let bodies = c
+                .query_row(
+                    "SELECT request_body,response_body FROM request_bodies WHERE request_id=?1",
+                    params![row_id],
+                    |r| {
+                        Ok(json!({
+                            "request": r.get::<_, Option<String>>(0)?,
+                            "response": r.get::<_, Option<String>>(1)?,
+                        }))
+                    },
+                )
+                .optional()?
+                .unwrap_or_else(|| json!({"request": null, "response": null}));
+            let mut st = c.prepare(
+                "SELECT seq,at_ms,event,summary,raw FROM request_frames
+                  WHERE request_id=?1 ORDER BY seq",
+            )?;
+            let frames = st
+                .query_map(params![row_id], |r| {
+                    Ok(json!({
+                        "seq": r.get::<_, i64>(0)?,
+                        "at_ms": r.get::<_, i64>(1)?,
+                        "event": r.get::<_, Option<String>>(2)?,
+                        "summary": r.get::<_, String>(3)?,
+                        "raw": r.get::<_, Option<String>>(4)?,
+                    }))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(Some(json!({
+                "summary": row,
+                "bodies": bodies,
+                "frames": frames,
+            })))
+        })
+        .await?;
+    Ok(detail)
+}
+
+/// 清空日志（票 59）：删 `requests`（`request_bodies` / `request_frames` 靠外键级联），
+/// 回删掉的请求行数。**二次确认是界面的事**，这里只认「调用方已经确认过」。
+pub async fn clear_logs(store: &Store) -> Result<usize> {
+    store
+        .write(|c| {
+            let tx = c.transaction()?;
+            let n = tx.execute("DELETE FROM requests", [])?;
+            tx.commit()?;
+            Ok(n)
+        })
+        .await
 }

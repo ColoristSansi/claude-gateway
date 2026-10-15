@@ -535,3 +535,111 @@ table.logs tr.bad td {
 .error {
   color: #c0392b;
 }
+
+/* ── 票 59：用量页的条形图 / 日志详情抽屉 / 设置页 ── */
+
+.bar-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 3px 0;
+  font-size: 12px;
+}
+
+.bar-label {
+  flex: 0 0 130px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.bar-track {
+  flex: 1 1 auto;
+  height: 10px;
+  background: #8882;
+  border-radius: 5px;
+  overflow: hidden;
+}
+
+.bar-fill {
+  display: block;
+  height: 100%;
+  background: #3a7bd5;
+}
+
+.bar-value {
+  flex: 0 0 90px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 详情抽屉：贴在右侧，四段从上到下（spec §10 第 5 条的「详情抽屉」）。 */
+.drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: min(680px, 92vw);
+  overflow-y: auto;
+  padding: 16px 18px 40px;
+  background: var(--bg, #fff);
+  border-left: 1px solid #8884;
+  box-shadow: -8px 0 24px #0002;
+  z-index: 20;
+}
+
+.drawer-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  position: sticky;
+  top: -16px;
+  padding: 6px 0;
+  background: var(--bg, #fff);
+}
+
+.drawer-head h3 {
+  margin: 0;
+  flex: 1 1 auto;
+}
+
+.drawer h4 {
+  margin: 16px 0 6px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid #8883;
+  font-size: 13px;
+}
+
+pre.raw {
+  max-height: 320px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-size: 12px;
+}
+
+table.frames details summary {
+  cursor: pointer;
+}
+
+table.frames pre.raw {
+  max-height: 160px;
+  margin: 4px 0 0;
+}
+
+.card .row label.grow {
+  flex: 1 1 320px;
+}
+
+.card .row input[type='text'] {
+  min-width: 320px;
+  font: inherit;
+}
+
+/* 深色背景下的抽屉（应用默认跟随系统）。 */
+@media (prefers-color-scheme: dark) {
+  .drawer {
+    --bg: #1c1c1e;
+  }
+}
+

@@ -336,9 +336,15 @@ async fn usage_summary_serves_today_and_7d_for_the_overview() {
     );
     assert_eq!(w["rows"].as_array().unwrap().len(), 1);
 
-    // 票 53 只做 today / 7d，别的范围给 400 而不是悄悄回一份错的（完整范围归票 59）。
-    let (status, e) = api
+    // 票 59 起范围扩到五个（today / 7d / 30d / all / custom）：30d 也回真数据；
+    // 认不出的范围仍是 400，不悄悄回一份错的。
+    let (status, m) = api
         .get("/api/usage/summary?range=30d&dim=virtual_model")
+        .await;
+    assert_eq!(status, 200, "{m}");
+    assert_eq!(m["totals"]["requests"], 3, "3 天前那条也在近 30 天里：{m}");
+    let (status, e) = api
+        .get("/api/usage/summary?range=last-year&dim=virtual_model")
         .await;
     assert_eq!(status, 400, "{e}");
     assert_eq!(e["error"]["type"], "invalid_request_error");

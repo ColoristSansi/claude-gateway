@@ -120,7 +120,8 @@ async fn recent_errors(
 }
 
 /// 错误模板（spec §10 错误表达）：**发生了什么 + 可能原因 + 一个主按钮**。
-fn template_for(status: i64, raw: &str) -> Value {
+/// 日志详情的第四段也用这一份（票 59：三处错误表达共用一套模板，不各写一份）。
+pub(crate) fn template_for(status: i64, raw: &str) -> Value {
     let lower = raw.to_lowercase();
     let (what, cause, label, kind, page) = match status {
         401 => (
@@ -187,7 +188,7 @@ async fn diagnostics(
 ) -> Result<Json<Value>, ApiFailure> {
     let admin = admin(&state)?;
     let body = body.map(|Json(v)| v).unwrap_or(Value::Null);
-    let text = diagnostics_text(&admin, &body).await?;
+    let text = diagnostics_text(&admin, &body, state.running()).await?;
     // 逐条自查：诊断文本里不该出现任何一份凭据的明文（拿库里的密文解出来比）。
     let leaked = credential_leak_check(&admin.store, &text).await;
     if let Some(leak) = leaked {
@@ -205,13 +206,17 @@ async fn diagnostics(
 }
 
 /// 诊断文本边界（spec §10）：版本 / 端口 / 运行状态 / 上游配置脱敏形式 / 错误原文 / 请求元数据。
-async fn diagnostics_text(admin: &AdminCtx, body: &Value) -> Result<String, ApiFailure> {
+async fn diagnostics_text(
+    admin: &AdminCtx,
+    body: &Value,
+    running: bool,
+) -> Result<String, ApiFailure> {
     let status = json!({
         "version": admin.version,
         "dbPath": admin.db_path,
         "dataDir": admin.data_dir.to_string_lossy(),
         "port": admin.port().await,
-        "running": true,
+        "running": running,
     });
     let ups = crate::egress::provider::list_upstreams(&admin.store)
         .await
