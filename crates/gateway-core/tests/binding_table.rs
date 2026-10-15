@@ -464,7 +464,7 @@ async fn a_binding_whose_wire_the_catalog_does_not_declare_is_rejected_with_400(
     // 目录条目只声明 anthropic；绑定表里那条却是 openai-chat（模拟老库 / 手工改库绕过了配置期主拦）。
     let mut upstreams = HashMap::new();
     upstreams.insert("cc".to_string(), upstream("cc", "http://127.0.0.1:9"));
-    let mut app = Gateway::new(
+    let app = Gateway::new(
         store,
         upstreams,
         BindingTable::new(
@@ -478,8 +478,9 @@ async fn a_binding_whose_wire_the_catalog_does_not_declare_is_rejected_with_400(
             default_profiles(),
         ),
     );
-    app.catalog.insert(
-        ("cc".to_string(), "claude-sonnet-5-5".to_string()),
+    app.set_catalog_entry(
+        "cc",
+        "claude-sonnet-5-5",
         UpstreamModel {
             upstream_id: "cc".into(),
             model_id: "claude-sonnet-5-5".into(),

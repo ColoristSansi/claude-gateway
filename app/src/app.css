@@ -1,43 +1,81 @@
-/* 最小样式：够把日志表看清就行。
-   shortcut: 正式设计体系归票 52 的壳层，这里不建变量、不做主题。 */
+/* 票 52 的壳层样式：侧栏七页 + 顶部横幅 + 卡片 / 表格 / 徽章 / 弹窗。
+   票 53 的日志页样式（表 / 筛选 / body 开关）保留在文件末尾，合并时原样留下。 */
 
 :root {
   color-scheme: light dark;
   font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
   font-size: 14px;
+  --line: #8884;
+  --muted: #777;
+  --ok: #1a7f37;
+  --warn: #9a6700;
+  --bad: #b42318;
 }
 
 body {
   margin: 0;
 }
 
+.layout {
+  display: grid;
+  grid-template-columns: 190px 1fr;
+  min-height: 100vh;
+}
+
 .nav {
   display: flex;
-  align-items: center;
-  gap: 14px;
-  padding: 10px 16px;
-  border-bottom: 1px solid #8884;
+  flex-direction: column;
+  gap: 4px;
+  padding: 12px 10px;
+  border-right: 1px solid var(--line);
 }
 
 .nav .brand {
   font-weight: 600;
-  margin-right: 8px;
+  margin-bottom: 10px;
 }
 
 .nav a {
   color: inherit;
   text-decoration: none;
-  opacity: 0.7;
+  opacity: 0.75;
+  padding: 6px 8px;
+  border-radius: 6px;
+  display: flex;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.nav a:hover {
+  background: #8881;
 }
 
 .nav a.active {
   opacity: 1;
   font-weight: 600;
-  border-bottom: 2px solid currentColor;
+  background: #8882;
+}
+
+.nav .spacer {
+  flex: 1;
+}
+
+.nav .status-line {
+  font-size: 12px;
+}
+
+.badge {
+  background: var(--bad);
+  color: #fff;
+  border-radius: 10px;
+  padding: 0 7px;
+  font-size: 12px;
+  line-height: 18px;
 }
 
 main {
-  padding: 16px;
+  padding: 16px 20px 40px;
+  max-width: 1180px;
 }
 
 .page-head {
@@ -46,6 +84,405 @@ main {
   justify-content: space-between;
   gap: 16px;
 }
+
+.banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  background: #fff3cd;
+  color: #3b2c00;
+  border-bottom: 1px solid #d9b64d;
+}
+
+.banner-text {
+  flex: 1;
+}
+
+.notice,
+.notice-line {
+  background: #e7f2ff;
+  border: 1px solid #a9cdf5;
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin: 8px 0;
+}
+
+.muted {
+  opacity: 0.65;
+}
+
+.card {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin: 12px 0;
+}
+
+.card h3 {
+  margin: 0 0 8px;
+}
+
+.card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.ok-card {
+  border-color: var(--ok);
+}
+
+.bad-card {
+  border-color: var(--bad);
+}
+
+.grid2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(330px, 1fr));
+  gap: 12px;
+}
+
+ul.kv {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+ul.kv li {
+  display: flex;
+  gap: 8px;
+  padding: 3px 0;
+  border-bottom: 1px dashed var(--line);
+}
+
+ul.kv li > span {
+  min-width: 96px;
+  opacity: 0.65;
+}
+
+ul.kv li > b {
+  font-weight: 500;
+  word-break: break-all;
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 8px 0;
+}
+
+.table th,
+.table td {
+  text-align: left;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+
+.table tr.mismatch {
+  background: #ffe08a55;
+}
+
+button,
+select,
+input {
+  font: inherit;
+}
+
+button {
+  padding: 4px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+button.primary {
+  background: #2f6feb;
+  border-color: #2f6feb;
+  color: #fff;
+}
+
+button.primary.danger {
+  background: var(--bad);
+  border-color: var(--bad);
+}
+
+button.link {
+  border: none;
+  text-decoration: underline;
+  padding: 4px 6px;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+input,
+select {
+  padding: 4px 6px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+}
+
+label {
+  display: block;
+  margin: 8px 0;
+}
+
+label.inline {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+label input,
+label select {
+  display: block;
+  width: 100%;
+  margin-top: 4px;
+}
+
+label.inline input {
+  display: inline;
+  width: auto;
+}
+
+.row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin: 8px 0;
+}
+
+.actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 10px 0;
+}
+
+.pill {
+  border-radius: 10px;
+  padding: 0 8px;
+  font-size: 12px;
+  line-height: 18px;
+  border: 1px solid currentColor;
+  display: inline-block;
+}
+
+.pill.ok {
+  color: var(--ok);
+}
+
+.pill.warn {
+  color: var(--warn);
+}
+
+.pill.bad {
+  color: var(--bad);
+}
+
+.pill.muted {
+  opacity: 0.65;
+}
+
+.checklist {
+  list-style: none;
+  padding: 0;
+  margin: 8px 0 16px;
+}
+
+.checklist li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+}
+
+.checklist li.todo {
+  border-color: var(--warn);
+  background: #fff8e6;
+}
+
+.checklist li.done {
+  border-color: var(--ok);
+}
+
+.step-title {
+  font-weight: 600;
+}
+
+.error-block {
+  border: 1px solid var(--bad);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin: 8px 0;
+  background: #fff5f4;
+  color: #3a1410;
+}
+
+.error-block.compact {
+  padding: 6px 8px;
+  margin: 4px 0;
+}
+
+.error-what {
+  font-weight: 600;
+}
+
+.error-cause {
+  margin: 4px 0;
+}
+
+.error-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+}
+
+.error-raw,
+pre.error-raw {
+  white-space: pre-wrap;
+  word-break: break-all;
+  background: #8881;
+  padding: 8px;
+  border-radius: 6px;
+  max-height: 260px;
+  overflow: auto;
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: #0006;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  z-index: 10;
+}
+
+.modal {
+  background: Canvas;
+  color: CanvasText;
+  border-radius: 10px;
+  padding: 16px 18px;
+  max-width: 620px;
+  width: 100%;
+  max-height: 86vh;
+  overflow: auto;
+}
+
+.modal.wide {
+  max-width: 860px;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.steps {
+  display: flex;
+  gap: 12px;
+  list-style: none;
+  padding: 0;
+  opacity: 0.7;
+  flex-wrap: wrap;
+}
+
+.steps li.active {
+  opacity: 1;
+  font-weight: 600;
+}
+
+.paths {
+  list-style: none;
+  padding: 0;
+  margin: 4px 0;
+}
+
+.paths code,
+code {
+  word-break: break-all;
+}
+
+.tabs {
+  display: flex;
+  gap: 6px;
+}
+
+.tab {
+  opacity: 0.7;
+}
+
+.tab.active {
+  opacity: 1;
+  font-weight: 600;
+  border-color: currentColor;
+}
+
+.wire-badge {
+  display: inline-block;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0 6px;
+  margin-right: 4px;
+  font-size: 12px;
+}
+
+.notes {
+  font-size: 12px;
+  padding-left: 18px;
+  margin: 8px 0 0;
+}
+
+.notes li {
+  margin: 2px 0;
+}
+
+.errors {
+  list-style: none;
+  padding: 0;
+}
+
+.errors > li {
+  border-bottom: 1px dashed var(--line);
+  padding: 6px 0;
+}
+
+.error-line {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.switch {
+  display: inline-flex;
+  gap: 4px;
+}
+
+/* ── 票 53：日志页（合并时原样保留） ── */
 
 .body-switch {
   white-space: nowrap;
@@ -93,10 +530,6 @@ table.logs td {
 
 table.logs tr.bad td {
   color: #c0392b;
-}
-
-.muted {
-  opacity: 0.65;
 }
 
 .error {

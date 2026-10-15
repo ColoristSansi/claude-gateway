@@ -688,9 +688,9 @@ async fn chat(State(app): State<Arc<Gateway>>, headers: HeaderMap, body: Bytes) 
     let identity = proxy::client_identity(&headers);
     // 日志里的档案是**客户端档案**（与票 51/53 的口径一致）：命中那条绑定的 profile 可能是
     // 落回 global 的那一行，不能拿它当客户端归属。
-    let profile = app.bindings.profile_for(&identity);
+    let profile = app.read_bindings().profile_for(&identity);
     let name = bare_name(&raw);
-    let rt = match app.bindings.resolve(name, &identity) {
+    let rt = match app.read_bindings().resolve(name, &identity) {
         Ok(rt) => rt,
         Err(_) => return not_found(&raw),
     };
@@ -746,7 +746,7 @@ async fn chat(State(app): State<Arc<Gateway>>, headers: HeaderMap, body: Bytes) 
 /// `GET /api/tags`：与 `GET /v1/models` **同一集合**（spec §4.4）。`HEAD` 由 `get()` 兜住（官方也有）。
 async fn tags(State(app): State<Arc<Gateway>>) -> Response {
     let models: Vec<Value> = app
-        .bindings
+        .read_bindings()
         .exposed()
         .into_iter()
         .map(|m| {
@@ -813,7 +813,7 @@ async fn show(State(app): State<Arc<Gateway>>, headers: HeaderMap, body: Bytes) 
 
     let identity = proxy::client_identity(&headers);
     let name = bare_name(&raw);
-    let rt = match app.bindings.resolve(name, &identity) {
+    let rt = match app.read_bindings().resolve(name, &identity) {
         Ok(rt) => rt,
         Err(_) => return not_found(&raw),
     };

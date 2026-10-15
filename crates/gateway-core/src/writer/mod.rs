@@ -64,7 +64,7 @@ mod desktop_tests;
 #[cfg(test)]
 mod tests;
 
-pub use engine::Writer;
+pub use engine::{FieldDiff, FileInspect, Writer};
 pub use plan::{
     ConflictMode, FileOutcome, FileSpec, Format, OwnedOp, RollbackOutcome, WritePlan, WriteReport,
     WriteRoots,

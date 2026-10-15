@@ -19,6 +19,12 @@ fn main() {
             shell::show_main_window(app)
         }))
         .setup(shell::setup)
+        // 票 52：网关没在跑时（`/api/*` 发不出去）前端走这三条 IPC 启动 / 换端口。
+        .invoke_handler(tauri::generate_handler![
+            shell::gateway_start,
+            shell::gateway_probe_port,
+            shell::gateway_change_port
+        ])
         // 关窗 = 隐藏到托盘，网关继续跑（票 18 §2）。
         .on_window_event(shell::on_window_event)
         .build(tauri::generate_context!())

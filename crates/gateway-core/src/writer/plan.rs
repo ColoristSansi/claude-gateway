@@ -68,6 +68,20 @@ impl OwnedOp {
         }
     }
 
+    /// 界面上的键名（`env.ANTHROPIC_BASE_URL` 这种点的形式）：「当前值 vs 期望值」对照表用。
+    pub fn display_key(&self) -> String {
+        self.path().join(".")
+    }
+
+    /// 这条动作写下去的**期望值**（`Set` / `SetElement` 有；摘键类没有）。
+    /// 界面对照表的左列；不是判据（判据永远是 [`crate::writer::Writer::inspect`]）。
+    pub fn expected(&self) -> Option<&Json> {
+        match self {
+            OwnedOp::Set { value, .. } | OwnedOp::SetElement { value, .. } => Some(value),
+            _ => None,
+        }
+    }
+
     /// 记录进 `client_config_state.owned_keys_json` 的标签：路径 + 动作区别，用来判「清单变没变」。
     /// 只做相等比较，不给用户看。
     pub fn label(&self) -> String {

@@ -18,6 +18,8 @@ fn config(port: u16, db_path: &str) -> GatewayConfig {
         forwarding: None,
         // 维护面（票 62）在 tests/dist_api.rs 里单独挂：那一格要真库与真数据目录。
         maintenance: None,
+        // 票 43 的验收只测管理面与生命周期：不带票 52 的 AdminCtx（那套由 tests/admin_api.rs 覆盖）。
+        admin: None,
     }
 }
 
