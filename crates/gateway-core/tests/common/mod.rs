@@ -106,14 +106,33 @@ impl Gateway {
 
     /// 网关自己的 GET（`/v1/models` 这类转发面端点）。
     pub async fn get_json(&self, path: &str) -> Value {
-        reqwest::Client::new()
-            .get(format!("{}{path}", self.base))
-            .send()
+        self.get_json_with(path, &[]).await
+    }
+
+    /// 带自定义入站头的 GET（票 51：`/v1/models` 的信封形状按客户端家族给）。
+    pub async fn get_json_with(&self, path: &str, headers: &[(&str, &str)]) -> Value {
+        let mut rb = reqwest::Client::new().get(format!("{}{path}", self.base));
+        for (k, v) in headers {
+            rb = rb.header(*k, *v);
+        }
+        rb.send()
             .await
             .expect("GET 失败")
             .json()
             .await
             .expect("响应不是 JSON")
+    }
+
+    /// 管理面 `GET /api/*`：回 (状态码, JSON)——票 53 的日志 / 用量端点要断言状态码。
+    pub async fn get_api(&self, path: &str) -> (u16, Value) {
+        let resp = reqwest::Client::new()
+            .get(format!("{}{path}", self.base))
+            .send()
+            .await
+            .expect("GET /api 失败");
+        let status = resp.status().as_u16();
+        let v = resp.json().await.unwrap_or(Value::Null);
+        (status, v)
     }
 
     /// mock 的请求回显（`GET <mock>/api/echo`）：头类 quirk / 路径模板 / auth 头靠它断言。

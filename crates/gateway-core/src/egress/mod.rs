@@ -4,7 +4,8 @@
 //! 本模块是**门面 + 出站实现**：按「上游面」把符号 re-export 出来；客户端面在 [`crate::ingress`]。
 //! 票 41 起，出站转发在 [`upstream`]；声明式供应商表、上游模型目录与价格在 [`provider`]
 //! （票 49 把原型那份两值 `Wire` 的表换成 spec §6 的三值形状）；「拉模型」那一次动作的
-//! 分流与降级处置在 [`discovery`]（票 50）。
+//! 分流与降级处置在 [`discovery`]（票 50）；结构化输出的三条出站映射与能力位探针在
+//! [`structured`]（票 57）。
 //!
 //! re-export 清单：
 //!
@@ -19,6 +20,7 @@
 
 pub mod discovery;
 pub mod provider;
+pub mod structured;
 pub mod upstream;
 
 pub use crate::anthropic::{

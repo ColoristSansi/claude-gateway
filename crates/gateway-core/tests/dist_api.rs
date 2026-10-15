@@ -255,10 +255,15 @@ async fn export_endpoint_writes_a_file_without_plaintext_secrets_then_import_rea
         .expect("POST 可达");
     assert_eq!(res.status(), 400, "读不到文件要 400");
     let body: serde_json::Value = res.json().await.expect("JSON");
-    assert!(body["error"]
-        .as_str()
-        .expect("错误文案")
-        .contains("读导入文件失败"));
+    // 错误体与日志面同一份形状（票 53 定的）：`{"error":{"type","message"}}`。
+    assert_eq!(body["error"]["type"], "api_error", "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .expect("错误文案")
+            .contains("读导入文件失败"),
+        "{body}"
+    );
 }
 
 #[tokio::test]

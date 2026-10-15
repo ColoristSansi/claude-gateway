@@ -120,6 +120,12 @@ async fn last_echo(gw: &Gateway) -> Value {
         .unwrap_or(Value::Null)
 }
 
+/// 发一发请求，等日志攒到 `n` 行，回最新那一行（票 53 的 body 开关用例用）。
+async fn post_and_latest(gw: &Gateway, request: &Value, n: usize) -> Value {
+    let _ = gw.post_messages(request).await;
+    gw.logs(n).await.first().cloned().unwrap_or(Value::Null)
+}
+
 /// ① 台账矩阵：15 格的状态码、首帧、末帧，加上逐帧逐字段的黄金比对，
 /// 以及几条**独立于黄金**的语义断言（黄金是离线核对过的，这里是第二把尺）。
 #[tokio::test(flavor = "multi_thread")]
@@ -1330,4 +1336,242 @@ fn section_of(text: &str, start: &str, end: &str) -> String {
     let rest = &text[from..];
     let upto = rest.find(end).unwrap_or(rest.len());
     rest[..upto].to_string()
+}
+
+/// ⑬ 客户端档案覆盖与 `/v1/models` 的暴露集合（票 51；销掉票 30 台账里那条「明确不覆盖」）。
+///
+/// ① 同一个模型名 `claude-haiku`：codex 档案走 mock 的 Anthropic 面（200 + 真回放字节），
+///    没有客户端标识的请求落回 `global`（commandcode，测试里 base 打不通 → 502）。
+/// ② `/v1/models` **不按客户端过滤**（spec §8.2 第 2 条）：两个客户端拿到同一个模型集合，
+///    只有信封形状按家族给（Claude 系是 `data` 那份，Codex 是标准 `models` 数组）。
+#[tokio::test(flavor = "multi_thread")]
+async fn client_profile_override_and_models_exposure() {
+    let gw = Gateway::start().await;
+    let mut fails: Vec<String> = Vec::new();
+
+    let codex_ua = "codex_exec/0.162.1 (Windows 10.0.26200; x86_64) unknown (codex_exec; 0.162.1)";
+    let code_ua = "claude-cli/2.1.299 (external, sdk-cli)";
+    let slot = json!({"model":"claude-haiku","max_tokens":256,"stream":true,
+                      "messages":[{"role":"user","content":"覆盖"}]});
+
+    // ① codex 档案那份覆盖指向 mock → 走完一整条回放（文本就是 text fixture 的那句）。
+    let (status, bytes) = gw
+        .post_messages_with(&slot, &[("user-agent", codex_ua)])
+        .await;
+    check(
+        &mut fails,
+        status == 200,
+        format!("codex 档案的 claude-haiku: HTTP {status}，期望 200"),
+    );
+    let text = joined_text(&golden::parse(&bytes));
+    check(
+        &mut fails,
+        text == "你好，这是 mock 上游的纯文本回放。",
+        format!("codex 档案没走到 mock 的 text 回放：{text:?}"),
+    );
+
+    // ② 同一个模型名、换成 Claude Code 的 UA：落回 global（commandcode，测试里打不通）→ 502。
+    let (status, bytes) = gw
+        .post_messages_with(&slot, &[("user-agent", code_ua)])
+        .await;
+    check(
+        &mut fails,
+        status == 502,
+        format!("全局那份 claude-haiku 该打 commandcode（测试里不可达）→ 502，实际 {status}"),
+    );
+    let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    check(
+        &mut fails,
+        v["error"]["type"] == "api_error",
+        format!("502 的错误信封不对：{v}"),
+    );
+
+    // ③ 不带任何客户端标识 = global，同上。
+    let (status, _) = gw.post_messages(&slot).await;
+    check(
+        &mut fails,
+        status == 502,
+        format!("没有客户端标识该落回 global → 502，实际 {status}"),
+    );
+
+    // ④ `/v1/models`：Claude 系那份是 Anthropic 信封；Codex 那份是标准 models 数组。
+    let anthropic = gw.get_json("/v1/models").await;
+    let codex = gw
+        .get_json_with("/v1/models", &[("user-agent", codex_ua)])
+        .await;
+    let ids = |v: &Value| -> Vec<String> {
+        v["data"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|m| m["id"].as_str().map(str::to_string))
+            .collect()
+    };
+    check(
+        &mut fails,
+        anthropic.get("has_more").is_some() && anthropic["first_id"] == json!("claude-fable"),
+        format!("Claude 系的 /v1/models 信封不对：{anthropic}"),
+    );
+    check(
+        &mut fails,
+        codex["object"] == json!("list")
+            && codex["data"][0]["object"] == json!("model")
+            && codex["data"][0]["id"] == json!("claude-fable"),
+        format!("Codex 的 /v1/models 该是标准 models 数组：{codex}"),
+    );
+    check(
+        &mut fails,
+        ids(&anthropic) == ids(&codex),
+        format!(
+            "两个客户端的暴露集合必须一致（不按客户端过滤）：{:?} vs {:?}",
+            ids(&anthropic),
+            ids(&codex)
+        ),
+    );
+    let exposed = ids(&anthropic);
+    check(
+        &mut fails,
+        exposed.starts_with(&[
+            "claude-fable".to_string(),
+            "claude-opus".into(),
+            "claude-sonnet".into(),
+            "claude-haiku".into(),
+        ]),
+        format!("四个家族名必须恒在且在最前：{exposed:?}"),
+    );
+    check(
+        &mut fails,
+        exposed.len() > 4 && exposed.contains(&"mock-anthropic-text".to_string()),
+        format!("普通虚拟模型也该在清单里：{exposed:?}"),
+    );
+
+    // ⑤ 日志行记下**归属到的档案**（票 51）：`requests.client` 是按客户端聚合的唯一依据（票 53）。
+    let logs = gw.logs(3).await;
+    let haiku_rows: Vec<Value> = logs
+        .into_iter()
+        .filter(|r| r["virtual_model"] == "claude-haiku")
+        .collect();
+    let client_of = |status: i64| -> Vec<String> {
+        haiku_rows
+            .iter()
+            .filter(|r| r["status"] == json!(status))
+            .filter_map(|r| r["client"].as_str().map(str::to_string))
+            .collect()
+    };
+    check(
+        &mut fails,
+        client_of(200) == vec!["codex".to_string()],
+        format!("codex 档案那一发该记 client=codex：{:?}", client_of(200)),
+    );
+    let mut failed_clients = client_of(502);
+    failed_clients.sort();
+    check(
+        &mut fails,
+        failed_clients == vec!["claude-code".to_string(), "global".to_string()],
+        format!("落回全局的两发该记 claude-code / global：{failed_clients:?}"),
+    );
+
+    assert!(
+        fails.is_empty(),
+        "客户端档案覆盖与 /v1/models {} 处不合格：\n{}",
+        fails.len(),
+        fails.join("\n")
+    );
+}
+
+/// ⑬ 日志页的 body 开关（票 53）：默认关 → 开启必须先过隐私确认 → 开启后这一发的出站 body
+/// 能捞到 → 到点自动关。**走管理面那个真实端点**（`/api/logs/body-recording`），证明界面上
+/// 的开关与转发路径读的是同一个窗口；窗口拨到 2 秒（真实值 1 小时，票 30 第 7 条的照搬）。
+#[tokio::test(flavor = "multi_thread")]
+async fn body_recording_switch_drives_the_proxy_window() {
+    let gw = Gateway::start().await;
+    let mut fails: Vec<String> = Vec::new();
+    let request = fixture_request(&gw, "text", "anthropic");
+    let switch = "/api/logs/body-recording";
+
+    // ① 默认关：这一发的 body 不写。
+    let (status, state) = gw.get_api(switch).await;
+    check(
+        &mut fails,
+        status == 200 && state["on"] == json!(false),
+        format!("默认该关：HTTP {status} / {state}"),
+    );
+    let row = post_and_latest(&gw, &request, 1).await;
+    check(
+        &mut fails,
+        row["body"].is_null(),
+        format!("默认不该写 body，实际 {}", row["body"]),
+    );
+
+    // ② 开启没带隐私确认 → 400，且开关一动不动。
+    let (status, body) = gw.post_json(switch, &json!({"enabled": true})).await;
+    check(
+        &mut fails,
+        status == 400 && body["error"]["type"] == "consent_required",
+        format!("缺隐私确认该 400：HTTP {status} / {body}"),
+    );
+    let (_, state) = gw.get_api(switch).await;
+    check(
+        &mut fails,
+        state["on"] == json!(false),
+        format!("被拒之后不该偷偷打开：{state}"),
+    );
+
+    // ③ 带确认、窗口拨到 2 秒 → 这一发能捞到**发给上游的那一份**（出站请求体）。
+    let (status, state) = gw
+        .post_json(
+            switch,
+            &json!({"enabled": true, "consent": true, "seconds": 2}),
+        )
+        .await;
+    check(
+        &mut fails,
+        status == 200 && state["on"] == json!(true),
+        format!("该开起来：HTTP {status} / {state}"),
+    );
+    check(
+        &mut fails,
+        state["seconds_remaining"]
+            .as_u64()
+            .map(|s| s <= 2)
+            .unwrap_or(false),
+        format!("该报剩余秒数（1 小时自动关的倒计时）：{state}"),
+    );
+    let row = post_and_latest(&gw, &request, 2).await;
+    let body = row["body"].as_str().unwrap_or_default().to_string();
+    check(
+        &mut fails,
+        body.contains("你好") && body.contains("mock-text"),
+        format!("开关打开后 body 应该能捞到，实际 {body:?}"),
+    );
+
+    // ④ 到点自动关：再发一发，body 又不写了。
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    let (_, state) = gw.get_api(switch).await;
+    check(
+        &mut fails,
+        state["on"] == json!(false),
+        format!("到点该自己关掉：{state}"),
+    );
+    let row = post_and_latest(&gw, &request, 3).await;
+    check(
+        &mut fails,
+        row["body"].is_null(),
+        format!("到点后不该再写 body，实际 {}", row["body"]),
+    );
+
+    // ⑤ 手动关也是同一条路（`enabled: false` 不需要确认）。
+    let (status, state) = gw.post_json(switch, &json!({"enabled": false})).await;
+    check(
+        &mut fails,
+        status == 200 && state["on"] == json!(false),
+        format!("手动关：HTTP {status} / {state}"),
+    );
+
+    assert!(
+        fails.is_empty(),
+        "body 开关 {} 处不合格：\n{}",
+        fails.len(),
+        fails.join("\n")
+    );
 }

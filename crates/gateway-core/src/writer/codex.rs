@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value as Json};
 
-use crate::binding::Route;
+use crate::binding::ExposedModel;
 use crate::store::Store;
 
 use super::doc::Doc;
@@ -136,20 +136,23 @@ fn neutral_row() -> Json {
 
 /// 目录值：`{"models":[...]}`，四个家族名在前（fable / opus / sonnet / haiku），
 /// 普通虚拟模型按名排序；每个条目 = 中性模板 + 覆盖（票 31 第 1、4、8 条）。
-pub fn catalog_value(routes: &[Route]) -> Json {
-    let mut ordered: Vec<&Route> = routes.iter().collect();
-    ordered.sort_by_key(|r| family_rank(&r.name));
+///
+/// 入参 = 网关暴露的清单（票 51 的 [`ExposedModel`]；`GET /v1/models` 与它同一份来源）。
+pub fn catalog_value(models: &[ExposedModel]) -> Json {
+    let mut ordered: Vec<&ExposedModel> = models.iter().collect();
+    ordered.sort_by_key(|m| family_rank(&m.name));
     let models: Vec<Json> = ordered
         .iter()
         .enumerate()
-        .map(|(i, r)| {
+        .map(|(i, m)| {
             let mut row = neutral_row();
-            row["slug"] = json!(r.name);
-            row["display_name"] = json!(r.name);
-            row["description"] = json!(format!(
-                "Claude Gateway -> {} / {}",
-                r.upstream_id, r.real_model
-            ));
+            row["slug"] = json!(m.name);
+            row["display_name"] = json!(m.name);
+            row["description"] = json!(match &m.binding {
+                Some(b) => format!("Claude Gateway -> {} / {}", b.upstream_id, b.real_model),
+                // 家族槽位可以还没绑（票 51 的 `exposed` 照样暴露名字）；目录不能因此不写。
+                None => "Claude Gateway（尚未绑定）".to_string(),
+            });
             // 原型的 `priority = 1000 + index`（票 31 没定字面值，这里沿用原型）。
             row["priority"] = json!(1000 + i as u64);
             row
@@ -432,8 +435,8 @@ impl CodexWriter {
 
     /// 一次切换的写入计划：目录文件（order 0）→ `config.toml`（order 1，先被引用者后指针）。
     /// 自检不过就返回 `Err`，调用方什么都不写。
-    pub fn plan(&self, routes: &[Route], model: &str) -> Result<WritePlan> {
-        let catalog = catalog_value(routes);
+    pub fn plan(&self, models: &[ExposedModel], model: &str) -> Result<WritePlan> {
+        let catalog = catalog_value(models);
         // 自检走一遍「序列化 → 再解析」：真写下去的就是这份字节（票 31 第 7 条）。
         let text = serde_json::to_string(&catalog).context("目录自检失败：序列化不了")?;
         let reparsed: Json =
@@ -446,15 +449,15 @@ impl CodexWriter {
     }
 
     /// 写：目录 + `config.toml`，再整理哨兵行。冲突（引擎放弃本次）时一个字节都不动。
-    pub async fn write(&self, routes: &[Route], model: &str) -> Result<WriteReport> {
-        let plan = self.plan(routes, model)?;
+    pub async fn write(&self, models: &[ExposedModel], model: &str) -> Result<WriteReport> {
+        let plan = self.plan(models, model)?;
         self.apply(&plan, ConflictMode::Abort).await
     }
 
     /// 「认领并覆盖」（用户显式确认后）：接管键以网关为准，仍然备份、仍然只动接管键
     /// （ADR-0006 第 4 条、票 31 第 6 条）。
-    pub async fn claim(&self, routes: &[Route], model: &str) -> Result<WriteReport> {
-        let plan = self.plan(routes, model)?;
+    pub async fn claim(&self, models: &[ExposedModel], model: &str) -> Result<WriteReport> {
+        let plan = self.plan(models, model)?;
         self.apply(&plan, ConflictMode::Claim).await
     }
 

@@ -9,7 +9,8 @@ use super::codex::{
 };
 use super::plan::{FileOutcome, WriteRoots};
 use super::Writer;
-use crate::binding::Route;
+use crate::binding::{Binding, ExposedModel, Profile};
+use crate::egress::provider::Wire;
 use crate::store::Store;
 use serde_json::{json, Value as Json};
 use std::fs;
@@ -68,50 +69,40 @@ fn env(tag: &str) -> Env {
 }
 
 /// 六个虚拟模型：四个家族（乱序进来）+ 两个普通（乱序进来）。
-fn routes() -> Vec<Route> {
+/// 入参是网关暴露的清单（票 51 的 `binding::ExposedModel`：名字 + 它在某档案下解析到的三元组）。
+fn routes() -> Vec<ExposedModel> {
+    let row = |name: &str, up: &str, real: &str, wire: Wire| ExposedModel {
+        name: name.to_string(),
+        is_family: crate::binding::is_family(name),
+        binding: Some(Binding::new(Profile::Global, name, up, real, wire)),
+    };
     vec![
-        Route {
-            name: "zeta".to_string(),
-            upstream_id: "commandcode".to_string(),
-            real_model: "deepseek/deepseek-v4.1-flash".to_string(),
-            wire: "anthropic".to_string(),
-            is_family: false,
-        },
-        Route {
-            name: "claude-sonnet".to_string(),
-            upstream_id: "commandcode".to_string(),
-            real_model: "deepseek/deepseek-v4.1-flash".to_string(),
-            wire: "anthropic".to_string(),
-            is_family: true,
-        },
-        Route {
-            name: "alpha".to_string(),
-            upstream_id: "opencode".to_string(),
-            real_model: "qwen/qwen3.5".to_string(),
-            wire: "openai".to_string(),
-            is_family: false,
-        },
-        Route {
-            name: "claude-fable".to_string(),
-            upstream_id: "opencode".to_string(),
-            real_model: "qwen/qwen3.5".to_string(),
-            wire: "openai".to_string(),
-            is_family: true,
-        },
-        Route {
-            name: "claude-opus".to_string(),
-            upstream_id: "commandcode".to_string(),
-            real_model: "deepseek/deepseek-v4.1-pro".to_string(),
-            wire: "anthropic".to_string(),
-            is_family: true,
-        },
-        Route {
-            name: "claude-haiku".to_string(),
-            upstream_id: "opencode".to_string(),
-            real_model: "qwen/qwen3.5-mini".to_string(),
-            wire: "openai".to_string(),
-            is_family: true,
-        },
+        row(
+            "zeta",
+            "commandcode",
+            "deepseek/deepseek-v4.1-flash",
+            Wire::Anthropic,
+        ),
+        row(
+            "claude-sonnet",
+            "commandcode",
+            "deepseek/deepseek-v4.1-flash",
+            Wire::Anthropic,
+        ),
+        row("alpha", "opencode", "qwen/qwen3.5", Wire::OpenAiChat),
+        row("claude-fable", "opencode", "qwen/qwen3.5", Wire::OpenAiChat),
+        row(
+            "claude-opus",
+            "commandcode",
+            "deepseek/deepseek-v4.1-pro",
+            Wire::Anthropic,
+        ),
+        row(
+            "claude-haiku",
+            "opencode",
+            "qwen/qwen3.5-mini",
+            Wire::OpenAiChat,
+        ),
     ]
 }
 
@@ -182,9 +173,10 @@ fn catalog_rows_use_the_neutral_template_defaults() {
         assert_eq!(m["shell_type"], json!("shell_command"));
         assert_eq!(m["priority"], json!(1000 + i as u64));
         let route = routes().into_iter().find(|r| r.name == slug).expect("路由");
+        let bound = route.binding.expect("夹具里每条都绑好了");
         let description = m["description"].as_str().expect("description");
-        assert!(description.contains(&route.upstream_id), "{description}");
-        assert!(description.contains(&route.real_model), "{description}");
+        assert!(description.contains(&bound.upstream_id), "{description}");
+        assert!(description.contains(&bound.real_model), "{description}");
     }
     let text = serde_json::to_string(&catalog).expect("序列化");
     // 中性模板：没有 freeform apply_patch / web_search（票 31 第 5 条、票 32 第 3 条）。

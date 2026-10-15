@@ -34,6 +34,12 @@ use axum::Router;
 /// `forwarding` 是转发面（`/v1/*`）的状态：`None` = 此刻只挂管理面
 /// （外壳还没接出站转发的阶段；票 49 / 51 起把它接上，路由表就来自那里）。
 pub fn router(api_state: api::ApiState, forwarding: Option<Arc<proxy::Gateway>>) -> Router {
+    // 票 53：日志面（`/api/logs*` 与 `/api/usage/summary`）要的是转发面那个库与**同一个**
+    // body 窗口，所以在挂路由之前先接过来；转发面没挂时日志面回 503，不装成空表。
+    let api_state = match &forwarding {
+        Some(gateway) => api_state.attach_logs(gateway),
+        None => api_state,
+    };
     let app = api::router(api_state);
     match forwarding {
         Some(state) => app.merge(proxy::router().with_state(state)),

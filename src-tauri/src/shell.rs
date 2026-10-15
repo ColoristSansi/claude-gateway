@@ -16,8 +16,7 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{App, AppHandle, Manager, Window, WindowEvent, Wry};
 
 use gateway_core::dist::autostart::{self, HkcuRun};
-use gateway_core::ingress::api::rfc3339_utc;
-use gateway_core::ingress::api::Maintenance;
+use gateway_core::ingress::api::{rfc3339_utc, Maintenance};
 use gateway_core::ingress::proxy;
 use gateway_core::service::{self, Gateway, GatewayConfig};
 use gateway_core::store::Store;
@@ -111,18 +110,39 @@ pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     let port = load_port(&data_dir);
 
     // 转发面 `/v1/*` 接进同一个进程（票 44 交付）：库由外壳开，落点就是上面那个 db_path。
-    // 供应商表与绑定表此刻是空的（归票 49 / 51）——空表下未知模型按入站协议回
-    // `not_found_error` 信封，而不是 axum 的裸 404，所以空表也照样挂上。
+    // 票 51 起装配路径也是**从库里读**：供应商表 + 上游模型目录 + 绑定表（家族槽位 / 每客户端
+    // 档案覆盖）。空库下三张表都是空的，未知模型按入站协议回 `not_found_error` 信封，
+    // 而不是 axum 的裸 404，所以空库也照样挂上。
     // 同一个库句柄也递给维护面（票 62 的 `/api/settings/autostart`、`/api/export`、`/api/import`）。
     let (forwarding, maintenance) = match Store::open(&data_dir) {
-        Ok(store) => (
-            Some(Arc::new(proxy::Gateway::new(
-                store.clone(),
-                HashMap::new(),
-                Vec::new(),
-            ))),
-            Some(Maintenance::new(store, data_dir.clone())),
-        ),
+        Ok(store) => {
+            let maint = Maintenance::new(store.clone(), data_dir.clone());
+            let loaded = tauri::async_runtime::block_on(async {
+                let upstreams = gateway_core::egress::provider::list_upstreams(&store).await;
+                let catalog = gateway_core::egress::provider::catalog_map(&store).await;
+                let bindings = gateway_core::binding::load(&store).await;
+                (upstreams, catalog, bindings)
+            });
+            match loaded {
+                (Ok(upstreams), Ok(catalog), Ok(bindings)) => {
+                    let upstreams = upstreams
+                        .into_iter()
+                        .map(|u| (u.id.clone(), u))
+                        .collect::<HashMap<_, _>>();
+                    let mut gw = proxy::Gateway::new(store, upstreams, bindings);
+                    gw.catalog = catalog;
+                    (Some(Arc::new(gw)), Some(maint))
+                }
+                (u, c, b) => {
+                    let e = u.err().or(c.err()).or(b.err()).map(|e| e.to_string());
+                    let line = format!("上游 / 绑定表读不出，转发面未挂载：{e:?}");
+                    eprintln!("{line}");
+                    let _ = append_log(&logs, &line);
+                    // 转发面挂了不影响导出 / 导入 / 自启开关：维护面照样挂上。
+                    (None, Some(maint))
+                }
+            }
+        }
         Err(e) => {
             let line = format!("库打开失败，转发面未挂载：{e}");
             eprintln!("{line}");

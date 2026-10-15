@@ -132,11 +132,17 @@ pub async fn start(cfg: GatewayConfig) -> Result<Gateway, StartError> {
         cfg.db_path.to_string_lossy().into_owned(),
         addr.port(),
     );
+    // 票 62：维护面（导出 / 导入 / 自启开关）跟着库走，不管转发面挂没挂。
     let state = match cfg.maintenance {
         Some(maint) => state.with_maintenance(maint),
         None => state,
     };
     let state = Arc::new(state);
+    // 票 53：保留期清理表跟着网关起——启动立刻扫一次（把上次退出后攒下的老行清掉），之后每小时一次。
+    // 只在转发面挂了的时候起（没有库就没有日志可清）。
+    if let Some(gateway) = &cfg.forwarding {
+        crate::obs::spawn_purge_sweeper(gateway.store.clone());
+    }
     let app = crate::ingress::router((*state).clone(), cfg.forwarding);
     let (tx, rx) = oneshot::channel();
 

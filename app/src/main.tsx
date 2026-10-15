@@ -1,12 +1,13 @@
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 
-// 空壳：七个页面（spec §10）从 M2 起逐个落地。
+import { App } from './App';
+import './app.css';
+
+// shortcut: 壳层（导航 / 横幅 / 侧栏徽标 / 设计体系）归票 52；这里先挂上「日志与调试」这一页
+// （票 53），52 落地后以它的壳为准。
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
-    <main>
-      <h1>Claude Gateway</h1>
-      <p>骨架已就位；页面随 M2 落地。</p>
-    </main>
+    <App />
   </StrictMode>,
 );

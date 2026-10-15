@@ -28,7 +28,7 @@
 | 6 | 入站的 Anthropic 协议头必须透传 | `tests/replay.rs::chunking_invariance_and_header_injection` |
 | 7 | 上游错误信封要就地转成入站信封 | `tests/replay.rs::error_envelopes_and_route_boundaries` + `src/bin/mock-upstream.rs::error_status` |
 
-## 明确不覆盖的两处
+## 明确不覆盖的一处
 
 （写了原因，不是漏掉。）
 
@@ -37,9 +37,11 @@
   「字节只存真录到的那一份」不手编；解析路径由 `src/sse.rs` 的单元测试
   `comment_frames_do_not_swallow_the_next_frame` 覆盖。真录到的那一个 `event: ping` 帧已作为
   `tests/fixtures/keepalive/anthropic.sse` 收下（40KB / 888 行，字节原样）。
-- **客户端档案覆盖**（同一槽位按客户端走不同上游）：原型没有客户端档案概念（票 10 的设计），
-  按用户 2026-10-15 的决定不在原型里造，归实现阶段（票 51 / 49）；`binding::Route` 已经带着
-  `is_family`，档案那一维加在它上面。
+
+> 原第二条「客户端档案覆盖」已由票 51 销账：`claude-haiku` 在 `codex` 档案下走 mock 的
+> Anthropic 面、在 `global` 下走 commandcode（不可达 → 502），断言在
+> `tests/replay.rs::client_profile_override_and_models_exposure`；解析与落库另见
+> `tests/binding_table.rs`。原型里没有档案概念，那半仍不必补。
 
 ## quirk 双向守卫与豁免
 

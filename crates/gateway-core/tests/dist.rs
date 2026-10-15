@@ -8,9 +8,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use gateway_core::binding::Route;
+use gateway_core::binding::{Binding, ExposedModel, Profile};
 use gateway_core::dist::bundle::{self, ExportOptions, ImportMode};
 use gateway_core::dist::restore::{self, ClientRoots};
+use gateway_core::egress::provider::Wire;
 use gateway_core::store::Store;
 use gateway_core::writer::claude_code::{self, ModelSlots};
 use gateway_core::writer::codex::{self, CodexWriter};
@@ -375,36 +376,24 @@ async fn seed_three_clients(root: &Path, store: &Store) -> (ClientRoots, Vec<(Pa
     (roots, official)
 }
 
-fn routes() -> Vec<Route> {
+fn routes() -> Vec<ExposedModel> {
+    // 票 51 起暴露的形状是 `ExposedModel`（名字 + 是不是家族槽位 + 绑定），不再是转发用的 Route。
+    let row = |name: &str, real: &str| ExposedModel {
+        name: name.to_string(),
+        is_family: true,
+        binding: Some(Binding::new(
+            Profile::Global,
+            name,
+            "openrouter",
+            real,
+            Wire::Anthropic,
+        )),
+    };
     vec![
-        Route {
-            name: "claude-sonnet".to_string(),
-            upstream_id: "openrouter".to_string(),
-            real_model: "deepseek/deepseek-v4.1-flash".to_string(),
-            wire: "anthropic".to_string(),
-            is_family: true,
-        },
-        Route {
-            name: "claude-opus".to_string(),
-            upstream_id: "openrouter".to_string(),
-            real_model: "deepseek/deepseek-v4.1-pro".to_string(),
-            wire: "anthropic".to_string(),
-            is_family: true,
-        },
-        Route {
-            name: "claude-haiku".to_string(),
-            upstream_id: "openrouter".to_string(),
-            real_model: "deepseek/deepseek-v4.1-flash".to_string(),
-            wire: "anthropic".to_string(),
-            is_family: true,
-        },
-        Route {
-            name: "claude-fable".to_string(),
-            upstream_id: "openrouter".to_string(),
-            real_model: "deepseek/deepseek-v4.1-flash".to_string(),
-            wire: "anthropic".to_string(),
-            is_family: true,
-        },
+        row("claude-sonnet", "deepseek/deepseek-v4.1-flash"),
+        row("claude-opus", "deepseek/deepseek-v4.1-pro"),
+        row("claude-haiku", "deepseek/deepseek-v4.1-flash"),
+        row("claude-fable", "deepseek/deepseek-v4.1-flash"),
     ]
 }
 

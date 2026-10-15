@@ -1,18 +1,22 @@
 //! 回放 harness 的**网关进程**（票 41 的测试专用 bin）：把 `ingress::proxy::router()` 挂起来，
-//! 路由表与供应商表用票 41 之前的原型脚手架填好（mock 场景 × wire + 家族槽位 + 两个真实上游）。
+//! 供应商表 / 上游模型目录 / 绑定表都**种进票 42 的库再从库里读出来**（票 51 起）——真实
+//! 装配路径与外壳（票 43）走的是同一条：`provider::save_upstream` → `save_manual_model` →
+//! `binding::save` → `binding::load` / `provider::catalog_map`。
 //!
 //! **独立进程 + 测试专用**：挂 `required-features = ["mock"]`，产品构建里没有它。
 //! 回放测试同时拉起两个进程（本 bin + `mock-upstream`），走**真实 HTTP**：
 //! 「mock 与网关分进程」这条硬要求由它保证。
 //!
-//! 幂等点：路由表从哪来（种库 / 界面 / 客户端档案）归票 49 与票 51；它们接手后本 bin 改成
-//! 「按测试给的绑定种库」，`/v1/*` 那一条路由链**不动**。
+//! 种进库的那张表仍然是**回放脚手架**（mock 场景 × wire + 家族槽位 + 两个真实上游 +
+//! 一条 codex 档案覆盖）；`/v1/*` 那条路由链本身不动。
 //!
 //! 旋钮（都是环境变量）：`GATEWAY_ENV`（凭据 env 文件）/ `GATEWAY_DATA_DIR`（库目录）/
 //! `GATEWAY_PORT` / `GATEWAY_MOCK_PORT` / `GATEWAY_PING_SECS` / `GATEWAY_PROBE_SECS` /
 //! `GATEWAY_LOG_BODY`。
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     extract::State,
@@ -22,8 +26,8 @@ use axum::{
 };
 use serde_json::{json, Value};
 
-use gateway_core::binding::Route;
-use gateway_core::egress::provider::{Env, Quirk, Upstream, Wire};
+use gateway_core::binding::{self, Binding, Profile};
+use gateway_core::egress::provider::{self, Env, Quirk, Upstream, Wire};
 use gateway_core::ingress::proxy::{router, Gateway, BODY_LOG_WINDOW};
 use gateway_core::store::Store;
 
@@ -37,6 +41,36 @@ const ONE_WIRE_SCENARIOS: [(&str, &str); 1] = [("keepalive", "anthropic")];
 const SPECIAL_SCENARIOS: [&str; 3] = ["hang", "hang-nohdr", "hardcut"];
 /// 上游错误信封的负例（票 30 第 4 条）：mock 直接回状态码，不经过 fixture 回放。
 const ERROR_CODES: [&str; 4] = ["401", "403", "429", "500"];
+
+/// 回放脚手架：攒「绑定 + 它需要的目录条目」，最后整批种进库。
+struct Scaffold {
+    upstreams: HashMap<String, Upstream>,
+    bindings: Vec<Binding>,
+    catalog: BTreeMap<(String, String), BTreeSet<Wire>>,
+}
+
+impl Scaffold {
+    /// 一条绑定：上游不存在（没配那条上游的 env）就整条跳过——绑定有外键，种不进去也不该种。
+    /// 同一条 `(上游, 真实模型)` 的两条绑定可能各用不同的 wire，所以目录取并集。
+    fn bind(
+        &mut self,
+        profile: Profile,
+        name: &str,
+        upstream_id: &str,
+        real_model: &str,
+        wire: Wire,
+    ) {
+        if !self.upstreams.contains_key(upstream_id) {
+            return;
+        }
+        self.catalog
+            .entry((upstream_id.to_string(), real_model.to_string()))
+            .or_default()
+            .insert(wire);
+        self.bindings
+            .push(Binding::new(profile, name, upstream_id, real_model, wire));
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -58,7 +92,7 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(8788);
 
     let mut upstreams: HashMap<String, Upstream> = HashMap::new();
-    // 出站凭据（M1 脚手架）：声明式表不存密钥，key 单独一张表；票 51 起改走票 42 的 Store。
+    // 出站凭据（按「上游 × wire」存票 42 的库，DPAPI 密文）：种库时用一次，之后只从库里读。
     let mut keys: HashMap<String, String> = HashMap::new();
 
     // mock 上游：本机假上游，回放 fixtures/。由 mock-upstream 那个**独立进程**提供。
@@ -89,9 +123,7 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("[warn] 缺 OPENCODE_* 配置，opencode 上游不可用");
     }
 
-    // 真实上游 2：commandcode。Claude 模型的位置由上游模型目录的 `supported_wires` 表达
-    // （票 49 起，原 quirk `ClaudeModelsOnAnthropicOnly` 已按 ADR-0004 删除）；harness 的
-    // 路由表仍然是脚手架，目录归票 51 的绑定层种。
+    // 真实上游 2：commandcode。Claude 模型的位置由上游模型目录的 `supported_wires` 表达。
     if let (Some(base), Some(key)) = (
         env.get("COMMANDCODE_BASE_URL"),
         env.get("COMMANDCODE_API_KEY"),
@@ -105,18 +137,14 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("[warn] 缺 COMMANDCODE_* 配置，commandcode 上游不可用");
     }
 
-    let mut routes: Vec<Route> = Vec::new();
-    let mut push = |name: String, upstream_id: &str, real_model: String, wire: &str, family| {
-        routes.push(Route {
-            name,
-            upstream_id: upstream_id.into(),
-            real_model,
-            wire: wire.into(),
-            is_family: family,
-        });
+    // ── 绑定表与目录（票 51）：先攒成内存里那张脚手架，再种进库、从库里读回来 ──
+    let mut s = Scaffold {
+        upstreams,
+        bindings: Vec::new(),
+        catalog: BTreeMap::new(),
     };
 
-    // 家族槽位：客户端只能填这四个名字（原型脚手架；真实绑定归票 51）。
+    // 家族槽位：客户端只能填这四个名字（脚手架值；真实绑定由界面 / 票 59 写）。
     for (name, up, model) in [
         ("claude-fable", "opencode", "deepseek-v4.1-flash"),
         ("claude-opus", "opencode", "deepseek-v4.1-flash"),
@@ -131,73 +159,98 @@ async fn main() -> anyhow::Result<()> {
             "deepseek/deepseek-v4.1-flash",
         ),
     ] {
-        push(name.into(), up, model.into(), "openai", true);
+        s.bind(Profile::Global, name, up, model, Wire::OpenAiChat);
     }
 
     // 真实上游验证条目：两个上游 × 两种 wire，另加三条「上游会拒」的负例。
     for (name, up, model, wire) in [
-        ("oc-deepseek", "opencode", "deepseek-v4.1-flash", "openai"),
-        ("cc-sonnet", "commandcode", "claude-sonnet-5-5", "anthropic"),
+        (
+            "oc-deepseek",
+            "opencode",
+            "deepseek-v4.1-flash",
+            Wire::OpenAiChat,
+        ),
+        (
+            "cc-sonnet",
+            "commandcode",
+            "claude-sonnet-5-5",
+            Wire::Anthropic,
+        ),
         // 负例 1：opencode 的 Anthropic 端点与 Chat 端点凭据不同 → 401。
         (
             "oc-anthropic-unauth",
             "opencode",
             "claude-haiku-5-5",
-            "anthropic",
+            Wire::Anthropic,
         ),
         // 负例 2：commandcode 的 opus 不在本计划内 → 403 MODEL_NOT_IN_PLAN。
         (
             "cc-opus-no-plan",
             "commandcode",
             "claude-opus-5",
-            "anthropic",
+            Wire::Anthropic,
         ),
-        // 负例 3：故意错配 wire，验证 ClaudeModelsOnAnthropicOnly 这条 quirk 真的会拦。
-        ("cc-opus-on-chat", "commandcode", "claude-opus-5", "openai"),
+        // 负例 3：故意错配 wire（commandcode 只把 opus 放在 Anthropic 面）。
+        (
+            "cc-opus-on-chat",
+            "commandcode",
+            "claude-opus-5",
+            Wire::OpenAiChat,
+        ),
     ] {
-        push(name.into(), up, model.into(), wire, false);
+        s.bind(Profile::Global, name, up, model, wire);
     }
+
+    // 票 51 的每客户端覆盖（回放用例拿它验「同一槽位按客户端走不同上游」）：
+    // codex 档案把 `claude-haiku` 指到 mock 的 Anthropic 面；全局那份仍指 commandcode。
+    s.bind(
+        Profile::Codex,
+        "claude-haiku",
+        "mock",
+        "mock-text",
+        Wire::Anthropic,
+    );
 
     // mock 场景：场景 × wire，两个编解码都过一遍。
     for scenario in SCENARIOS {
-        for wire in ["anthropic", "openai"] {
-            push(
-                format!("mock-{wire}-{scenario}"),
+        for (wire, prefix) in [(Wire::Anthropic, "anthropic"), (Wire::OpenAiChat, "openai")] {
+            s.bind(
+                Profile::Global,
+                &format!("mock-{prefix}-{scenario}"),
                 "mock",
-                format!("mock-{scenario}"),
+                &format!("mock-{scenario}"),
                 wire,
-                false,
             );
         }
     }
-    for (scenario, wire) in ONE_WIRE_SCENARIOS {
-        push(
-            format!("mock-{wire}-{scenario}"),
+    for (scenario, prefix) in ONE_WIRE_SCENARIOS {
+        s.bind(
+            Profile::Global,
+            &format!("mock-{prefix}-{scenario}"),
             "mock",
-            format!("mock-{scenario}"),
-            wire,
-            false,
+            &format!("mock-{scenario}"),
+            Wire::parse(prefix).unwrap_or(Wire::Anthropic),
         );
     }
     for scenario in SPECIAL_SCENARIOS {
-        for wire in ["anthropic", "openai"] {
-            push(
-                format!("mock-{wire}-{scenario}"),
+        for (wire, prefix) in [(Wire::Anthropic, "anthropic"), (Wire::OpenAiChat, "openai")] {
+            s.bind(
+                Profile::Global,
+                &format!("mock-{prefix}-{scenario}"),
                 "mock",
-                format!("mock-{scenario}"),
+                &format!("mock-{scenario}"),
                 wire,
-                false,
             );
         }
     }
     for code in ERROR_CODES {
-        for wire in ["anthropic", "openai"] {
-            push(
-                format!("mock-{wire}-err{code}"),
+        for (wire, prefix) in [(Wire::Anthropic, "anthropic"), (Wire::OpenAiChat, "openai")] {
+            s.bind(
+                Profile::Global,
+                &format!("mock-{prefix}-err{code}"),
                 "mock",
-                format!("mock-err{code}"),
+                &format!("mock-err{code}"),
                 wire,
-                false,
             );
         }
     }
@@ -206,12 +259,31 @@ async fn main() -> anyhow::Result<()> {
         ("mock-anthropic-count404", "mock-count404"),
         ("mock-anthropic-countnoinput", "mock-countnoinput"),
     ] {
-        push(name.into(), "mock", real.into(), "anthropic", false);
+        s.bind(Profile::Global, name, "mock", real, Wire::Anthropic);
     }
 
+    // ── 种库：上游 → 目录 → 绑定 → 凭据；再从库里读回请求期要用的两张表 ──
     let store = Store::open(std::path::Path::new(&data_dir))?;
-    let mut gw = Gateway::new(store, upstreams, routes);
-    gw.keys = keys;
+    for up in s.upstreams.values() {
+        provider::save_upstream(&store, up).await?;
+    }
+    for ((upstream_id, model_id), wires) in &s.catalog {
+        let wires: Vec<Wire> = wires.iter().copied().collect();
+        provider::save_manual_model(&store, upstream_id, model_id, &wires).await?;
+    }
+    for b in &s.bindings {
+        binding::save(&store, b)
+            .await
+            .map_err(|e| anyhow::anyhow!("种绑定失败（{}）：{e}", b.name))?;
+    }
+    for (id, key) in &keys {
+        store.put_credential(id, "default", key).await?;
+    }
+    let table = binding::load(&store).await?;
+    let catalog = provider::catalog_map(&store).await?;
+
+    let mut gw = Gateway::new(store, s.upstreams, table);
+    gw.catalog = catalog;
     gw.ping = Duration::from_secs(env_u64("GATEWAY_PING_SECS", 15));
     gw.probe = Duration::from_secs(env_u64("GATEWAY_PROBE_SECS", 20));
     if std::env::var("GATEWAY_LOG_BODY")
@@ -222,17 +294,36 @@ async fn main() -> anyhow::Result<()> {
     }
     let state = Arc::new(gw);
 
-    let app = router()
-        .route("/healthz", get(|| async { "ok" }))
-        // body 日志开关的测试控制面（票 30 第 7 条）：真产品里它是设置页那个开关 + 1 小时自动关。
-        .route("/__bodylog", post(set_body_log))
-        .with_state(state.clone());
+    // 票 53：harness 把**管理面也挂上**（`/api/logs*` / `/api/usage/summary`），日志页那几条
+    // 验收才走得到真实 HTTP。产品侧由 `ingress::router` 干这件事（这里要额外挂两个测试控制面，
+    // 所以自己 merge 一次，挂的仍然是同一个 `api::router`）。
+    let api_state = gateway_core::ingress::api::ApiState::new(
+        env!("CARGO_PKG_VERSION"),
+        std::path::Path::new(&data_dir)
+            .join(gateway_core::store::DB_FILE_NAME)
+            .to_string_lossy()
+            .into_owned(),
+        port,
+    )
+    .attach_logs(&state);
+    let app = gateway_core::ingress::api::router(api_state).merge(
+        router()
+            .route("/healthz", get(|| async { "ok" }))
+            // body 日志开关的测试控制面（票 30 第 7 条）：它拨的是**同一个**窗口实例，
+            // 正式入口是 `/api/logs/body-recording`（票 53）。
+            .route("/__bodylog", post(set_body_log))
+            .with_state(state.clone()),
+    );
 
     println!(
         "网关   http://127.0.0.1:{port}   (inbound: POST /v1/messages, POST /v1/messages/count_tokens, POST /v1/responses, GET /v1/models)"
     );
     println!("mock   http://127.0.0.1:{mock_port}  (独立进程 mock-upstream)");
-    println!("路由表（{} 条）:", state.routes.len());
+    println!(
+        "绑定表（{} 条绑定 / {} 个暴露模型）:",
+        state.bindings.len(),
+        state.bindings.exposed().len()
+    );
 
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     axum::serve(listener, app).await?;

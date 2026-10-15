@@ -1,18 +1,14 @@
 //! 转发面 `/v1/*`：入站协议 → IR → 绑定查表 → 出站转发（spec §3 / §4）。
 //!
-//! 票 41 的落点：这里只放**转发链**，出站细节在 [`crate::egress::upstream`]，
-//! 供应商表在 [`crate::egress::provider`]。管理面 `/api/*` 归票 43 的 `ingress/api.rs`，本模块不碰；
-//! 路由表从哪来归票 49 / 51，这里只拿一张现成的 [`Route`] 表查。
+//! 票 41 铺了转发链、票 49 铺了供应商表与目录；票 51 把**绑定表接进来**：查表不再是一张
+//! 事先拼好的 `Vec<Route>`，而是 [`BindingTable`]（家族槽位 / 普通虚拟模型 / 每客户端档案覆盖），
+//! 出站凭据也从 `Gateway.keys` 那张 M1 临时表换成票 42 的 `Store`（按「上游 × wire」，未填继承
+//! `default`）。管理面 `/api/*` 归票 43 的 `ingress/api.rs`，本模块不碰。
 //!
 //! `router()` 是这一面的唯一入口：外壳（票 43 的 `service`）与回放 harness 都挂它，
 //! 不各自拼一套 `/v1/*`。
 
-use std::{
-    collections::HashMap,
-    path::PathBuf,
-    sync::{Arc, Mutex},
-    time::{Duration, Instant},
-};
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
 use axum::{
     extract::State,
@@ -24,15 +20,17 @@ use axum::{
 use serde_json::{json, Value};
 
 use crate::anthropic;
-use crate::binding::Route;
-use crate::egress::provider::{Upstream, UpstreamModel, Wire};
+use crate::binding::{self, BindingTable, Profile};
+use crate::egress::provider::{self, Upstream, UpstreamModel, Wire};
 use crate::egress::upstream::{self, Inbound};
 use crate::ir;
 use crate::responses;
 use crate::store::Store;
 
 /// body 日志窗口：开启后 1 小时自动关（票 11 的日志定案 / 票 30 第 7 条）。
-pub const BODY_LOG_WINDOW: Duration = Duration::from_secs(3600);
+/// 窗口本体在 [`crate::obs::BodyLogWindow`]（票 53 起管理面 `/api/logs/body-recording` 与这里
+/// 共用同一个实例），这个常量只是转发面测试与 harness 的默认拨法。
+pub use crate::obs::BODY_LOG_WINDOW;
 
 /// 网关运行态：出站客户端、供应商表、绑定表、日志落点与三个旋钮。
 pub struct Gateway {
@@ -41,33 +39,26 @@ pub struct Gateway {
     pub upstreams: HashMap<String, Upstream>,
     /// 上游模型目录：`(上游 id, 真实模型)` → 目录条目（票 49 的三层校验第二层用它早拒）。
     pub catalog: HashMap<(String, String), UpstreamModel>,
-    /// 出站凭据：上游 id → 明文 key。
-    ///
-    /// M1 脚手架（票 41 的 `Gateway.env` 那套）：正式路径是票 42 的 `Store` + DPAPI
-    /// （`credentials` 表按「上游 × wire」各存一份），票 51 的绑定层接手后这里退场。
-    /// 只活在内存里，`Debug` 不打印（见下方手写实现）。
-    pub keys: HashMap<String, String>,
-    /// 绑定表：虚拟模型名 → 上游 + 真实模型 + wire。
-    pub routes: Vec<Route>,
-    /// 日志落点（票 42 的 `Store`）。
+    /// 绑定表（票 51）：虚拟模型名 + 客户端档案 → 上游 / 真实模型 / wire。
+    pub bindings: BindingTable,
+    /// 日志落点与**出站凭据**的来源（票 42 的 `Store`；密钥 DPAPI 密文入库，明文只在内存）。
     pub store: Store,
     /// 上游静默超过它就向前发一帧 `ping`（票 30 第 6 条）。
     pub ping: Duration,
     /// 探针档（`max_tokens <= PROBE_MAX_TOKENS`）的上游上限（票 26 决定 5）。
     pub probe: Duration,
-    /// body 日志开关的到点时间：`None` = 关。
-    pub body_log_until: Mutex<Option<Instant>>,
+    /// body 日志开关的窗口：`None` = 关。与 `/api/logs/body-recording` **同一个**实例（票 53）。
+    pub body_log: Arc<crate::obs::BodyLogWindow>,
 }
 
 impl std::fmt::Debug for Gateway {
-    /// 手写而不是 `derive`：`keys` 是明文密钥，`Debug` 打出来就等于把密钥写进日志。
+    /// 手写而不是 `derive`：这里不该出现任何能拼出密钥的字段（原本的 `keys` 已随票 51 退场）。
     /// 只报条数与旋钮。
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Gateway")
             .field("upstreams", &self.upstreams.len())
             .field("catalog", &self.catalog.len())
-            .field("keys", &self.keys.len())
-            .field("routes", &self.routes.len())
+            .field("bindings", &self.bindings.len())
             .field("ping", &self.ping)
             .field("probe", &self.probe)
             .finish_non_exhaustive()
@@ -76,7 +67,7 @@ impl std::fmt::Debug for Gateway {
 
 impl Gateway {
     /// 装配运行态。出站客户端 300 秒总超时（探针档另有更短的 deadline）。
-    pub fn new(store: Store, upstreams: HashMap<String, Upstream>, routes: Vec<Route>) -> Self {
+    pub fn new(store: Store, upstreams: HashMap<String, Upstream>, bindings: BindingTable) -> Self {
         Gateway {
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(300))
@@ -84,31 +75,21 @@ impl Gateway {
                 .unwrap_or_default(),
             upstreams,
             catalog: HashMap::new(),
-            keys: HashMap::new(),
-            routes,
+            bindings,
             store,
             ping: Duration::from_secs(15),
-            probe: Duration::from_secs(20),
-            body_log_until: Mutex::new(None),
+            probe: binding::PROBE_DEADLINE,
+            body_log: Arc::new(crate::obs::BodyLogWindow::new()),
         }
     }
 
     pub fn body_log_on(&self) -> bool {
-        self.body_log_until
-            .lock()
-            .map(|until| until.map(|d| Instant::now() < d).unwrap_or(false))
-            .unwrap_or(false)
+        self.body_log.on()
     }
 
     /// 拨 body 日志窗口：`0` = 立即关，其余 = 从现在起这么多秒（到点自关）。
     pub fn set_body_log(&self, seconds: u64) {
-        if let Ok(mut until) = self.body_log_until.lock() {
-            *until = if seconds == 0 {
-                None
-            } else {
-                Some(Instant::now() + Duration::from_secs(seconds))
-            };
-        }
+        self.body_log.set(seconds);
     }
 }
 
@@ -160,14 +141,18 @@ async fn proxy(
 ) -> Response {
     // 票 30 第 4 条定下的规则：**去首尾空白 + 大小写敏感**（模型 ID 按契约大小写为准）。
     let name = virtual_model(&body);
+    // 票 51：客户端档案归属按入站 `user-agent` + 客户端标识头判（同一槽位按客户端走不同上游）。
+    let identity = client_identity(&headers);
+    let profile = app.bindings.profile_for(&identity);
     // 票 15：记下客户端真实打的路径与协议头，用来定 base URL 语义。
     println!(
-        "[in] {} proto={} model={name} ua={:?} ver={:?} beta={:?}",
+        "[in] {} proto={} model={name} profile={} ua={:?} ver={:?} beta={:?}",
         uri.path_and_query().map(|p| p.as_str()).unwrap_or(""),
         match inbound {
             Inbound::Anthropic => "anthropic",
             Inbound::Responses => "responses",
         },
+        profile.id(),
         headers.get("user-agent").and_then(|v| v.to_str().ok()),
         headers
             .get("anthropic-version")
@@ -177,13 +162,16 @@ async fn proxy(
     // body 日志开着时把入站体落盘：Codex 的真实请求形状只有它说得清（票 32）。
     dump_inbound(&app, &body);
 
-    let Some(rt) = app.routes.iter().find(|r| r.name == name) else {
-        return err_in(
-            inbound,
-            StatusCode::NOT_FOUND,
-            "not_found_error",
-            &format!("未知虚拟模型 {name:?}"),
-        );
+    let rt = match app.bindings.resolve(&name, &identity) {
+        Ok(rt) => rt,
+        Err(e) => {
+            return err_in(
+                inbound,
+                StatusCode::from_u16(e.status()).unwrap_or(StatusCode::NOT_FOUND),
+                e.error_type(),
+                &e.message(),
+            )
+        }
     };
     let streaming = body
         .get("stream")
@@ -196,21 +184,11 @@ async fn proxy(
                 inbound,
                 StatusCode::BAD_GATEWAY,
                 "api_error",
-                &format!("上游 {} 未配置（缺 key）", rt.upstream_id),
+                &format!("上游 {} 未配置", rt.upstream_id),
             )
         }
     };
-    let wire = Wire::parse(&rt.wire).unwrap_or(Wire::Anthropic);
-    // M1 脚手架：出站凭据从 Gateway.keys 取；票 51 起改成按「上游 × wire」查票 42 的 Store。
-    let Some(key) = app.keys.get(&rt.upstream_id).cloned() else {
-        return err_in(
-            inbound,
-            StatusCode::BAD_GATEWAY,
-            "api_error",
-            &format!("上游 {} 未配置（缺 key）", rt.upstream_id),
-        );
-    };
-    let auth = up.auth_for(wire);
+    let wire = rt.wire;
 
     let decoded = match inbound {
         Inbound::Anthropic => anthropic::decode_request(&body),
@@ -230,6 +208,7 @@ async fn proxy(
     req.model = rt.real_model.clone();
 
     // 三层校验的第二层（ADR-0004）：目录声明过这个模型的 wire 就早拒 400；未声明放行给自检。
+    // 排在取凭据之前：配置错了就不该去碰密钥。
     let entry = app
         .catalog
         .get(&(rt.upstream_id.clone(), rt.real_model.clone()));
@@ -242,14 +221,90 @@ async fn proxy(
         );
     }
 
+    // 出站凭据：按「上游 × wire」查票 42 的 `Store`，没有这一面就继承 `default`（ADR-0004）。
+    let Some(key) = credential(&app, &rt.upstream_id, wire).await else {
+        return err_in(
+            inbound,
+            StatusCode::BAD_GATEWAY,
+            "api_error",
+            &format!("上游 {} 没有可用凭据", rt.upstream_id),
+        );
+    };
+    let auth = up.auth_for(wire);
+
     // 入站的 Anthropic 协议头必须带过去：`anthropic-beta` 一丢，prompt caching / thinking 就静默失效。
     let pass = protocol_headers(&headers);
 
     if streaming {
-        upstream::forward(app, &up, wire, auth, &key, req, name, pass, inbound).await
+        upstream::forward(
+            app,
+            &up,
+            wire,
+            auth,
+            &key,
+            req,
+            name,
+            profile.id().to_string(),
+            pass,
+            inbound,
+        )
+        .await
     } else {
-        upstream::forward_buffered(app, &up, wire, auth, &key, req, name, pass, inbound).await
+        upstream::forward_buffered(
+            app,
+            &up,
+            wire,
+            auth,
+            &key,
+            req,
+            name,
+            profile.id().to_string(),
+            pass,
+            inbound,
+        )
+        .await
     }
+}
+
+/// 出站凭据（票 42 的 `Store`，DPAPI 密文）：读失败就当没有，别把库的抖动说成上游的问题。
+async fn credential(app: &Gateway, upstream_id: &str, wire: Wire) -> Option<String> {
+    match provider::wire_credential(&app.store, upstream_id, wire).await {
+        Ok(secret) => secret,
+        Err(e) => {
+            eprintln!(
+                "[warn] 读凭据失败（{upstream_id} / {}）：{e}",
+                wire.as_str()
+            );
+            None
+        }
+    }
+}
+
+/// 入站客户端身份：`user-agent` + 几个客户端标识头（头名与值都算）。
+///
+/// 归属判据是库里的 `client_profiles.match_ua`（`;` 分隔的子串，大小写不敏感）；
+/// 这里只负责把「客户端到底是谁」的线索拼成一串——UA 里带版本号，标识头里带安装 ID，
+/// 两者都可能是判据（Codex 桌面应用就是靠 `x-codex-*` 认出来的，票 32 的真录入站体）。
+fn client_identity(headers: &HeaderMap) -> String {
+    const MARKERS: [&str; 6] = [
+        "user-agent",
+        "x-app",
+        "originator",
+        "x-codex-installation-id",
+        "x-codex-turn-metadata",
+        "x-codex-window-id",
+    ];
+    let mut out = String::new();
+    for name in MARKERS {
+        if let Some(v) = headers.get(name).and_then(|v| v.to_str().ok()) {
+            // 头名也进串：桌面应用可能只给标识头、不给可辨认的 UA。
+            out.push_str(name);
+            out.push(' ');
+            out.push_str(v);
+            out.push('\n');
+        }
+    }
+    out
 }
 
 /// 虚拟模型名：去首尾空白（大小写敏感由查表本身保证）。
@@ -282,16 +337,21 @@ async fn count_tokens(
     Json(body): Json<Value>,
 ) -> Response {
     let name = virtual_model(&body);
+    let identity = client_identity(&headers);
     println!(
-        "[in] {} count_tokens model={name}",
+        "[in] {} count_tokens model={name} profile={}",
         uri.path_and_query().map(|p| p.as_str()).unwrap_or(""),
+        app.bindings.profile_for(&identity).id(),
     );
-    let Some(rt) = app.routes.iter().find(|r| r.name == name) else {
-        return err(
-            StatusCode::NOT_FOUND,
-            "not_found_error",
-            &format!("未知虚拟模型 {name:?}"),
-        );
+    let rt = match app.bindings.resolve(&name, &identity) {
+        Ok(rt) => rt,
+        Err(e) => {
+            return err(
+                StatusCode::from_u16(e.status()).unwrap_or(StatusCode::NOT_FOUND),
+                e.error_type(),
+                &e.message(),
+            )
+        }
     };
     let mut req = match anthropic::decode_request(&body) {
         Ok(r) => r,
@@ -304,29 +364,28 @@ async fn count_tokens(
         }
     };
     req.model = rt.real_model.clone();
-    let wire = Wire::parse(&rt.wire).unwrap_or(Wire::Anthropic);
+    let wire = rt.wire;
 
     let mut source = "local";
     let mut n = None;
     if wire == Wire::Anthropic {
-        if let (Some(up), Some(key)) = (
-            app.upstreams.get(&rt.upstream_id),
-            app.keys.get(&rt.upstream_id),
-        ) {
-            n = upstream::count_tokens_upstream(
-                &app,
-                up,
-                up.auth_for(wire),
-                key,
-                &req,
-                &protocol_headers(&headers),
-            )
-            .await;
-            source = if n.is_some() {
-                "upstream"
-            } else {
-                "local(降级)"
-            };
+        if let Some(up) = app.upstreams.get(&rt.upstream_id) {
+            if let Some(key) = credential(&app, &rt.upstream_id, wire).await {
+                n = upstream::count_tokens_upstream(
+                    &app,
+                    up,
+                    up.auth_for(wire),
+                    &key,
+                    &req,
+                    &protocol_headers(&headers),
+                )
+                .await;
+                source = if n.is_some() {
+                    "upstream"
+                } else {
+                    "local(降级)"
+                };
+            }
         }
     }
     let n = n.unwrap_or_else(|| ir::estimate_tokens(&req));
@@ -350,24 +409,46 @@ fn protocol_headers(headers: &HeaderMap) -> Vec<(String, String)> {
         .collect()
 }
 
-async fn list_models(State(app): State<Arc<Gateway>>) -> Response {
+/// `GET /v1/models`（spec §4.5 / §8.2）：**自己实现，不依赖上游**。
+///
+/// 暴露集合 = [`BindingTable::exposed`]（四个家族名 + 普通虚拟模型，跨档案去重），
+/// **不按客户端过滤**——过滤发生在配置层，发现层用同一判据（spec §8.2 第 2 条）。
+/// 只有**信封形状**按入站客户端家族给：Claude 系要 Anthropic 的 `data` 那份
+/// （它们还会按「id 含 claude/anthropic」再筛一次），Codex 要标准 `models` 数组
+/// （它是 OpenAI 系客户端，只认 `object: list` + `data[].object: model`）。
+async fn list_models(State(app): State<Arc<Gateway>>, headers: HeaderMap) -> Response {
+    let identity = client_identity(&headers);
+    let profile = app.bindings.profile_for(&identity);
     let data: Vec<Value> = app
-        .routes
-        .iter()
-        .map(|r| {
+        .bindings
+        .exposed()
+        .into_iter()
+        .map(|m| {
+            let (kind, owned) = if m.is_family {
+                ("model", "claude-gateway/family")
+            } else {
+                ("model", "claude-gateway")
+            };
             json!({
-                "type": "model",
-                "id": r.name,
-                "display_name": r.name,
-                "created_at": "2026-01-01T00:00:00Z"
+                "type": kind,
+                "id": m.name,
+                "object": kind,
+                "display_name": m.name,
+                "created": 1_767_225_600u64,
+                "created_at": "2026-01-01T00:00:00Z",
+                "owned_by": owned,
             })
         })
         .collect();
+
+    if profile == Profile::Codex {
+        return Json(json!({ "object": "list", "data": data })).into_response();
+    }
     Json(json!({
         "data": data,
         "has_more": false,
-        "first_id": app.routes.first().map(|r| r.name.clone()),
-        "last_id": app.routes.last().map(|r| r.name.clone())
+        "first_id": data.first().and_then(|m| m["id"].as_str()),
+        "last_id": data.last().and_then(|m| m["id"].as_str())
     }))
     .into_response()
 }

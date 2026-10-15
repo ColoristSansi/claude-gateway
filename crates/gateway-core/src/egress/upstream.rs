@@ -20,6 +20,7 @@ use serde_json::{json, Value};
 
 use crate::anthropic::{self, AnthropicAssembler, AnthropicDecoder, AnthropicEncoder};
 use crate::egress::provider::{AuthScheme, EarlyReject, Quirk, Upstream, UpstreamModel, Wire};
+use crate::egress::structured;
 use crate::ingress::proxy::Gateway;
 use crate::ir::{IrEvent, IrRequest};
 use crate::obs::{self, RequestLog};
@@ -36,6 +37,17 @@ type ByteStream =
 pub enum Inbound {
     Anthropic,
     Responses,
+}
+
+impl Inbound {
+    /// 入站协议对应的出站 wire：结构化输出的 `ResponseFormat::Other` 只在「与入站同形状」的
+    /// wire 上原样带，这个映射就是那条判据（Ollama 面没有出站 wire，将来传 `None`）。
+    pub fn format_origin(self) -> Option<Wire> {
+        match self {
+            Inbound::Anthropic => Some(Wire::Anthropic),
+            Inbound::Responses => Some(Wire::OpenAiResponses),
+        }
+    }
 }
 
 enum Decoder {
@@ -134,14 +146,15 @@ pub fn guard(entry: Option<&UpstreamModel>, wire: Wire) -> Result<(), EarlyRejec
     }
 }
 
-/// 出站请求的唯一组装点：认证、协议头透传、quirk 注入。流式 / 非流式 / 计数三个出口共用，
-/// 免得「某条出口忘了带 anthropic-beta」这种事故。
+/// 出站请求的唯一组装点：认证、协议头透传、quirk 注入。流式 / 非流式 / 计数 / 自检探针
+/// 四个出口共用，免得「某条出口忘了带 anthropic-beta」这种事故。
 ///
-/// 凭据按「上游 × wire」由调用方取好再传进来（M1 是 Gateway 里的临时表，M2 起是票 42 的
-/// `Store` + DPAPI），声明式表本身**不存密钥**。
+/// 凭据按「上游 × wire」由调用方取好再传进来（`provider::wire_credential`），
+/// 声明式表本身**不存密钥**。只收 `reqwest::Client`（不收整个 `Gateway`）：绑定层的自检探针
+/// 也要用同一个组装点，而绑定层不能反过来依赖转发面的状态。
 #[allow(clippy::too_many_arguments)]
-fn request(
-    app: &Gateway,
+pub(crate) fn request(
+    client: &reqwest::Client,
     up: &Upstream,
     wire: Wire,
     auth: AuthScheme,
@@ -151,7 +164,7 @@ fn request(
     seed: &str,
     pass_headers: &[(String, String)],
 ) -> reqwest::RequestBuilder {
-    let mut rb = app.client.post(url).json(body);
+    let mut rb = client.post(url).json(body);
     rb = match auth {
         AuthScheme::Bearer => rb.header("authorization", format!("Bearer {key}")),
         AuthScheme::XApiKey => rb.header("x-api-key", key.to_string()),
@@ -190,7 +203,11 @@ fn wire_not_implemented(wire: Wire, inbound: Inbound, up_id: &str) -> Response {
 /// deepseek 直连 curl 也复现），所以只给这一档加短上限，普通生成长度不受影响。
 /// 票 26 决定 5：统一超时不加，只封这一档。上限值由 `GATEWAY_PROBE_SECS` 给（默认 20 秒，
 /// 票 30 第 9 条给测试留的旋钮——不拨短的话那条断言要真等 20 秒）。
-const PROBE_MAX_TOKENS: u64 = 16;
+pub const PROBE_MAX_TOKENS: u64 = 16;
+
+/// 探针档的上游上限（秒）：超时 504（spec §4.5 / 票 26 决定 5）。
+/// 绑定层的自检探针（`binding::selfcheck`）与转发面共用这一个值。
+pub const PROBE_DEADLINE: Duration = Duration::from_secs(20);
 
 fn with_deadline(
     rb: reqwest::RequestBuilder,
@@ -227,21 +244,39 @@ pub async fn forward_buffered(
     key: &str,
     req: IrRequest,
     client_model: String,
+    // 客户端档案 id（票 51）：只进日志行，转发逻辑不看它。
+    client: String,
     pass_headers: Vec<(String, String)>,
     inbound: Inbound,
 ) -> Response {
     let Some(url) = up.url(wire) else {
         return wire_not_implemented(wire, inbound, &up.id);
     };
-    let body = match wire {
+    let mut body = match wire {
         Wire::Anthropic => anthropic::encode_request(&req, true),
         Wire::OpenAiChat => openai::encode_request(&req, true),
         Wire::OpenAiResponses => return wire_not_implemented(wire, inbound, &up.id),
     };
+    // 票 57：结构化输出的两条请求期 400（表达不了 / 能力位 ignore）在这里落地：body 就在这一步
+    // 组装，所以判据也只能在这里——关键是它排在**发出任何字节之前**。
+    if let Err(rej) = structured::apply(
+        &mut body,
+        req.format.as_ref(),
+        wire,
+        up.structured_output(wire),
+        inbound.format_origin(),
+    ) {
+        return error_response_for(
+            inbound,
+            StatusCode::from_u16(rej.status).unwrap_or(StatusCode::BAD_REQUEST),
+            rej.error_type,
+            &rej.message,
+        );
+    }
     let t0 = Instant::now();
     let sent = with_deadline(
         request(
-            &app,
+            &app.client,
             up,
             wire,
             auth,
@@ -268,6 +303,7 @@ pub async fn forward_buffered(
                 wire,
                 status.as_u16() as i64,
                 &client_model,
+                &client,
                 Some(msg.clone()),
             )
             .await;
@@ -285,6 +321,7 @@ pub async fn forward_buffered(
             wire,
             status.as_u16() as i64,
             &client_model,
+            &client,
             Some(msg.clone()),
         )
         .await;
@@ -340,7 +377,9 @@ pub async fn forward_buffered(
     };
     let row = RequestLog {
         ts: 0,
+        request_id: None,
         virtual_model: client_model.clone(),
+        client: Some(client.clone()),
         upstream_id: up.id.clone(),
         real_model: req.model.clone(),
         wire: wire.as_str().into(),
@@ -381,7 +420,7 @@ pub async fn count_tokens_upstream(
     let body = anthropic::encode_count_request(req);
     // shortcut: 计数是辅助端点，10 秒封顶，不让它挂住客户端；要更久就改这里。
     let resp = request(
-        app,
+        &app.client,
         up,
         Wire::Anthropic,
         auth,
@@ -411,21 +450,48 @@ pub async fn forward(
     key: &str,
     req: IrRequest,
     client_model: String,
+    // 客户端档案 id（票 51）：只进日志行，转发逻辑不看它。
+    client: String,
     pass_headers: Vec<(String, String)>,
     inbound: Inbound,
 ) -> Response {
     let Some(url) = up.url(wire) else {
         return wire_not_implemented(wire, inbound, &up.id);
     };
-    let body = match wire {
+    let mut body = match wire {
         Wire::Anthropic => anthropic::encode_request(&req, true),
         Wire::OpenAiChat => openai::encode_request(&req, true),
         Wire::OpenAiResponses => return wire_not_implemented(wire, inbound, &up.id),
     };
+    // 票 57：与 `forward_buffered` 同一套判据（两条出口共用，免得某条忘了拦）。
+    if let Err(rej) = structured::apply(
+        &mut body,
+        req.format.as_ref(),
+        wire,
+        up.structured_output(wire),
+        inbound.format_origin(),
+    ) {
+        return error_response_for(
+            inbound,
+            StatusCode::from_u16(rej.status).unwrap_or(StatusCode::BAD_REQUEST),
+            rej.error_type,
+            &rej.message,
+        );
+    }
 
     let seed = first_user_text(&req);
     let rb = with_deadline(
-        request(&app, up, wire, auth, key, &url, &body, &seed, &pass_headers),
+        request(
+            &app.client,
+            up,
+            wire,
+            auth,
+            key,
+            &url,
+            &body,
+            &seed,
+            &pass_headers,
+        ),
         req.max_tokens,
         app.probe,
     );
@@ -442,6 +508,7 @@ pub async fn forward(
                 wire,
                 status.as_u16() as i64,
                 &client_model,
+                &client,
                 Some(msg.clone()),
             )
             .await;
@@ -460,6 +527,7 @@ pub async fn forward(
             wire,
             status.as_u16() as i64,
             &client_model,
+            &client,
             Some(msg.clone()),
         )
         .await;
@@ -488,6 +556,7 @@ pub async fn forward(
         row: RequestLog {
             ts: 0,
             virtual_model: client_model,
+            client: Some(client),
             upstream_id: up.id.clone(),
             real_model: req.model.clone(),
             wire: wire.as_str().into(),
@@ -666,6 +735,8 @@ impl Drop for Pump {
     }
 }
 
+/// 转发还没进流就失败时的日志行（连接失败 / 上游非 2xx）：这一发没有终态可等，一个字段一个字段地拼。
+#[allow(clippy::too_many_arguments)]
 async fn log_plain(
     store: &Store,
     upstream_id: &str,
@@ -673,12 +744,14 @@ async fn log_plain(
     wire: Wire,
     status: i64,
     client_model: &str,
+    client: &str,
     error: Option<String>,
 ) {
     let _ = obs::log(
         store,
         &RequestLog {
             virtual_model: client_model.to_string(),
+            client: Some(client.to_string()),
             upstream_id: upstream_id.to_string(),
             real_model: real_model.to_string(),
             wire: wire.as_str().into(),
