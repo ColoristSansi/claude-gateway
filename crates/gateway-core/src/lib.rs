@@ -11,5 +11,6 @@ pub mod egress;
 pub mod ingress;
 pub mod ir;
 pub mod obs;
+pub mod service;
 pub mod store;
 pub mod writer;
