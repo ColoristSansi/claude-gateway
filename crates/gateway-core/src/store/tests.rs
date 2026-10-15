@@ -344,6 +344,20 @@ async fn upgrades_a_prototype_era_db_in_place() {
     assert_eq!(quirks[0]["name"], "SessionIdHeader");
     assert_eq!(quirks[0]["arg"], "x-opencode-session");
 
+    // v3（票 49）与 v4（票 50）加的两列在旧库上也在，且都还没有记录。
+    let (pull_ok_at, selfcheck_at): (Option<i64>, Option<i64>) = store
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT last_pull_ok_at,last_selfcheck_at FROM upstreams WHERE id='opencode'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(pull_ok_at, None, "旧库升上来：从没成功拉过");
+    assert_eq!(selfcheck_at, None, "旧库升上来：从没自检过");
+
     // 原型期的 quirks 表已并走。
     let gone: i64 = store
         .read(|c| {
