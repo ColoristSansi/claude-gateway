@@ -9,7 +9,10 @@ description = "本地模型网关内核：ingress / IR / binding / egress / obs 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "fs", "sync"] }
 axum = "0.8"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# preserve_order：写入引擎要「JSON 保键序 + 位移删除」（spec §8.4 第 5 条）——Map 缺省是 BTreeMap，会按名排序。
+serde_json = { version = "1", features = ["preserve_order"] }
+# TOML 保序改写（spec §8.4 第 5 条）：toml_edit 保留原有键序、注释与格式，只改接管键。
+toml_edit = "0.25"
 reqwest = { version = "0.12", features = ["json", "stream"] }
 futures-util = "0.3"
 bytes = "1"
@@ -17,5 +20,11 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 anyhow = "1"
 
 # DPAPI（CryptProtectData / CryptUnprotectData）：密钥只以密文入库（spec §9）。
+# FileSystem：原子替换 ReplaceFileW（spec §8.4 第 1 条）；SystemInformation：备份文件名的本地时间。
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_SystemInformation",
+] }
