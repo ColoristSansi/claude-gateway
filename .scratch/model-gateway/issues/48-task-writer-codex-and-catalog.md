@@ -171,6 +171,9 @@ diff 动手前 还原后  →  0 行
 全部通过。
 ```
 
+收工前 `git merge integration/model-gateway`（tip `0f394ae`，票 46/47/49/50）后**重跑同一门禁**：`unit` → `gateway_core(lib)` **107 passed / 3 ignored**（含本票 15 条）、`claude_gateway` 5、`gateway_service` 4、集成 `provider_table` / `discovery` 14 passed / 4 ignored（真实上游那条）、`doc-tests` 1；`replay` 20、`replay-unit` 5 —— **全绿**。
+唯一冲突在 `writer/mod.rs` 的模块清单（本票的 `codex` / `codex_tests` vs 票 46 的 `desktop` / `desktop_tests`），两边都留。集成里票 46 顺手改了引擎 `doc.rs` 的 `json_ensure_array`（`SetElement` 自建数组），与本票用的键级 `Set` / `Remove` 无关，本票 15 条用例在合并后仍全过。
+
 ### 遗留与坑
 
 1. **引擎工件：空的 `[model_providers]` 父表**。引擎 `toml_ensure` 建中间层时是非隐式表，所以写出来的文件多一行 `[model_providers]`（Codex 实测接受：`✓ config loaded` + `debug models` 6 条）。还原用 `RemoveIfEmpty` 把它一起摘掉，逐字节回原样有测试；哨兵区域把那行也圈进去。要让它消失得改引擎（给中间层设 implicit），本票不动。
