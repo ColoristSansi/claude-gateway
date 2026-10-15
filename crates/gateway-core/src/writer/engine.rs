@@ -58,13 +58,22 @@ impl Writer {
     }
 
     /// 按依赖序写一份计划里的所有文件。
+    ///
+    /// 中途**报错即停**（错误里列出已改动的文件）；中途**冲突也即停**（后面的文件一个字节不动），
+    /// 否则指针文件会先于它指向的那份配置生效，出现「激活了一个没配好的 profile」。
     pub async fn write(&self, plan: &WritePlan) -> Result<WriteReport> {
         let mut specs: Vec<&FileSpec> = plan.files.iter().collect();
         specs.sort_by_key(|s| s.order);
         let mut done: Vec<(PathBuf, FileOutcome)> = Vec::new();
         for spec in specs {
             match self.write_one(spec, plan.mode).await {
-                Ok(o) => done.push((spec.rel_path.clone(), o)),
+                Ok(o) => {
+                    let conflicted = matches!(o, FileOutcome::Conflict { .. });
+                    done.push((spec.rel_path.clone(), o));
+                    if conflicted {
+                        break;
+                    }
+                }
                 Err(e) => {
                     return Err(e.context(format!(
                         "多文件写入中途失败；已改动：{}",

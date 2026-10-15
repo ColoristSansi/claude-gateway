@@ -1052,6 +1052,43 @@ async fn multi_file_write_follows_dependency_order_and_lists_changed_files() {
     );
 }
 
+#[tokio::test]
+async fn a_conflict_stops_the_rest_of_the_plan() {
+    let e = env("multi-conflict");
+    // order 0：被引用者；order 1：指针。前者的接管键被手改 → 冲突 → 指针文件一个字节不动。
+    let referenced = FileSpec::new(
+        "claude-desktop",
+        "configLibrary/p.json",
+        Format::Json,
+        vec![set(&["inferenceProvider"], json!("gateway"))],
+    )
+    .with_order(0);
+    let pointer = FileSpec::new(
+        "claude-desktop",
+        "configLibrary/_meta.json",
+        Format::Json,
+        vec![set(&["appliedId"], json!("p"))],
+    )
+    .with_order(1);
+    let plan = WritePlan::new(vec![referenced.clone(), pointer.clone()]);
+
+    e.writer.write(&plan).await.unwrap();
+    write_file(
+        &e.config.join("configLibrary/p.json"),
+        "{\n  \"inferenceProvider\": \"anthropic\"\n}\n",
+    );
+    fs::remove_file(e.config.join("configLibrary/_meta.json")).unwrap();
+
+    let report = e.writer.write(&plan).await.unwrap();
+    assert_eq!(report.files.len(), 1, "冲突即停：后面的文件不许再动");
+    assert!(matches!(report.files[0].1, FileOutcome::Conflict { .. }));
+    assert_eq!(report.conflicts().len(), 1);
+    assert!(
+        !e.config.join("configLibrary/_meta.json").exists(),
+        "指针文件必须没被碰过（不出现悬空/错位指针）"
+    );
+}
+
 // ── 并发 ──────────────────────────────────────────────────────────────────────
 
 #[tokio::test]

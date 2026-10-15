@@ -73,6 +73,7 @@ let spec = FileSpec::new(
     .with_order(0);                    // 依赖序：先被引用者、后指针
 
 let report = writer.write(&WritePlan::new(vec![profile, meta])).await?;  // 多文件按 order 逐个原子替换
+// 中途报错 / 冲突都即停（错误里列已改文件、冲突时后面的文件一个字节不动，避免指针先于被引用者生效）
 // 冲突（report.conflicts() / FileOutcome::Conflict{path,recorded,current}）→ 界面提示；
 // 用户点「认领并覆盖」→ WritePlan::new(files).claim() 再来一次。
 writer.restore(&plan).await?;            // 默认摘键（含指针性条目）
@@ -111,23 +112,23 @@ writer.rollback(&spec).await?;           // 整份回滚：Rolled / Refused{reas
 真实路径证据：跑门禁前 / 后各对 `%LOCALAPPDATA%\Claude-3p`、`~/.claude`、`~/.codex` 逐文件快照（相对路径 + 长度 + mtime + SHA256），两次快照文件**逐字节相同**：
 
 ```
-snapshot before2.txt: 7355 files
+snapshot before3.txt: 7355 files
 === 跑 pwsh -File ./check.ps1 -Quick -Replay ===
-snapshot after2.txt: 7355 files
-diff before2.txt after2.txt   →  exit 0，0 行
-sha256  before2.txt = dc88f2457dbe8c9fcd1270a83a93362c9982cf8e89f6eb27271041b7792b66c7
-sha256  after2.txt  = dc88f2457dbe8c9fcd1270a83a93362c9982cf8e89f6eb27271041b7792b66c7
+snapshot after3.txt: 7355 files
+diff before3.txt after3.txt   →  exit 0，0 行
+sha256  before3.txt = dc88f2457dbe8c9fcd1270a83a93362c9982cf8e89f6eb27271041b7792b66c7
+sha256  after3.txt  = dc88f2457dbe8c9fcd1270a83a93362c9982cf8e89f6eb27271041b7792b66c7
 ```
 
 （快照脚本没进仓库，逻辑就是：对三个目录 `Get-ChildItem -Recurse -File -Force` 逐个 `Get-FileHash -Algorithm SHA256`，输出 `路径|长度|mtime ticks|hash` 排序后比对；脚本本身只有读操作。）
 
-**2）六类必需用例**（`cargo test -p gateway-core --lib writer::`，33 条全过）
+**2）六类必需用例**（`cargo test -p gateway-core --lib writer::`，34 条全过）
 
 | 要求 | 用例 | 断言要点 |
 | --- | --- | --- |
 | 崩溃窗口 | `crash_window_never_leaves_a_half_written_target`、`stale_temp_files_are_cleaned_and_foreign_temp_files_are_left_alone` | 同目录躺着写满没替换的 `*.cg-tmp*` 时目标文件仍是**完整合法 JSON**、混不进半截字节；>24h 陈旧临时文件顺手清掉，不陈旧的别人的文件不碰 |
 | 占用重试 | `busy_file_is_retried_then_reported_with_paths_and_hint` | 目标以 `FILE_SHARE_READ` 被占住：退避重试 3 次（实测 `elapsed >= 600ms`）后报错，错误里带**目标路径 + 备份路径 + 「可能有客户端正占用该文件」**；目标字节与 mtime 不变、临时文件已删 |
-| 冲突放弃 | `conflict_gives_up_and_leaves_the_file_untouched` | 手改接管键 → `Conflict{path,recorded:"gateway",current:"anthropic"}`，文件与 mtime 不变、不新增备份；配套 `claim_mode_overwrites_the_owned_key`（认领覆盖）、`a_different_owned_key_list_is_treated_as_first_takeover` |
+| 冲突放弃 | `conflict_gives_up_and_leaves_the_file_untouched` | 手改接管键 → `Conflict{path,recorded:"gateway",current:"anthropic"}`，文件与 mtime 不变、不新增备份；配套 `claim_mode_overwrites_the_owned_key`（认领覆盖）、`a_different_owned_key_list_is_treated_as_first_takeover`、`a_conflict_stops_the_rest_of_the_plan`（多文件遇冲突即停，指针文件不动） |
 | 幂等不写 | `json_write_is_idempotent_and_keeps_user_keys_and_layout` | 第二次 `Unchanged` 且 `mtime` 不变；把文件还原成写前内容再写一次 → 字节与第一次完全相同 |
 | 摘键还原 | `snip_restore_drops_owned_keys_and_pointer_entries_only`、`restore_deletes_a_file_the_gateway_created_and_emptied` | `_meta.json` 只摘网关条目 + `appliedId` 条件回退，别的 profile 不动；网关新建且摘空只剩网关内容的文件整个删；已有用户内容的文件留着只摘键 |
 | 整份回滚拒绝 | `rollback_refuses_when_the_file_drifted_after_our_write` | 网关写完后手改接管键 → `Refused{reason}` 里点出键名与「外部改过」，文件一个字节不动；配套 `rollback_restores_the_first_snapshot_byte_for_byte`（逐字节）、`rollback_deletes_a_file_the_gateway_created`、`rollback_without_any_record_is_refused` |
@@ -140,7 +141,7 @@ sha256  after2.txt  = dc88f2457dbe8c9fcd1270a83a93362c9982cf8e89f6eb27271041b779
 pwsh -File ./check.ps1 -Quick -Replay
 === fmt    (cargo fmt --all --check) ===
 === clippy (cargo clippy --workspace -D warnings) ===
-=== unit   (cargo test --workspace) ===                           70 passed
+=== unit   (cargo test --workspace) ===                           71 passed
 === clippy (mock 特性：两个测试 bin + 回放测试) ===
 === replay (集成：自起网关 + mock 两个进程，回放 fixtures) ===      20 passed
 === replay-unit (回放器切法单测，mock 特性下的 bin) ===             5 passed
