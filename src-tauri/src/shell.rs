@@ -49,8 +49,9 @@ pub fn status_label(running: bool, port: u16) -> String {
 
 /// 端口配置：`<数据目录>\config.json` 里的 `port`；缺省、非法、越界一律回默认 8787。
 ///
-/// shortcut: 端口暂读 JSON 文件而不是 SQLite `settings` 表（spec §9）；等票 42 的库与
-/// 票 52 的设置页落地后，这里改读库，`config.json` 只留迁移用。
+/// shortcut: 端口暂读 JSON 文件，而不是票 42 库里的 `settings` 表 `settings_keys::PORT`
+/// （spec §9 要求落库）；`store` 还没有设置项读写接口、设置页（票 52）也还没写它。
+/// 接上后这里改读库，`config.json` 只留迁移用（默认值仍是 8787，行为不变）。
 pub fn load_port(data_dir: &Path) -> u16 {
     let Ok(text) = fs::read_to_string(data_dir.join("config.json")) else {
         return service::DEFAULT_PORT;
@@ -81,14 +82,16 @@ pub fn append_log(logs_dir: &Path, line: &str) -> std::io::Result<()> {
 /// `setup`：备目录 → 起网关 → 建托盘。网关起不来也**继续建托盘**，
 /// 好让用户看到「未运行」并去改端口（spec §10 故障态）。
 pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
-    let data_dir = app.path().app_data_dir()?;
+    // 数据目录只有一处定义（票 42 的 `store::default_data_dir`）：`%APPDATA%\com.claudegateway.desktop\`。
+    let data_dir = gateway_core::store::default_data_dir()?;
     let logs = logs_dir(&data_dir);
     fs::create_dir_all(&logs)?;
 
+    let db_path = data_dir.join(gateway_core::store::DB_FILE_NAME);
     let port = load_port(&data_dir);
     let config = GatewayConfig {
         port,
-        db_path: data_dir.join("gateway.db"),
+        db_path: db_path.clone(),
         version: env!("CARGO_PKG_VERSION").to_string(),
     };
 
@@ -99,7 +102,7 @@ pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
                 "网关已启动：http://{}:{}（库：{}）",
                 service::HOST,
                 gateway.port(),
-                data_dir.join("gateway.db").display()
+                db_path.display()
             );
             println!("{line}");
             let _ = append_log(&logs, &line);
@@ -168,7 +171,7 @@ fn build_tray(app: &AppHandle, running: bool, port: u16) -> tauri::Result<()> {
 fn on_menu_event(app: &AppHandle, event: MenuEvent) {
     match event.id().as_ref() {
         "show-window" => show_main_window(app),
-        "open-logs" => open_logs_dir(app),
+        "open-logs" => open_logs_dir(),
         "quit" => quit(app),
         // "desktop-1p3p" 是禁用占位项，点不出事件；其余忽略。
         _ => {}
@@ -184,8 +187,8 @@ pub fn show_main_window(app: &AppHandle) {
     }
 }
 
-fn open_logs_dir(app: &AppHandle) {
-    let Ok(data_dir) = app.path().app_data_dir() else {
+fn open_logs_dir() {
+    let Ok(data_dir) = gateway_core::store::default_data_dir() else {
         return;
     };
     let dir = logs_dir(&data_dir);
