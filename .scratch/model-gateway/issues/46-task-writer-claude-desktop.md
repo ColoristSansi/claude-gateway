@@ -145,7 +145,7 @@ pwsh -File ./check.ps1 -Quick -Replay
 === clippy (cargo clippy --workspace -D warnings) ===
 === unit   (cargo test --workspace) ===
 test result: ok. 5 passed; 0 failed; 0 ignored                              (claude-gateway)
-test result: ok. 83 passed; 0 failed; 1 ignored                             (gateway-core lib：含 desktop 14 条，1 条 #[ignore] 的真实路径用例)
+test result: ok. 83 passed; 0 failed; 1 ignored                             (gateway-core lib：含 desktop 14 条，1 条 #[ignore] 的真实路径用例；合票 47 后是 92 条)
 test result: ok. 4 passed; 0 failed; 0 ignored                              (gateway_service)
 test result: ok. 14 passed; 0 failed; 0 ignored                             (provider_table，票 49)
 test result: ok. 0 passed; 0 failed; 2 ignored                              (upstream_live，票 49 的真上游用例)
@@ -156,7 +156,7 @@ test result: ok. 1 passed; 0 failed; 0 ignored                              (doc
 全部通过。
 ```
 
-这是合并集成分支（`e303329` 票 49）之后的运行；`gateway_core-2dea75f1da6774a5.exe --list` 里 `desktop_tests` 计 14 条，确认门禁跑的就是带本票用例的那个二进制（下面遗留 8 说的那件事）。
+这是合并集成分支（`e303329` 票 49，随后又合了 `50ab7ff` 票 47——`mod.rs` 只有两行模块声明并存）之后的运行；`gateway_core-2dea75f1da6774a5.exe --list` 里 `desktop_tests` 计 14 条，确认门禁跑的就是带本票用例的那个二进制（下面遗留 8 说的那件事）。合票 47 之后 gateway-core lib = **92** 条（70 基座 + 本票 14 + 票 47 的 8），仍 0 failed。
 
 #### 4）留给票 55 现场验收（用户在场）的步骤与前置
 
