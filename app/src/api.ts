@@ -210,20 +210,130 @@ export type UsageRow = {
   input_tokens: number;
   output_tokens: number;
   cache_read: number;
+  /** 缓存写（票 58）：上游报了才有，没报计 0。 */
+  cache_write: number;
   /** 价格缺失的请求数（不计入总额）。 */
   no_price: number;
   /** token 未知的请求数（不计入总额）。 */
   token_unknown: number;
 };
 
+export type UsageTotals = Omit<UsageRow, 'key'>;
+
 export type UsageSummary = {
   range: string;
   dim: string;
   from: number;
-  totals: Omit<UsageRow, 'key'>;
+  totals: UsageTotals;
   rows: UsageRow[];
   /** 美元→人民币汇率（票 33：库内美元为锚，界面按当前汇率换算）。 */
   rate: number | null;
+};
+
+/** 按天明细（票 59）：`day` 是**本机本地**自然日 `YYYY-MM-DD`。 */
+export type UsageDailyRow = UsageTotals & { day: string };
+
+/** 用量页的完整一份（`/api/usage`，与 `/api/usage/summary` 同一个 handler）。 */
+export type UsageReport = UsageSummary & {
+  /** 右端（Unix 秒）；`null` = 一直到现在。 */
+  to: number | null;
+  daily: UsageDailyRow[];
+};
+
+/** 帧时间轴里的一帧（票 59）：时间戳 + 事件类型 + 摘要 + 可展开的原文。 */
+export type LogFrame = {
+  seq: number;
+  at_ms: number;
+  event: string | null;
+  summary: string;
+  raw: string | null;
+};
+
+/** 日志详情四段（票 59）：概要 / 请求与响应体 / 帧时间轴 / 错误信息。 */
+export type LogDetail = {
+  summary: LogRow;
+  bodies: {
+    request: string | null;
+    response: string | null;
+    recorded: boolean;
+    recording_on: boolean;
+    retention_days: number;
+  };
+  frames: {
+    frames: LogFrame[];
+    /** 上游原样的整条 SSE 文本（「切原始 SSE 文本」看的就是它）。 */
+    sse: string | null;
+    recorded: boolean;
+  };
+  error: { raw: string | null; template: ErrorShape | null };
+};
+
+export type SettingsView = {
+  version: string;
+  port: number;
+  dbPath: string;
+  dataDir: string;
+  logRetentionDays: number;
+  usdCnyRate: number;
+  catalogSnapshotAt: number | null;
+  /** 关窗行为：`hide` = 隐藏到托盘，`quit` = 退出应用。 */
+  trayCloseAction: 'hide' | 'quit';
+  bodyRecording: BodyRecording;
+  /** 维护面没挂上时是 `null`（不假装「关着」）。 */
+  autostart: { enabled: boolean; valueName: string } | null;
+};
+
+export type DistInfo = {
+  exportFormat: string;
+  exportVersion: number;
+  dpapiWarning: string;
+  usage: string;
+  autostartDefault: boolean;
+  restoreCommand: string;
+};
+
+export type ExportReport = {
+  path: string;
+  bytes: number;
+  secrets: boolean;
+  encrypted: boolean;
+  dpapiWarning: string;
+};
+
+export type ImportReport = {
+  format: string;
+  version: number;
+  appVersion: string;
+  exportedAt: string;
+  duplicates: string[];
+  upstreamsCreated: number;
+  upstreamsReplaced: number;
+  upstreamsSkipped: number;
+  upstreamModelsImported: number;
+  virtualModelsImported: number;
+  virtualModelsDropped: number;
+  settingsImported: number;
+  credentialsImported: number;
+  credentialsSkipped: number;
+};
+
+export type AboutView = {
+  version: string;
+  dbPath: string;
+  dataDir: string;
+  updatesDir: string;
+  packages: string[];
+  rollback: { guidance: string; hasPrevious: boolean };
+  portable: { isPortable: boolean; note: string };
+  update: { supported: boolean; note: string };
+};
+
+export type CatalogRefresh = {
+  refreshed: boolean;
+  imported: number;
+  at: number | null;
+  reusedOldSnapshot: boolean;
+  message: string;
 };
 
 export type ClientFileStatus = {
@@ -399,6 +509,47 @@ export const api = {
     req<BodyRecording>('/api/logs/body-recording', {
       ...json(seconds === undefined ? { enabled, consent } : { enabled, consent, seconds }),
     }),
+  /** 票 59：详情四段（`id` 认行 id 也认 request_id）。 */
+  logDetail: (id: number | string) => req<LogDetail>(`/api/logs/${encodeURIComponent(String(id))}`),
+  /** 票 59：清空日志（二次确认由界面做）。 */
+  clearLogs: () => req<{ deleted: number }>('/api/logs/clear', json({})),
+
+  // ── 票 59：用量与成本页 ──
+  /** 五个时间范围 × 三个维度 + 按天明细；自定义要配 `from` / `to`（本地日期，`to` 含当天）。 */
+  usage: (
+    range: 'today' | '7d' | '30d' | 'all' | 'custom',
+    dim: 'virtual_model' | 'upstream' | 'client',
+    from?: string,
+    to?: string,
+  ) => {
+    const p = new URLSearchParams({ range, dim });
+    if (from) p.set('from', from);
+    if (to) p.set('to', to);
+    return req<UsageReport>(`/api/usage?${p.toString()}`);
+  },
+
+  // ── 票 59：设置页 ──
+  settings: () => req<SettingsView>('/api/settings'),
+  saveSettings: (patch: Partial<{ port: number; logRetentionDays: number; usdCnyRate: number; trayCloseAction: 'hide' | 'quit' }>) =>
+    req<SettingsView>('/api/settings', put(patch)),
+  autostart: () => req<{ enabled: boolean; valueName: string; runKey: string; commandLine: string }>(
+    '/api/settings/autostart',
+  ),
+  setAutostart: (enabled: boolean) =>
+    req<{ enabled: boolean; valueName: string; runKey: string; commandLine: string }>(
+      '/api/settings/autostart',
+      put({ enabled }),
+    ),
+  openDbDir: (which: 'data' | 'logs') =>
+    req<{ opened: string; which: string }>('/api/settings/db/open', json({ which })),
+  refreshCatalog: () => req<CatalogRefresh>('/api/catalog/refresh', json({})),
+  about: () => req<AboutView>('/api/about'),
+  distInfo: () => req<DistInfo>('/api/dist/info'),
+  /** 导出配置到文件（默认不含明文密钥；给口令 = 加密导出）。 */
+  exportConfig: (body: { path: string; password?: string | null; includeSecrets?: boolean }) =>
+    req<ExportReport>('/api/export', json(body)),
+  importConfig: (body: { path: string; password?: string | null; overwrite?: boolean }) =>
+    req<ImportReport>('/api/import', json(body)),
 
   // ── 通用 ──
   status: () => req<GatewayStatus>('/api/status'),

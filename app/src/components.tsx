@@ -3,9 +3,10 @@
 // 错误模板逐字照 spec §10 错误表达：**发生了什么 + 可能原因 + 一个主按钮 + 复制诊断**，
 // 原始 JSON 可展开。
 
-import { useState, type ReactNode } from 'react';
+import { Component, useState, type ReactNode } from 'react';
 
 import { api, ApiError, type ErrorShape } from './api';
+import { setCurrency, useCurrency, type Currency } from './currency';
 
 /** 后端的错误模板长这样；别的东西（字符串 / Error）也接得住。 */
 function isShape(value: unknown): value is ErrorShape {
@@ -17,15 +18,22 @@ export type PageSlug = 'overview' | 'upstreams' | 'models' | 'clients' | 'logs' 
 export function ErrorBlock({
   error,
   onAction,
+  fallbackAction,
   compact = false,
 }: {
   /** 后端给的错误模板、`ApiError`，或者任何被 catch 到的东西（统一渲染成模板）。 */
   error: unknown;
   onAction?: (kind: string, page?: string | null) => void;
+  /** 后端没给主按钮时拿它兜底：spec §10 的错误模板里**总有一颗主按钮**（重试类动作）。 */
+  fallbackAction?: { label: string; onClick: () => void };
   compact?: boolean;
 }) {
+  // 三个 hook 都必须在下面那个 `return null` **之前**：这个组件是以 `error = null` 挂上去的，
+  // 第一次报错时才变成三个 hook —— 顺序一变 react-dom 就抛 #310（Rendered more hooks than
+  // during the previous render），整棵树被卸掉，页面全白（票 60b 实测）。
   const [open, setOpen] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [busy, setBusy] = useState(false);
   if (!error) return null;
   const shape: ErrorShape =
     error instanceof ApiError
@@ -33,7 +41,6 @@ export function ErrorBlock({
       : isShape(error)
         ? error
         : { what: String(error), likelyCause: '看下面的原始错误。', raw: null };
-  const [busy, setBusy] = useState(false);
 
   const copyDiagnostics = async () => {
     setBusy(true);
@@ -58,6 +65,11 @@ export function ErrorBlock({
             {shape.action.label}
           </button>
         )}
+        {!(shape.action && onAction) && fallbackAction && (
+          <button className="primary" onClick={fallbackAction.onClick}>
+            {fallbackAction.label}
+          </button>
+        )}
         <button onClick={copyDiagnostics} disabled={busy}>
           {copied ? '已复制诊断' : '复制诊断'}
         </button>
@@ -68,6 +80,43 @@ export function ErrorBlock({
       {open && <pre className="error-raw">{shape.raw ?? '（没有更多原文）'}</pre>}
     </div>
   );
+}
+
+/**
+ * 渲染期抛异常的兜底（spec §10：**绝不允许整页白屏**）。
+ *
+ * React 18/19 里渲染期未捕获的异常会把整棵根树卸掉——页面直接全白，只能退出重启（票 60b 实测：
+ * `ErrorBlock` 的 hook 顺序一乱，react-dom 抛 #310，就是全白）。这个边界把错误模板顶上去，
+ * 主按钮 = 重新加载界面。
+ */
+export class RenderBoundary extends Component<{ children: ReactNode }, { error: unknown }> {
+  state: { error: unknown } = { error: null };
+
+  static getDerivedStateFromError(error: unknown) {
+    return { error };
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="page">
+          <ErrorBlock
+            error={{
+              what: '界面渲染出错了（停在这一屏，不是白屏）',
+              likelyCause: '网关回来的数据形状与这一版界面对不上；把「复制诊断」贴给开发者能直接定位。',
+              action: { label: '重新加载界面', kind: 'reload' },
+              raw:
+                this.state.error instanceof Error
+                  ? (this.state.error.stack ?? this.state.error.message)
+                  : String(this.state.error),
+            }}
+            onAction={() => window.location.reload()}
+          />
+        </div>
+      );
+    }
+    return this.props.children;
+  }
 }
 
 export type ConfirmRequest = {
@@ -142,13 +191,15 @@ export function formatTime(secs: number | null | undefined): string {
   return new Date(secs * 1000).toLocaleString();
 }
 
-/** 美元 → 人民币（币种以人民币为主、可切美元；不足 ¥0.01 显示 `<¥0.01`）。 */
+/**
+ * 美元 → 当前币种（票 33 第 2 节：库内美元为锚、界面人民币为主、可切美元）。
+ * 金额**两位小数**；不足一个最小单位显示 `<¥0.01` / `<$0.01`；没价显示「未知」（不是 0）。
+ */
 export function money(usd: number | null | undefined, rate: number | null, currency: 'CNY' | 'USD' = 'CNY'): string {
   if (usd === null || usd === undefined) return '未知';
-  if (currency === 'USD') return `$${usd.toFixed(2)}`;
-  const cny = usd * (rate ?? 7.1);
-  if (cny > 0 && cny < 0.01) return '<¥0.01';
-  return `¥${cny.toFixed(2)}`;
+  const [symbol, value] = currency === 'USD' ? ['$', usd] : ['¥', usd * (rate ?? 7.1)];
+  if (value > 0 && value < 0.01) return `<${symbol}0.01`;
+  return `${symbol}${value.toFixed(2)}`;
 }
 
 export function json(value: unknown): string {
@@ -158,4 +209,18 @@ export function json(value: unknown): string {
   } catch {
     return String(value);
   }
+}
+
+/** 币种切换（全局显示态，票 33 第 2 节；用量 / 概览 / 日志三处跟随同一个选择）。 */
+export function CurrencySwitch() {
+  const currency = useCurrency();
+  return (
+    <label title="库内以美元为锚；人民币按设置页的汇率换算（不联网）">
+      币种
+      <select value={currency} onChange={(e) => setCurrency(e.target.value as Currency)}>
+        <option value="CNY">人民币</option>
+        <option value="USD">美元</option>
+      </select>
+    </label>
+  );
 }

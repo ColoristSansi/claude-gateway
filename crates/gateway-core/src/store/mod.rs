@@ -40,6 +40,8 @@ pub mod settings_keys {
     pub const LOG_RETENTION_DAYS: &str = "log_retention_days";
     pub const USD_CNY_RATE: &str = "usd_cny_rate";
     pub const CATALOG_SNAPSHOT_AT: &str = "catalog_snapshot_at";
+    /// 托盘行为（票 59）：`hide`（默认，关窗隐藏到托盘）/ `quit`（关窗退出应用）。
+    pub const TRAY_CLOSE_ACTION: &str = "tray_close_action";
 }
 
 /// 数据目录（票 18）。**只算路径、不创建**——创建发生在 [`Store::open`]。

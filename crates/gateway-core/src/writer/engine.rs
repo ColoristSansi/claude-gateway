@@ -45,6 +45,8 @@ pub struct FieldDiff {
     pub current: Json,
     /// 已经一致。
     pub matches: bool,
+    /// 这条键上还留着网关写下去的值（四态判定用它，口径见 [`Doc::carries_gateway_value`]）。
+    pub gateway_value: bool,
 }
 
 /// 一个「客户端 × 文件」的实读比对结果（**每次都真读，不缓存**）。
@@ -71,9 +73,12 @@ impl FileInspect {
         self.fields.iter().filter(|f| !f.matches)
     }
 
-    /// 一个网关接管键都没有（= 文件就是客户端官方态）。摘键还原后、从没写过时都是这样。
+    /// 网关写下去的值一个都不在（= 文件就是客户端官方态）。摘键还原后、从没写过时都是这样。
+    ///
+    /// 判据是「网关写下去的值都不在了」，**不是「文件里一个键都没有」**：Desktop 的
+    /// `_meta.json` 还原后 `appliedId` 必须指回某个档案（`Default`），那个键永远在。
     pub fn has_no_gateway_keys(&self) -> bool {
-        self.error.is_none() && self.fields.iter().all(|f| f.current.is_null())
+        self.error.is_none() && !self.fields.iter().any(|f| f.gateway_value)
     }
 }
 
@@ -229,19 +234,29 @@ impl Writer {
                 expected: op.expected().cloned().unwrap_or(Json::Null),
                 current: doc.slot(op),
                 matches: doc.satisfies(op),
+                gateway_value: doc.carries_gateway_value(op),
             });
         }
         out
     }
 
     /// 按依赖序写一份计划里的所有文件。
+    ///
+    /// 中途**报错即停**（错误里列出已改动的文件）；中途**冲突也即停**（后面的文件一个字节不动），
+    /// 否则指针文件会先于它指向的那份配置生效，出现「激活了一个没配好的 profile」。
     pub async fn write(&self, plan: &WritePlan) -> Result<WriteReport> {
         let mut specs: Vec<&FileSpec> = plan.files.iter().collect();
         specs.sort_by_key(|s| s.order);
         let mut done: Vec<(PathBuf, FileOutcome)> = Vec::new();
         for spec in specs {
             match self.write_one(spec, plan.mode).await {
-                Ok(o) => done.push((spec.rel_path.clone(), o)),
+                Ok(o) => {
+                    let conflicted = matches!(o, FileOutcome::Conflict { .. });
+                    done.push((spec.rel_path.clone(), o));
+                    if conflicted {
+                        break;
+                    }
+                }
                 Err(e) => {
                     return Err(e.context(format!(
                         "多文件写入中途失败；已改动：{}",

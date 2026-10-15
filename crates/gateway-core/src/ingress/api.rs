@@ -19,7 +19,19 @@
 //! | `GET/POST /api/logs/body-recording` | body 开关（默认关、开启需隐私确认、1 小时自动关） |
 //! | `GET /api/usage/summary` | 概览要的今日 / 近 7 天 × 虚拟模型 / 上游（票 53 的统计层） |
 //!
-//! 详情四段（`GET /api/logs/:requestId`）、五个时间范围与按天明细归票 59。
+//! 详情四段（`GET /api/logs/{id}`）、五个时间范围与按天明细归票 59。
+//!
+//! 票 59 在这里补齐用量、日志详情与设置三页：
+//!
+//! | 端点 | 用途 |
+//! | --- | --- |
+//! | `GET /api/usage`（与 `/api/usage/summary` 同一个 handler） | 五个时间范围 × 三维度 + 按天明细 |
+//! | `GET /api/logs/{id}` | 详情四段：概要 / 请求与响应体 / 帧时间轴 / 错误信息 |
+//! | `POST /api/logs/clear` | 清空日志（body 与帧随外键级联走） |
+//! | `GET/PUT /api/settings`、`POST /api/settings/db/open`、`POST /api/catalog/refresh`、`GET /api/about` | 设置页（见 [`settings`]） |
+//!
+//! 帧时间轴的落点、`request_frames` 与 `request_bodies.response_body` 的写入都在
+//! `egress::upstream`（body 开关开着时才记），查询在 [`crate::obs::log_detail`]。
 //!
 //! 票 62 在这里补分发收尾那一格（设置页要的设置项与导出 / 导入）：
 //!
@@ -48,6 +60,7 @@ pub mod bindings;
 pub mod clients;
 pub mod gateway;
 pub mod overview;
+pub mod settings;
 pub mod upstreams;
 
 use std::net::SocketAddr;
@@ -410,6 +423,11 @@ impl ApiState {
         self.running.store(false, Ordering::SeqCst);
     }
 
+    /// 此刻在不在跑（诊断包要如实报这一格，不能写死 `true`）。
+    pub fn running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
+    }
+
     pub fn started_at(&self) -> SystemTime {
         self.started_at
     }
@@ -458,6 +476,13 @@ pub fn router(state: ApiState) -> Router {
             get(body_recording).post(set_body_recording),
         )
         .route("/api/usage/summary", get(usage_summary))
+        // 票 59：用量页的完整粒度（五个时间范围 × 三维度 + 按天明细）。
+        // 与 `/api/usage/summary` **同一个 handler**：概览与用量页不会各算一套
+        // （`frontend.md` §③ 第 10 / 39 条的附注）。
+        .route("/api/usage", get(usage_summary))
+        // 票 59：日志详情四段 + 清空日志。
+        .route("/api/logs/clear", post(clear_logs))
+        .route("/api/logs/{id}", get(log_detail))
         // 票 62：分发收尾（设置页的设置项 + 导出 / 导入）。
         .route("/api/dist/info", get(dist_info))
         .route(
@@ -475,6 +500,7 @@ pub fn router(state: ApiState) -> Router {
         .merge(bindings::routes())
         .merge(clients::routes())
         .merge(gateway::routes())
+        .merge(settings::routes())
         .layer(axum::middleware::from_fn(cors))
         .with_state(state)
 }
@@ -1048,6 +1074,9 @@ async fn state_json(body_log: &BodyLogWindow, store: &Store) -> serde_json::Valu
 }
 
 /// `GET /api/usage/summary?range=today|7d&dim=virtual_model|upstream|client`（概览要的那半）。
+///
+/// 票 59 起 `range` 也认 `30d` / `all` / `custom`（自定义要配 `from` / `to`，本地日期
+/// `YYYY-MM-DD`，`to` 含当天），返回里多一份**按天明细** `daily`。
 async fn usage_summary(
     State(state): State<ApiState>,
     Query(p): Query<std::collections::HashMap<String, String>>,
@@ -1057,7 +1086,9 @@ async fn usage_summary(
     };
     let range = p.get("range").map(String::as_str).unwrap_or("today");
     let dim = p.get("dim").map(String::as_str).unwrap_or("virtual_model");
-    match obs::usage_summary(&logs.store, range, dim).await {
+    let from = p.get("from").map(String::as_str);
+    let to = p.get("to").map(String::as_str);
+    match obs::usage(&logs.store, range, dim, from, to).await {
         Ok(mut v) => {
             if let Some(o) = v.as_object_mut() {
                 o.insert(
@@ -1072,6 +1103,79 @@ async fn usage_summary(
             Json(json!({"error": {"type": "invalid_request_error", "message": e.to_string()}})),
         )
             .into_response(),
+    }
+}
+
+/// 详情四段（票 59）：概要 / 请求与响应体 / 帧时间轴 / 错误信息。
+///
+/// `:id` 认两种写法：纯数字 = 行 id（界面从列表跳过来用那把钥匙），其余 = `request_id`。
+/// 找不到是 **404**（不是 200 + 空详情）。
+async fn log_detail(
+    State(state): State<ApiState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    let Some(logs) = &state.logs else {
+        return unavailable();
+    };
+    let detail = match obs::log_detail(&logs.store, &id).await {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            return failed_status(
+                StatusCode::NOT_FOUND,
+                format!("没有这条请求日志：{id}（按行 id 或 request_id 都查不到）"),
+            )
+        }
+        Err(e) => return failed(format!("读日志详情失败：{e}")),
+    };
+    let recording_on = logs.body_log.on();
+    let retention = obs::retention_days(&logs.store)
+        .await
+        .unwrap_or(obs::DEFAULT_RETENTION_DAYS);
+    let summary = &detail["summary"];
+    let bodies = &detail["bodies"];
+    let error_raw = summary["error"].clone();
+    let status = summary["status"].as_i64().unwrap_or(0);
+    let aborted = summary["aborted"].as_bool().unwrap_or(false);
+    // 第四段：模板与概览「最近错误」共用一份（`overview::template_for`）。
+    let template = (aborted || status >= 400).then(|| {
+        overview::template_for(
+            if status == 0 { 500 } else { status },
+            error_raw.as_str().unwrap_or_default(),
+        )
+    });
+    let has_bodies = bodies["request"].is_string() || bodies["response"].is_string();
+    Json(json!({
+        "summary": summary,
+        "bodies": {
+            "request": bodies["request"],
+            "response": bodies["response"],
+            "recorded": has_bodies,
+            "recording_on": recording_on,
+            "retention_days": retention,
+        },
+        "frames": {
+            "frames": detail["frames"],
+            // 「原始 SSE 文本」= `request_bodies.response_body`（上游原样字节）。
+            "sse": bodies["response"],
+            "recorded": detail["frames"].as_array().map(|f| !f.is_empty()).unwrap_or(false),
+        },
+        "error": {
+            "raw": error_raw,
+            "template": template,
+        },
+    }))
+    .into_response()
+}
+
+/// 清空日志（票 59）：删请求行，body 与帧随外键级联走。
+/// **二次确认是界面的事**（票 17 第 86 条），这里只认「调用方已经确认过」。
+async fn clear_logs(State(state): State<ApiState>) -> Response {
+    let Some(logs) = &state.logs else {
+        return unavailable();
+    };
+    match obs::clear_logs(&logs.store).await {
+        Ok(deleted) => Json(json!({"deleted": deleted})).into_response(),
+        Err(e) => failed(format!("清空日志失败：{e}")),
     }
 }
 
