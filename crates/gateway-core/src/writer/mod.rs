@@ -48,6 +48,7 @@
 mod atomic;
 mod backup;
 pub mod claude_code;
+pub mod desktop;
 mod doc;
 mod engine;
 pub mod instance;
@@ -55,6 +56,8 @@ mod log;
 mod plan;
 mod state;
 
+#[cfg(test)]
+mod desktop_tests;
 #[cfg(test)]
 mod tests;
 
