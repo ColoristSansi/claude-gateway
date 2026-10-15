@@ -284,6 +284,64 @@ async fn read_write_roundtrip_across_spec9_tables() {
     assert!(bad.is_err(), "wire 取值域应被 CHECK 拦住");
 }
 
+/// 票 57 的 v6：`upstreams` 补结构化输出能力位列（按「上游 × 出站协议」存一份 JSON）。
+#[tokio::test]
+async fn v6_adds_the_structured_output_capability_column() {
+    let root = tmp_root("migrate-v6");
+    std::fs::create_dir_all(&root).unwrap();
+    let db = root.join(DB_FILE_NAME);
+    {
+        let mut c = Connection::open(&db).unwrap();
+        super::schema::migrate_upto(&mut c, 5).unwrap();
+        c.execute(
+            "INSERT INTO upstreams(id,name,base_url) VALUES('cc','commandcode','https://cc.example')",
+            [],
+        )
+        .unwrap();
+    }
+
+    let store = Store::open(&root).expect("v5 旧库升上来");
+    assert_eq!(store.read(user_version).await.unwrap(), SCHEMA_VERSION);
+    // 补列之后旧行拿到缺省值：一面都没判过。
+    let cap: String = store
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT structured_output_json FROM upstreams WHERE id='cc'",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(cap, "{}");
+    // 脏值不让整条上游不可用（与 quirks 同一条口径）。
+    store
+        .write(|c| {
+            c.execute(
+                "UPDATE upstreams SET structured_output_json=?1 WHERE id='cc'",
+                rusqlite::params![
+                    "{\"anthropic\":{\"mode\":\"ignore\",\"source\":\"selfcheck\"},\
+                     \"没这个面\":{\"mode\":\"x\"}}"
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let up = crate::egress::provider::load_upstream(&store, "cc")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        up.structured_output(crate::egress::provider::Wire::Anthropic),
+        crate::egress::provider::StructuredOutput::Ignore
+    );
+    assert_eq!(
+        up.structured_capability(crate::egress::provider::Wire::OpenAiChat),
+        None
+    );
+}
+
 /// 造一份**原型期**（v1）的库，再用现版本升上来。
 #[tokio::test]
 async fn upgrades_a_prototype_era_db_in_place() {

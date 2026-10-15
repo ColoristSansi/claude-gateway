@@ -261,10 +261,10 @@ pub fn decode_request(v: &Value) -> Result<IrRequest> {
         // 本机装载参数（`num_ctx` / `num_gpu` / …）与已废弃的 `typical_p` 同理丢弃。
         extra: Map::new(),
         freeform_tools: Vec::new(),
-        // shortcut: 入站的 `format`（JSON mode / JSON schema）**这里被忽略**——IR 的
-        // `ResponseFormat` 槽位归票 57（`IrRequest` 现在还没有该字段）。票 57 落地后在这一行
-        // 补 `format: decode_format(obj.get("format"))`（spec §4.4：裸 schema → JsonSchema、
-        // `"json"` → Json）。在那之前接受并忽略，好过把带 `format` 的请求整条拒掉。
+        // `format`（JSON mode / 裸 JSON schema）→ IR 的归一化槽位（票 57 的
+        // [`ResponseFormat::from_ollama_request`]）：Ollama 面**只解不编**，出站仍走三条 wire
+        // 的逐字映射，表达不了就在请求期 400（spec §4.4）。
+        format: crate::ir::ResponseFormat::from_ollama_request(obj),
     })
 }
 
@@ -1018,6 +1018,35 @@ mod tests {
             "model":"m","messages":[{"role":"user","content":"."}]}))
         .unwrap();
         assert_eq!(absent.max_tokens, DEFAULT_MAX_TOKENS);
+    }
+
+    /// `format`：裸 schema → `JsonSchema`（`name`/`strict` 留空）、`"json"` → `Json`、
+    /// 缺省 / 空串 → 没要结构化输出（spec §4.4；解成 IR 后由票据 57 的三条出站映射接手）。
+    #[test]
+    fn format_is_normalized_into_the_ir_slot() {
+        let with = |format: Value| {
+            decode_request(
+                &json!({"model":"m","messages":[{"role":"user","content":"."}],"format":format}),
+            )
+            .unwrap()
+            .format
+        };
+        assert_eq!(
+            with(json!({"type":"object","properties":{"city":{"type":"string"}}})),
+            Some(crate::ir::ResponseFormat::JsonSchema {
+                schema: json!({"type":"object","properties":{"city":{"type":"string"}}}),
+                name: None,
+                strict: None,
+            })
+        );
+        assert_eq!(with(json!("json")), Some(crate::ir::ResponseFormat::Json));
+        assert_eq!(with(json!("")), None);
+        assert_eq!(
+            decode_request(&json!({"model":"m","messages":[{"role":"user","content":"."}]}))
+                .unwrap()
+                .format,
+            None
+        );
     }
 
     /// 怪癖③：只有 `tool_name` 时按名反查前面 assistant 轮里的 `ToolUse.id`；

@@ -440,6 +440,47 @@ async fn tool_call_is_buffered_whole_and_tool_results_pair_by_name() {
     assert_eq!(id, used, "tool_result 与 tool_use 必须成对：{sent}");
 }
 
+/// `format`（JSON mode / 裸 schema）解进 IR 之后由票 57 的三条出站映射接手：
+/// 打到 Anthropic wire 上就是 `output_config.format`（3 层，无 `name`/`strict` 包裹）。
+#[tokio::test(flavor = "multi_thread")]
+async fn format_is_decoded_into_the_ir_and_mapped_outbound() {
+    let (base, mock, _app) = harness("chat-format").await;
+    let before = mock.len();
+    let (status, _, lines) = chat(
+        &base,
+        &json!({
+            "model":"claude-haiku",
+            "format":{"type":"object","properties":{"city":{"type":"string"}}},
+            "messages":[{"role":"user","content":"天气"}
+        ]}),
+    )
+    .await;
+    assert_eq!(status, 200, "{lines:?}");
+    let sent = mock.request(before);
+    assert_eq!(
+        sent["output_config"]["format"]["type"], "json_schema",
+        "裸 schema 该走 JsonSchema：{sent}"
+    );
+    assert_eq!(
+        sent["output_config"]["format"]["schema"]["properties"]["city"]["type"], "string",
+        "{sent}"
+    );
+    assert!(
+        sent["output_config"]["format"].get("name").is_none(),
+        "Anthropic 那层没有 name/strict：{sent}"
+    );
+
+    // JSON mode（`"json"`）打到 Anthropic 是表达不了的：请求期 400，单层信封（票 57 定案 2）。
+    let (status, _, v) = post_json(
+        &base,
+        "/api/chat",
+        &json!({"model":"claude-haiku","format":"json","messages":[{"role":"user","content":"."}]}),
+    )
+    .await;
+    assert_eq!(status, 400, "{v}");
+    assert!(v["error"].is_string(), "Ollama 信封是单层的：{v}");
+}
+
 // ───────────────────────── ③ 装载 / 卸载 ─────────────────────────
 
 /// 空 `messages` = 装载 / 卸载：本地假终态、**不打上游**；`keep_alive:0` 才是卸载。

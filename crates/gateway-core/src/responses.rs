@@ -60,6 +60,9 @@ pub fn decode_request(v: &Value) -> Result<IrRequest> {
         stop: Vec::new(),
         thinking: None,
         metadata: None,
+        // 票 57：`text.format` 归一化进 IR。`text` 的兄弟键（`verbosity`）与其余 Responses
+        // 专有字段一样不透传（见上面那段注释）。
+        format: crate::ir::ResponseFormat::from_responses_request(obj),
         // 刻意**不**透传 Responses 专有字段（`store` / `include` / `reasoning` /
         // `previous_response_id` …）：出站是 Anthropic 或 OpenAI Chat，这些字段对它们
         // 没有意义，严格的上游会直接 400。
