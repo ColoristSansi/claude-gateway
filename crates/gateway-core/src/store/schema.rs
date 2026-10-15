@@ -5,7 +5,7 @@
 //!
 //! v1 = 原型期的形状（`prototype/src/store.rs` 的四张表），v2 = spec §9 的形状，
 //! v3 = 票 49 给 `upstreams` 补「上次自检结果」，v4 = 票 50 补「上次成功拉取时间」，
-//! v5 = 票 51 给 `client_profiles` 补实测 UA 判据。
+//! v5 = 票 51 给 `client_profiles` 补实测 UA 判据，v6 = 票 57 给 `upstreams` 补结构化输出能力位。
 //! 新库也照样从 v1 顺序跑到最新：装一次机就把整条迁移路径走一遍，热路径与升级路径不分叉。
 
 use anyhow::{Context, Result};
@@ -13,7 +13,7 @@ use rusqlite::{Connection, Transaction};
 use std::collections::HashMap;
 
 /// 当前 schema 版本 = 迁移表最后一条。
-pub const SCHEMA_VERSION: i32 = 5;
+pub const SCHEMA_VERSION: i32 = 6;
 
 pub(crate) struct Migration {
     pub(crate) version: i32,
@@ -40,6 +40,10 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 5,
         apply: v5_profile_match_ua,
+    },
+    Migration {
+        version: 6,
+        apply: v6_structured_output_caps,
     },
 ];
 
@@ -388,6 +392,18 @@ fn v5_profile_match_ua(tx: &Transaction<'_>) -> Result<()> {
         "UPDATE client_profiles SET match_ua='Claude/' WHERE id='claude-desktop' AND match_ua='';
          UPDATE client_profiles SET match_ua='claude-cli/' WHERE id='claude-code' AND match_ua='';
          UPDATE client_profiles SET match_ua='codex_exec/;x-codex-' WHERE id='codex' AND match_ua='';",
+    )?;
+    Ok(())
+}
+
+/// v6（票 57）：`upstreams` 补**结构化输出能力位**，按「上游 × 出站协议」存成一份 JSON。
+///
+/// 粒度与键都跟着 `auth_json` / `path_templates_json` 走（同样是「上游 × wire」的映射），
+/// 所以是一列 JSON 而不是新表：wire 级事实进上游表（spec §6），不进 quirks。
+/// 缺省值 `'{}'` = 一面都没判过 = 一律按 `native`（缺省态），老库升上来就是干净的缺省。
+fn v6_structured_output_caps(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute_batch(
+        "ALTER TABLE upstreams ADD COLUMN structured_output_json TEXT NOT NULL DEFAULT '{}';",
     )?;
     Ok(())
 }
