@@ -1,0 +1,13 @@
+[package]
+name = "claude-gateway"
+version = "0.1.0"
+edition = "2021"
+description = "Claude Gateway 桌面外壳（Tauri 2）：管理 API + 托盘，唯一的 bin（ADR-0007）"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+gateway-core = { path = "../crates/gateway-core" }
+# tray-icon：托盘常驻（票 18；trayIcon 配置随之生效）
+tauri = { version = "2", features = ["tray-icon"] }

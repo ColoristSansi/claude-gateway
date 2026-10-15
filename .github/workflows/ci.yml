@@ -1,0 +1,28 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: check.ps1 -Quick -Replay
+        shell: pwsh
+        run: ./check.ps1 -Quick -Replay
+
+  # 打 tag 出包（NSIS per-user + 免安装 zip + latest.json + updater 签名）：
+  # 票 18 / M4 落地前先占位，不产出任何产物。
+  bundle:
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: windows-latest
+    steps:
+      - name: 占位
+        shell: pwsh
+        run: Write-Host '占位：tag 出包待 M4（票 18：NSIS + zip + latest.json，updater 私钥进 Secret）。'

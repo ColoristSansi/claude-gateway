@@ -1,0 +1,12 @@
+event: message_start
+data: {"message":{"content":[],"id":"msg_mock_hardcut","model":"mock-anthropic-hardcut","role":"assistant","stop_reason":null,"stop_sequence":null,"type":"message","usage":{"input_tokens":9,"output_tokens":0}},"type":"message_start"}
+
+event: content_block_start
+data: {"content_block":{"text":"","type":"text"},"index":0,"type":"content_block_start"}
+
+event: content_block_delta
+data: {"delta":{"text":"说到一半","type":"text_delta"},"index":0,"type":"content_block_delta"}
+
+event: error
+data: {"error":{"message":"上游传输中断: error decoding response body","type":"upstream_abort"},"type":"error"}
+

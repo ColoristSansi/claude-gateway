@@ -1,0 +1,17 @@
+[package]
+name = "gateway-core"
+version = "0.1.0"
+edition = "2021"
+description = "本地模型网关内核：ingress / IR / binding / egress / obs / store / writer"
+
+# 约束：不依赖 Tauri（ADR-0007 第 1 条）。依赖集跟着原型 Cargo.toml 里与转换/存储相关的部分走。
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "fs"] }
+axum = "0.8"
+serde = "1"
+serde_json = "1"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+futures-util = "0.3"
+bytes = "1"
+rusqlite = { version = "0.40", features = ["bundled"] }
+anyhow = "1"

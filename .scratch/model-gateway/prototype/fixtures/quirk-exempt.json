@@ -1,0 +1,1 @@
+{"exempt":{"ClaudeModelsOnAnthropicOnly":"守卫型 quirk（wire 错配早拒，见 src/upstream.rs 的 guard），不产生 fixture 回放；票 23 已决定删除它，删除随实现阶段。"}}

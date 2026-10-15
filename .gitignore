@@ -1,0 +1,19 @@
+# 参考仓库克隆（体积大，仅本地阅读用）
+.scratch/model-gateway/vendor/
+
+# 用户凭据，绝不入库
+**/prototype-upstream.env
+
+# 构建产物
+target/
+node_modules/
+dist/
+
+# tauri-build 生成的 ACL schema（每次构建重写）
+src-tauri/gen/schemas/
+
+# app/dist 只放行 .gitkeep：tauri::generate_context! 编译期要求 frontendDist 那个目录存在，
+# 干净 clone 后 cargo build --workspace 才能过；pnpm build 的产物不入库。
+!app/dist/
+app/dist/*
+!app/dist/.gitkeep

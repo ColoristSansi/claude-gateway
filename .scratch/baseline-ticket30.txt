@@ -1,0 +1,106 @@
+
+=== fmt    (cargo fmt --check) ===
+
+=== clippy (cargo clippy -D warnings) ===
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.17s
+
+=== unit   (cargo test --bins) ===
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.17s
+     Running unittests src\main.rs (target\debug\deps\gateway_prototype-c42b5ef342c7adc2.exe)
+
+running 23 tests
+test anthropic::tests::assembles_text_and_usage ... ok
+test anthropic::tests::count_request_drops_max_tokens_and_stream ... ok
+test anthropic::tests::thinking_without_signature_is_dropped ... ok
+test anthropic::tests::tool_input_is_parsed_from_partial_json ... ok
+test anthropic::tests::upstream_error_and_missing_eos_are_visible ... ok
+test ir::tests::ascii_is_four_chars_per_token ... ok
+test ir::tests::cjk_is_one_token_per_char ... ok
+test ir::tests::never_zero ... ok
+test provider::tests::every_quirk_declares_what_it_acts_on ... ok
+test ir::tests::system_and_tools_count_but_base64_does_not ... ok
+test replay::tests::crlf_bytes_reparse_to_the_same_frames ... ok
+test replay::tests::every_scheme_keeps_the_bytes ... ok
+test replay::tests::half_frames_split_inside_frames ... ok
+test replay::tests::meta_can_pin_explicit_cuts ... ok
+test provider::tests::fixture_quirk_tags_are_real_enum_values ... ok
+test provider::tests::every_quirk_is_covered_by_a_fixture_or_explicitly_exempt ... ok
+test sse::tests::comment_frames_do_not_swallow_the_next_frame ... ok
+test replay::tests::reparse_is_chunking_invariant ... ok
+test sse::tests::crlf_terminator_is_understood ... ok
+test provider::tests::every_tagged_fixture_has_bytes ... ok
+test sse::tests::single_byte_chunks_are_buffered_until_the_frame_ends ... ok
+test sse::tests::splits_frames_and_keeps_order ... ok
+test sse::tests::unfinished_tail_is_still_parsed_on_finish ... ok
+
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+=== replay (集成：自起网关 + mock，回放 fixtures) ===
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running tests\replay.rs (target\debug\deps\replay-74bd257a8465512e.exe)
+
+running 15 tests
+test common::golden::tests::event_order_and_missing_frames_are_caught ... ok
+test common::golden::tests::mask_makes_the_unstable_id_comparable ... ok
+test common::golden::tests::parse_reads_event_names_and_json_payloads ... ok
+test common::golden::tests::text_change_is_caught_with_a_field_path ... ok
+test replay::tests::crlf_bytes_reparse_to_the_same_frames ... ok
+test replay::tests::every_scheme_keeps_the_bytes ... ok
+test replay::tests::half_frames_split_inside_frames ... ok
+test replay::tests::meta_can_pin_explicit_cuts ... ok
+test replay::tests::reparse_is_chunking_invariant ... ok
+test sse::tests::comment_frames_do_not_swallow_the_next_frame ... ok
+test sse::tests::crlf_terminator_is_understood ... ok
+test sse::tests::single_byte_chunks_are_buffered_until_the_frame_ends ... ok
+test sse::tests::splits_frames_and_keeps_order ... ok
+test sse::tests::unfinished_tail_is_still_parsed_on_finish ... ok
+[warn] 读不到 C:\Users\ZHANQUAN\AppData\Local\Temp\gw-replay-23784\no-upstreams.env，真实上游将不可用（只有 mock 能跑）
+[warn] 缺 OPENCODE_* 配置，opencode 上游不可用
+[warn] 缺 COMMANDCODE_* 配置，commandcode 上游不可用
+网关   http://127.0.0.1:18787   (inbound: POST /v1/messages, POST /v1/messages/count_tokens, GET /v1/models, GET /api/routes, GET /api/logs)
+mock   http://127.0.0.1:18788  (fixtures: C:\Users\ZHANQUAN\AIGC\Project\Claude Gateway\.scratch\model-gateway\prototype\fixtures)
+路由表（19 条）:
+  claude-fable           -> opencode     deepseek-v4.1-flash    openai  [家族槽位]
+  claude-opus            -> opencode     deepseek-v4.1-flash    openai  [家族槽位]
+  claude-sonnet          -> commandcode  deepseek/deepseek-v4.1-flash openai  [家族槽位]
+  claude-haiku           -> commandcode  deepseek/deepseek-v4.1-flash openai  [家族槽位]
+  oc-deepseek            -> opencode     deepseek-v4.1-flash    openai
+  cc-sonnet              -> commandcode  claude-sonnet-5-5      anthropic
+  oc-anthropic-unauth    -> opencode     claude-haiku-5-5       anthropic
+  cc-opus-no-plan        -> commandcode  claude-opus-5          anthropic
+  cc-opus-on-chat        -> commandcode  claude-opus-5          openai
+  mock-anthropic-text    -> mock         mock-text              anthropic
+  mock-openai-text       -> mock         mock-text              openai
+  mock-anthropic-tools   -> mock         mock-tools             anthropic
+  mock-openai-tools      -> mock         mock-tools             openai
+  mock-anthropic-thinking -> mock         mock-thinking          anthropic
+  mock-openai-thinking   -> mock         mock-thinking          openai
+  mock-anthropic-usage   -> mock         mock-usage             anthropic
+  mock-openai-usage      -> mock         mock-usage             openai
+  mock-anthropic-abort   -> mock         mock-abort             anthropic
+  mock-openai-abort      -> mock         mock-abort             openai
+[in] /v1/messages model=mock-anthropic-text ua=None ver=None beta=None
+[in] /v1/messages model=mock-openai-text ua=None ver=None beta=None
+[in] /v1/messages model=mock-anthropic-tools ua=None ver=None beta=None
+[in] /v1/messages model=mock-openai-tools ua=None ver=None beta=None
+[in] /v1/messages model=mock-anthropic-thinking ua=None ver=None beta=None
+[in] /v1/messages model=mock-openai-thinking ua=None ver=None beta=None
+[in] /v1/messages model=mock-anthropic-usage ua=None ver=None beta=None
+[in] /v1/messages model=mock-openai-usage ua=None ver=None beta=None
+[in] /v1/messages model=mock-anthropic-abort ua=None ver=None beta=None
+[in] /v1/messages model=mock-openai-abort ua=None ver=None beta=None
+[in] /v1/messages model=mock-anthropic-text ua=None ver=None beta=None
+[in] /v1/messages model=mock-anthropic-text ua=None ver=None beta=None
+[in] /v1/messages model=mock-anthropic-text ua=None ver=None beta=None
+[in] /v1/messages model=mock-anthropic-text ua=None ver=None beta=None
+[in] /v1/messages model=mock-anthropic-text ua=None ver=None beta=None
+[in] /v1/messages model=mock-anthropic-text ua=None ver=None beta=None
+[in] /v1/messages model=mock-anthropic-text ua=None ver=None beta=None
+[in] /v1/messages model=mock-anthropic-text ua=None ver=None beta=None
+test fixtures_replay_through_the_gateway ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 15.95s
+
+
+全部通过。

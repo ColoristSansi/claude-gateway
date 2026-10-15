@@ -1,0 +1,16 @@
+[package]
+name = "gateway-prototype"
+version = "0.0.1"
+edition = "2021"
+
+# 一次性原型：只为回答「IR + 编解码能不能立起来」，不代表最终依赖集。
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "fs"] }
+axum = "0.8"
+serde = "1"
+serde_json = "1"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+futures-util = "0.3"
+bytes = "1"
+rusqlite = { version = "0.40", features = ["bundled"] }
+anyhow = "1"

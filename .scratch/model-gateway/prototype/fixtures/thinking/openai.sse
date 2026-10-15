@@ -1,0 +1,11 @@
+data: {"id":"chatcmpl-mock-thinking","object":"chat.completion.chunk","created":0,"model":"mock-upstream","choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning_content":"先看它问的是不是路由问题。"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-mock-thinking","object":"chat.completion.chunk","created":0,"model":"mock-upstream","choices":[{"index":0,"delta":{"reasoning_content":" 应该是虚拟模型名字写错了。"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-mock-thinking","object":"chat.completion.chunk","created":0,"model":"mock-upstream","choices":[{"index":0,"delta":{"content":"检查一下 GET /api/routes 里的名字。"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-mock-thinking","object":"chat.completion.chunk","created":0,"model":"mock-upstream","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"id":"chatcmpl-mock-thinking","object":"chat.completion.chunk","created":0,"model":"mock-upstream","choices":[],"usage":{"prompt_tokens":30,"completion_tokens":22,"total_tokens":52}}
+
+data: [DONE]
