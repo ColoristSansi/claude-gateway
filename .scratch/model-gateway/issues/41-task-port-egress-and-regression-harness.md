@@ -76,7 +76,7 @@ Blocked by: 40
 | # | 命令 | 结果 |
 |---|---|---|
 | 1 | `pwsh -File .\check.ps1 -Replay` | `全部通过。` 出口码 0：replay `20 passed`（12 格转发/回归断言 + 回放器 5 + golden 4）+ replay-unit `5 passed` |
-| 2 | `cargo build -p gateway-core -p claude-gateway` 后 `grep -a -c` | `claude-gateway.exe` 与 `libgateway_core.rlib` 里 `/__chunks`、`/api/echo`、`chunk_scheme`、`echo_push`、`mock-upstream` **各 0 次**；对照：`target/debug/deps/mock_upstream.exe` 里 `/__chunks` 命中 1 次（证明 grep 不是假阴性）；且产品构建**不再产出** `mock-upstream.exe` / `gateway-harness.exe`（先删干净再构建，构建后仍不存在） |
+| 2 | `cargo build -p gateway-core -p claude-gateway` 后 `grep -a -c` | `claude-gateway.exe` 与 `libgateway_core.rlib` 里 `/__chunks`、`/api/echo`、`/__bodylog`、`chunk_scheme`、`echo_push`、`mock-upstream` **各 0 次**；正对照：`target/debug/deps/gateway_harness.exe` 里 `/__bodylog` 命中、`deps/mock_upstream.exe` 里 `/__chunks` 命中 1 次（证明 grep 不是假阴性）；且产品构建**不再产出** `mock-upstream.exe` / `gateway-harness.exe`（先删干净再构建，构建后仍不存在） |
 | 3 | `pwsh -File .\check.ps1 -Quick -Replay` | `全部通过。` 出口码 0：fmt / clippy(workspace) / clippy(mock) 无输出；unit = lib `37` + `gateway_service` `4`；replay `20`；replay-unit `5` |
 | 4 | 抽掉 `crates/gateway-core/tests/fixtures/usage/anthropic.sse` 后 `cargo test --workspace egress::provider` | 红：`every_tagged_fixture_has_bytes ... FAILED` + `…\fixtures\usage\anthropic.sse 没有对应的字节文件`（`test result: FAILED. 3 passed; 1 failed`）。另抽掉两份带 quirk 标签的 `text/*.meta.json` → `every_quirk_is_covered_by_a_fixture_or_explicitly_exempt ... FAILED`。两份都 `mv` 出去、验 md5（`f25d27c…`）后还原，再跑 4 个守卫全 ok |
 
