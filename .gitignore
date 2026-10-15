@@ -5,9 +5,10 @@
 **/prototype-upstream.env
 
 # 构建产物
+# 注意：**不要**在这里写裸 `dist/` —— 它会连 `crates/gateway-core/src/dist/` 这种源码目录一起吞掉，
+# `git add -A` 会静默跳过（票 62 就这么丢过一整个模块，`pub mod dist;` 直接编译失败）。
 target/
 node_modules/
-dist/
 
 # tauri-build 生成的 ACL schema（每次构建重写）
 src-tauri/gen/schemas/
