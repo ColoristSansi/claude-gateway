@@ -15,3 +15,7 @@ futures-util = "0.3"
 bytes = "1"
 rusqlite = { version = "0.40", features = ["bundled"] }
 anyhow = "1"
+
+# DPAPI（CryptProtectData / CryptUnprotectData）：密钥只以密文入库（spec §9）。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
