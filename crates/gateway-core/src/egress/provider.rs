@@ -968,6 +968,42 @@ pub async fn list_models(store: &Store, upstream_id: &str) -> Result<Vec<Upstrea
         .await
 }
 
+/// 取某条上游在某个 wire 面上的出站凭据：先找这一面那份，没有就继承 `default`（ADR-0004）。
+///
+/// 绑定层与自检探针共用这一个入口——「认证方式 + key 由调用方传」的那条规矩（票 49）
+/// 只在出站组装点执法，取凭据的优先级只有一份。
+pub async fn wire_credential(
+    store: &Store,
+    upstream_id: &str,
+    wire: Wire,
+) -> Result<Option<String>> {
+    if let Some(secret) = store.credential_secret(upstream_id, wire.as_str()).await? {
+        return Ok(Some(secret));
+    }
+    store.credential_secret(upstream_id, "default").await
+}
+
+/// 整张上游模型目录：`(上游 id, 真实模型 id)` → 目录条目。
+///
+/// 请求期早拒（票 49 的三层校验第二层）与外壳装配用；键与 `Gateway.catalog` 同一套。
+pub async fn catalog_map(
+    store: &Store,
+) -> Result<std::collections::HashMap<(String, String), UpstreamModel>> {
+    let models = store
+        .read(|c| {
+            let mut st = c.prepare(
+                "SELECT upstream_id,supported_wires,source,model_id FROM upstream_models",
+            )?;
+            let rows = st.query_map([], model_from_row)?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .await?;
+    Ok(models
+        .into_iter()
+        .map(|m| ((m.upstream_id.clone(), m.model_id.clone()), m))
+        .collect())
+}
+
 /// 手工新增 / 手工改一条目录条目：`source = manual` 锁定，重拉不覆盖（票 23 第 5 节）。
 pub async fn save_manual_model(
     store: &Store,

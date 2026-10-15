@@ -1331,3 +1331,144 @@ fn section_of(text: &str, start: &str, end: &str) -> String {
     let upto = rest.find(end).unwrap_or(rest.len());
     rest[..upto].to_string()
 }
+
+/// ⑬ 客户端档案覆盖与 `/v1/models` 的暴露集合（票 51；销掉票 30 台账里那条「明确不覆盖」）。
+///
+/// ① 同一个模型名 `claude-haiku`：codex 档案走 mock 的 Anthropic 面（200 + 真回放字节），
+///    没有客户端标识的请求落回 `global`（commandcode，测试里 base 打不通 → 502）。
+/// ② `/v1/models` **不按客户端过滤**（spec §8.2 第 2 条）：两个客户端拿到同一个模型集合，
+///    只有信封形状按家族给（Claude 系是 `data` 那份，Codex 是标准 `models` 数组）。
+#[tokio::test(flavor = "multi_thread")]
+async fn client_profile_override_and_models_exposure() {
+    let gw = Gateway::start().await;
+    let mut fails: Vec<String> = Vec::new();
+
+    let codex_ua = "codex_exec/0.162.1 (Windows 10.0.26200; x86_64) unknown (codex_exec; 0.162.1)";
+    let code_ua = "claude-cli/2.1.299 (external, sdk-cli)";
+    let slot = json!({"model":"claude-haiku","max_tokens":256,"stream":true,
+                      "messages":[{"role":"user","content":"覆盖"}]});
+
+    // ① codex 档案那份覆盖指向 mock → 走完一整条回放（文本就是 text fixture 的那句）。
+    let (status, bytes) = gw
+        .post_messages_with(&slot, &[("user-agent", codex_ua)])
+        .await;
+    check(
+        &mut fails,
+        status == 200,
+        format!("codex 档案的 claude-haiku: HTTP {status}，期望 200"),
+    );
+    let text = joined_text(&golden::parse(&bytes));
+    check(
+        &mut fails,
+        text == "你好，这是 mock 上游的纯文本回放。",
+        format!("codex 档案没走到 mock 的 text 回放：{text:?}"),
+    );
+
+    // ② 同一个模型名、换成 Claude Code 的 UA：落回 global（commandcode，测试里打不通）→ 502。
+    let (status, bytes) = gw
+        .post_messages_with(&slot, &[("user-agent", code_ua)])
+        .await;
+    check(
+        &mut fails,
+        status == 502,
+        format!("全局那份 claude-haiku 该打 commandcode（测试里不可达）→ 502，实际 {status}"),
+    );
+    let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    check(
+        &mut fails,
+        v["error"]["type"] == "api_error",
+        format!("502 的错误信封不对：{v}"),
+    );
+
+    // ③ 不带任何客户端标识 = global，同上。
+    let (status, _) = gw.post_messages(&slot).await;
+    check(
+        &mut fails,
+        status == 502,
+        format!("没有客户端标识该落回 global → 502，实际 {status}"),
+    );
+
+    // ④ `/v1/models`：Claude 系那份是 Anthropic 信封；Codex 那份是标准 models 数组。
+    let anthropic = gw.get_json("/v1/models").await;
+    let codex = gw
+        .get_json_with("/v1/models", &[("user-agent", codex_ua)])
+        .await;
+    let ids = |v: &Value| -> Vec<String> {
+        v["data"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|m| m["id"].as_str().map(str::to_string))
+            .collect()
+    };
+    check(
+        &mut fails,
+        anthropic.get("has_more").is_some() && anthropic["first_id"] == json!("claude-fable"),
+        format!("Claude 系的 /v1/models 信封不对：{anthropic}"),
+    );
+    check(
+        &mut fails,
+        codex["object"] == json!("list")
+            && codex["data"][0]["object"] == json!("model")
+            && codex["data"][0]["id"] == json!("claude-fable"),
+        format!("Codex 的 /v1/models 该是标准 models 数组：{codex}"),
+    );
+    check(
+        &mut fails,
+        ids(&anthropic) == ids(&codex),
+        format!(
+            "两个客户端的暴露集合必须一致（不按客户端过滤）：{:?} vs {:?}",
+            ids(&anthropic),
+            ids(&codex)
+        ),
+    );
+    let exposed = ids(&anthropic);
+    check(
+        &mut fails,
+        exposed.starts_with(&[
+            "claude-fable".to_string(),
+            "claude-opus".into(),
+            "claude-sonnet".into(),
+            "claude-haiku".into(),
+        ]),
+        format!("四个家族名必须恒在且在最前：{exposed:?}"),
+    );
+    check(
+        &mut fails,
+        exposed.len() > 4 && exposed.contains(&"mock-anthropic-text".to_string()),
+        format!("普通虚拟模型也该在清单里：{exposed:?}"),
+    );
+
+    // ⑤ 日志行记下**归属到的档案**（票 51）：`requests.client` 是按客户端聚合的唯一依据（票 53）。
+    let logs = gw.logs(3).await;
+    let haiku_rows: Vec<Value> = logs
+        .into_iter()
+        .filter(|r| r["virtual_model"] == "claude-haiku")
+        .collect();
+    let client_of = |status: i64| -> Vec<String> {
+        haiku_rows
+            .iter()
+            .filter(|r| r["status"] == json!(status))
+            .filter_map(|r| r["client"].as_str().map(str::to_string))
+            .collect()
+    };
+    check(
+        &mut fails,
+        client_of(200) == vec!["codex".to_string()],
+        format!("codex 档案那一发该记 client=codex：{:?}", client_of(200)),
+    );
+    let mut failed_clients = client_of(502);
+    failed_clients.sort();
+    check(
+        &mut fails,
+        failed_clients == vec!["claude-code".to_string(), "global".to_string()],
+        format!("落回全局的两发该记 claude-code / global：{failed_clients:?}"),
+    );
+
+    assert!(
+        fails.is_empty(),
+        "客户端档案覆盖与 /v1/models {} 处不合格：\n{}",
+        fails.len(),
+        fails.join("\n")
+    );
+}

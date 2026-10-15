@@ -4,7 +4,8 @@
 //! （`user_version` 与 DDL 同事务提交，所以不会出现「表改了但版本没动」的半截库）。
 //!
 //! v1 = 原型期的形状（`prototype/src/store.rs` 的四张表），v2 = spec §9 的形状，
-//! v3 = 票 49 给 `upstreams` 补「上次自检结果」，v4 = 票 50 补「上次成功拉取时间」。
+//! v3 = 票 49 给 `upstreams` 补「上次自检结果」，v4 = 票 50 补「上次成功拉取时间」，
+//! v5 = 票 51 给 `client_profiles` 补实测 UA 判据。
 //! 新库也照样从 v1 顺序跑到最新：装一次机就把整条迁移路径走一遍，热路径与升级路径不分叉。
 
 use anyhow::{Context, Result};
@@ -12,7 +13,7 @@ use rusqlite::{Connection, Transaction};
 use std::collections::HashMap;
 
 /// 当前 schema 版本 = 迁移表最后一条。
-pub const SCHEMA_VERSION: i32 = 4;
+pub const SCHEMA_VERSION: i32 = 5;
 
 pub(crate) struct Migration {
     pub(crate) version: i32,
@@ -35,6 +36,10 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 4,
         apply: v4_pull_ok_at,
+    },
+    Migration {
+        version: 5,
+        apply: v5_profile_match_ua,
     },
 ];
 
@@ -362,5 +367,27 @@ fn v3_selfcheck_columns(tx: &Transaction<'_>) -> Result<()> {
 /// `last_pull_ok_at` = 上次成功（NULL = 从没成功过）。
 fn v4_pull_ok_at(tx: &Transaction<'_>) -> Result<()> {
     tx.execute_batch("ALTER TABLE upstreams ADD COLUMN last_pull_ok_at INTEGER;")?;
+    Ok(())
+}
+
+/// v5（票 51）：`client_profiles.match_ua` 从空串填成**实测 UA 的稳定片段**。
+///
+/// v2 只建了四行空壳（`global` / `claude-desktop` / `claude-code` / `codex`），
+/// 归属判据是实测才知道的东西（票 51 第 16 行「`match_ua` 留空要你填实测 UA」）：
+///
+/// - Claude Desktop 3P：`Claude/`（票 15 端到端实测的 Electron UA 里那一段）
+/// - Claude Code：`claude-cli/`（本机 2.1.299 实测 `claude-cli/2.1.299 (external, sdk-cli)`）
+/// - Codex：`codex_exec/`（CLI 实测）与 `x-codex-`（桌面应用必带的标识头，票 32 真录入站体）
+///
+/// 与 `crate::binding::DEFAULT_MATCH_UA` 逐字一致（`binding` 的测试钉住这条）；写进迁移而不是
+/// 运行时读常量：档案判据是**可被用户改的配置**（界面能编辑），库是唯一真相。
+/// `global` 的判据保持空串——它是兜底档案，不该抢归属。
+/// （本迁移在集成分支上从 v4 顺延为 v5：票 50 先占了 v4 的 `last_pull_ok_at`。）
+fn v5_profile_match_ua(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute_batch(
+        "UPDATE client_profiles SET match_ua='Claude/' WHERE id='claude-desktop' AND match_ua='';
+         UPDATE client_profiles SET match_ua='claude-cli/' WHERE id='claude-code' AND match_ua='';
+         UPDATE client_profiles SET match_ua='codex_exec/;x-codex-' WHERE id='codex' AND match_ua='';",
+    )?;
     Ok(())
 }
