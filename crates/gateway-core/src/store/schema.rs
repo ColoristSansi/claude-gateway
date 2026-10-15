@@ -3,7 +3,8 @@
 //! 规矩：**只前进、不后退**；一个版本一个函数；每个版本整段跑在一个事务里，失败即回滚
 //! （`user_version` 与 DDL 同事务提交，所以不会出现「表改了但版本没动」的半截库）。
 //!
-//! v1 = 原型期的形状（`prototype/src/store.rs` 的四张表），v2 = spec §9 的形状。
+//! v1 = 原型期的形状（`prototype/src/store.rs` 的四张表），v2 = spec §9 的形状，
+//! v3 = 票 49 给 `upstreams` 补「上次自检结果」。
 //! 新库也照样从 v1 顺序跑到最新：装一次机就把整条迁移路径走一遍，热路径与升级路径不分叉。
 
 use anyhow::{Context, Result};
@@ -11,7 +12,7 @@ use rusqlite::{Connection, Transaction};
 use std::collections::HashMap;
 
 /// 当前 schema 版本 = 迁移表最后一条。
-pub const SCHEMA_VERSION: i32 = 2;
+pub const SCHEMA_VERSION: i32 = 3;
 
 pub(crate) struct Migration {
     pub(crate) version: i32,
@@ -26,6 +27,10 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 2,
         apply: v2_spec9,
+    },
+    Migration {
+        version: 3,
+        apply: v3_selfcheck_columns,
     },
 ];
 
@@ -328,5 +333,19 @@ fn v2_spec9(tx: &Transaction<'_>) -> Result<()> {
          DROP TABLE request_log;",
     )?;
 
+    Ok(())
+}
+
+/// v3（票 49）：`upstreams` 补「上次自检结果」。
+///
+/// v2 只留了拉取的三列（时间 / 状态 / 警告），而上游就绪判据**只看自检**（spec §6、
+/// 票 35 第 7 条：拉取失败与反查警告都不算「未就绪」）。所以自检结果必须自己有一列，
+/// 不能挤进 `last_pull_status`——两者是不同的事实，混用会让侧栏「未通过自检的上游数」说谎。
+/// 状态取值 `ok` / `fail`（尚无记录即 NULL）。
+fn v3_selfcheck_columns(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute_batch(
+        "ALTER TABLE upstreams ADD COLUMN last_selfcheck_at INTEGER;
+         ALTER TABLE upstreams ADD COLUMN last_selfcheck_status TEXT;",
+    )?;
     Ok(())
 }

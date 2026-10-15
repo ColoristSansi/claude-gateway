@@ -19,7 +19,7 @@ use futures_util::StreamExt;
 use serde_json::{json, Value};
 
 use crate::anthropic::{self, AnthropicAssembler, AnthropicDecoder, AnthropicEncoder};
-use crate::egress::provider::{Auth, Quirk, Upstream, Wire};
+use crate::egress::provider::{AuthScheme, EarlyReject, Quirk, Upstream, UpstreamModel, Wire};
 use crate::ingress::proxy::Gateway;
 use crate::ir::{IrEvent, IrRequest};
 use crate::obs::{self, RequestLog};
@@ -124,35 +124,37 @@ impl ClientAssembler {
     }
 }
 
-/// quirk 的唯一执法点：转换代码里不出现供应商名，只出现 quirk。
-pub fn guard(up: &Upstream, wire: Wire, real_model: &str) -> Result<(), String> {
-    if up.has_quirk(&Quirk::ClaudeModelsOnAnthropicOnly)
-        && wire == Wire::OpenAi
-        && real_model.starts_with("claude")
-    {
-        return Err(format!(
-            "上游 {} 的 {} 只有 Anthropic 端点（quirk ClaudeModelsOnAnthropicOnly）",
-            up.id, real_model
-        ));
+/// 请求期早拒（ADR-0004 第 4 条的第二层）：目录条目声明过这个模型的 wire 集合时，wire 必须
+/// 在集合里；未声明（空集合）是正常态，放行交给自检；目录里没有这条（回放 harness 的脚手架
+/// 场景）也不拦——那是票 51 的绑定层该保证的事（绑定必须先有目录条目）。
+pub fn guard(entry: Option<&UpstreamModel>, wire: Wire) -> Result<(), EarlyReject> {
+    match entry {
+        Some(e) => e.validate_wire(wire).map(|_| ()),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// 出站请求的唯一组装点：认证、协议头透传、quirk 注入。流式 / 非流式 / 计数三个出口共用，
 /// 免得「某条出口忘了带 anthropic-beta」这种事故。
+///
+/// 凭据按「上游 × wire」由调用方取好再传进来（M1 是 Gateway 里的临时表，M2 起是票 42 的
+/// `Store` + DPAPI），声明式表本身**不存密钥**。
+#[allow(clippy::too_many_arguments)]
 fn request(
     app: &Gateway,
     up: &Upstream,
     wire: Wire,
+    auth: AuthScheme,
+    key: &str,
     url: &str,
     body: &Value,
     seed: &str,
     pass_headers: &[(String, String)],
 ) -> reqwest::RequestBuilder {
     let mut rb = app.client.post(url).json(body);
-    rb = match up.auth {
-        Auth::Bearer => rb.header("authorization", format!("Bearer {}", up.api_key)),
-        Auth::XApiKey => rb.header("x-api-key", up.api_key.clone()),
+    rb = match auth {
+        AuthScheme::Bearer => rb.header("authorization", format!("Bearer {key}")),
+        AuthScheme::XApiKey => rb.header("x-api-key", key.to_string()),
     };
     // 协议头只在 Anthropic 直通时透传；换成 OpenAI wire 时它们没有意义。
     if wire == Wire::Anthropic {
@@ -162,12 +164,25 @@ fn request(
     }
     for q in &up.quirks {
         match q {
-            Quirk::ClientUserAgent(ua) => rb = rb.header("user-agent", *ua),
-            Quirk::SessionIdHeader(h) => rb = rb.header(*h, up.session_id(seed)),
-            Quirk::ClaudeModelsOnAnthropicOnly => {}
+            Quirk::ClientUserAgent(ua) => rb = rb.header("user-agent", ua.clone()),
+            Quirk::SessionIdHeader(h) => rb = rb.header(h.clone(), up.session_id(seed)),
+            _ => {}
         }
     }
     rb
+}
+
+/// 上游 Responses 面（`/responses`）的出站编解码还没做（M3）：早报清楚，别静默当 Chat 打。
+fn wire_not_implemented(wire: Wire, inbound: Inbound, up_id: &str) -> Response {
+    error_response_for(
+        inbound,
+        StatusCode::BAD_GATEWAY,
+        "api_error",
+        &format!(
+            "上游 {up_id} 的 {} 面尚未实现（M3 起接）；请先把该模型绑到已实现的 wire 上。",
+            wire.as_str()
+        ),
+    )
 }
 
 /// 探针档 `max_tokens`：这一档基本都是健康探针（Desktop 的推理探针是 `max_tokens:1`），
@@ -203,19 +218,25 @@ fn upstream_error(e: &reqwest::Error, url: &str, probe: Duration) -> (StatusCode
 
 /// 出站永远是流式（票 26 决定 3）：非流式只是把这条流缓到终态再组装完整 message。
 /// 好处是编解码面只有一套，Chat wire 迟到的 usage 也正好在收敛后拿全。
+#[allow(clippy::too_many_arguments)]
 pub async fn forward_buffered(
     app: Arc<Gateway>,
     up: &Upstream,
     wire: Wire,
+    auth: AuthScheme,
+    key: &str,
     req: IrRequest,
     client_model: String,
     pass_headers: Vec<(String, String)>,
     inbound: Inbound,
 ) -> Response {
-    let url = up.url(wire);
+    let Some(url) = up.url(wire) else {
+        return wire_not_implemented(wire, inbound, &up.id);
+    };
     let body = match wire {
         Wire::Anthropic => anthropic::encode_request(&req, true),
-        Wire::OpenAi => openai::encode_request(&req, true),
+        Wire::OpenAiChat => openai::encode_request(&req, true),
+        Wire::OpenAiResponses => return wire_not_implemented(wire, inbound, &up.id),
     };
     let t0 = Instant::now();
     let sent = with_deadline(
@@ -223,6 +244,8 @@ pub async fn forward_buffered(
             &app,
             up,
             wire,
+            auth,
+            key,
             &url,
             &body,
             &first_user_text(&req),
@@ -271,7 +294,8 @@ pub async fn forward_buffered(
 
     let mut dec = match wire {
         Wire::Anthropic => Decoder::A(AnthropicDecoder),
-        Wire::OpenAi => Decoder::O(OpenAiDecoder::default()),
+        Wire::OpenAiChat => Decoder::O(OpenAiDecoder::default()),
+        Wire::OpenAiResponses => return wire_not_implemented(wire, inbound, &up.id),
     };
     let mut parser = SseParser::default();
     let mut asm = ClientAssembler::new(inbound, req.freeform_tools.clone());
@@ -343,23 +367,25 @@ pub async fn forward_buffered(
 
 /// `count_tokens` 的转发（票 26 决定 1）：只有 Anthropic wire 有原生端点，路径是
 /// `/messages` 的兄弟 `/messages/count_tokens`。任何失败都返回 `None`，由调用方降级到本地估算。
+#[allow(clippy::too_many_arguments)]
 pub async fn count_tokens_upstream(
     app: &Gateway,
     up: &Upstream,
+    auth: AuthScheme,
+    key: &str,
     req: &IrRequest,
     pass_headers: &[(String, String)],
 ) -> Option<u64> {
-    let url = format!(
-        "{}{}/count_tokens",
-        up.base_url.trim_end_matches('/'),
-        up.path_anthropic
-    );
+    // count_tokens 是 `/messages` 的兄弟：按 Anthropic 路径模板推，模板缺失就没有上游计数。
+    let url = format!("{}/count_tokens", up.url(Wire::Anthropic)?);
     let body = anthropic::encode_count_request(req);
     // shortcut: 计数是辅助端点，10 秒封顶，不让它挂住客户端；要更久就改这里。
     let resp = request(
         app,
         up,
         Wire::Anthropic,
+        auth,
+        key,
         &url,
         &body,
         &first_user_text(req),
@@ -376,24 +402,30 @@ pub async fn count_tokens_upstream(
     v.get("input_tokens").and_then(Value::as_u64)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn forward(
     app: Arc<Gateway>,
     up: &Upstream,
     wire: Wire,
+    auth: AuthScheme,
+    key: &str,
     req: IrRequest,
     client_model: String,
     pass_headers: Vec<(String, String)>,
     inbound: Inbound,
 ) -> Response {
-    let url = up.url(wire);
+    let Some(url) = up.url(wire) else {
+        return wire_not_implemented(wire, inbound, &up.id);
+    };
     let body = match wire {
         Wire::Anthropic => anthropic::encode_request(&req, true),
-        Wire::OpenAi => openai::encode_request(&req, true),
+        Wire::OpenAiChat => openai::encode_request(&req, true),
+        Wire::OpenAiResponses => return wire_not_implemented(wire, inbound, &up.id),
     };
 
     let seed = first_user_text(&req);
     let rb = with_deadline(
-        request(&app, up, wire, &url, &body, &seed, &pass_headers),
+        request(&app, up, wire, auth, key, &url, &body, &seed, &pass_headers),
         req.max_tokens,
         app.probe,
     );
@@ -437,7 +469,8 @@ pub async fn forward(
 
     let dec = match wire {
         Wire::Anthropic => Decoder::A(AnthropicDecoder),
-        Wire::OpenAi => Decoder::O(OpenAiDecoder::default()),
+        Wire::OpenAiChat => Decoder::O(OpenAiDecoder::default()),
+        Wire::OpenAiResponses => return wire_not_implemented(wire, inbound, &up.id),
     };
     let pump = Pump {
         inner: Box::pin(resp.bytes_stream()),

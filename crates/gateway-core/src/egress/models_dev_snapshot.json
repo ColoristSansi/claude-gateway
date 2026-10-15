@@ -1,0 +1,58 @@
+{
+  "anthropic": {
+    "id": "anthropic",
+    "name": "Anthropic",
+    "env": ["ANTHROPIC_API_KEY"],
+    "npm": "@ai-sdk/anthropic",
+    "doc": "https://docs.anthropic.com/en/docs/about-claude/models",
+    "models": {
+      "claude-haiku-4-5": {
+        "id": "claude-haiku-4-5",
+        "name": "Claude Haiku 4.5",
+        "cost": { "input": 1, "output": 5, "cache_read": 0.1, "cache_write": 1.25 },
+        "limit": { "context": 200000, "output": 64000 },
+        "canonical_model_id": "anthropic/claude-haiku-4-5"
+      },
+      "claude-sonnet-4-6": {
+        "id": "claude-sonnet-4-6",
+        "name": "Claude Sonnet 4.6",
+        "cost": { "input": 3, "output": 15, "cache_read": 0.3, "cache_write": 3.75 },
+        "limit": { "context": 200000, "output": 64000 },
+        "canonical_model_id": "anthropic/claude-sonnet-4-6"
+      }
+    }
+  },
+  "openai": {
+    "id": "openai",
+    "name": "OpenAI",
+    "env": ["OPENAI_API_KEY"],
+    "npm": "@ai-sdk/openai",
+    "doc": "https://platform.openai.com/docs/models",
+    "models": {
+      "gpt-5.6-luna": {
+        "id": "gpt-5.6-luna",
+        "name": "GPT-5.6 Luna",
+        "cost": { "input": 1.25, "output": 10, "cache_read": 0.125 },
+        "limit": { "context": 1050000, "output": 128000 },
+        "canonical_model_id": "openai/gpt-5.6-luna"
+      }
+    }
+  },
+  "deepseek": {
+    "id": "deepseek",
+    "name": "DeepSeek",
+    "env": ["DEEPSEEK_API_KEY"],
+    "npm": "@ai-sdk/openai-compatible",
+    "api": "https://api.deepseek.com",
+    "doc": "https://api-docs.deepseek.com/quick_start/pricing",
+    "models": {
+      "deepseek-v4.1-flash": {
+        "id": "deepseek-v4.1-flash",
+        "name": "DeepSeek V4.1 Flash",
+        "cost": { "input": 0.15, "output": 0.6, "cache_read": 0.003 },
+        "limit": { "context": 1000000, "output": 393216 },
+        "canonical_model_id": "deepseek/deepseek-v4.1-flash"
+      }
+    }
+  }
+}

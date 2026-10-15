@@ -23,7 +23,7 @@ use axum::{
 use serde_json::{json, Value};
 
 use gateway_core::binding::Route;
-use gateway_core::egress::provider::{Auth, Env, Quirk, Upstream};
+use gateway_core::egress::provider::{Env, Quirk, Upstream, Wire};
 use gateway_core::ingress::proxy::{router, Gateway, BODY_LOG_WINDOW};
 use gateway_core::store::Store;
 
@@ -58,64 +58,49 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(8788);
 
     let mut upstreams: HashMap<String, Upstream> = HashMap::new();
+    // 出站凭据（M1 脚手架）：声明式表不存密钥，key 单独一张表；票 51 起改走票 42 的 Store。
+    let mut keys: HashMap<String, String> = HashMap::new();
 
     // mock 上游：本机假上游，回放 fixtures/。由 mock-upstream 那个**独立进程**提供。
     // 两条头类 quirk 挂在它身上（票 19 §6.3）：quirk 的唯一执法点在 HTTP 组装路径上，
     // mock 是集成层唯一能真读到「出站请求头」的上游。
-    upstreams.insert(
-        "mock".into(),
-        Upstream {
-            id: "mock".into(),
-            base_url: format!("http://127.0.0.1:{mock_port}"),
-            auth: Auth::Bearer,
-            api_key: "mock".into(),
-            path_anthropic: "/anthropic/v1/messages".into(),
-            path_openai: "/openai/v1/chat/completions".into(),
-            quirks: vec![
-                Quirk::ClientUserAgent("claude-gateway-prototype/0.0.1"),
-                Quirk::SessionIdHeader("x-opencode-session"),
-            ],
-        },
-    );
+    let mut mock = Upstream::new("mock", "mock", format!("http://127.0.0.1:{mock_port}"));
+    mock.set_path(Wire::Anthropic, "/anthropic/v1/messages");
+    mock.set_path(Wire::OpenAiChat, "/openai/v1/chat/completions");
+    mock.quirks = vec![
+        Quirk::ClientUserAgent("claude-gateway-prototype/0.0.1".into()),
+        Quirk::SessionIdHeader("x-opencode-session".into()),
+    ];
+    keys.insert("mock".into(), "mock".into());
+    upstreams.insert("mock".into(), mock);
 
     // 真实上游 1：opencode。UA 与会话头由 quirk 声明，网关侧自动处理。
     if let (Some(base), Some(key)) = (env.get("OPENCODE_BASE_URL"), env.get("OPENCODE_API_KEY")) {
-        upstreams.insert(
-            "opencode".into(),
-            Upstream {
-                id: "opencode".into(),
-                base_url: base,
-                auth: Auth::Bearer,
-                api_key: key,
-                path_anthropic: "/messages".into(),
-                path_openai: "/chat/completions".into(),
-                quirks: vec![
-                    Quirk::ClientUserAgent("claude-gateway-prototype/0.0.1"),
-                    Quirk::SessionIdHeader("x-opencode-session"),
-                ],
-            },
-        );
+        let mut up = Upstream::new("opencode", "opencode", base);
+        up.set_path(Wire::Anthropic, "/messages");
+        up.set_path(Wire::OpenAiChat, "/chat/completions");
+        up.quirks = vec![
+            Quirk::ClientUserAgent("claude-gateway-prototype/0.0.1".into()),
+            Quirk::SessionIdHeader("x-opencode-session".into()),
+        ];
+        keys.insert("opencode".into(), key);
+        upstreams.insert("opencode".into(), up);
     } else {
         eprintln!("[warn] 缺 OPENCODE_* 配置，opencode 上游不可用");
     }
 
-    // 真实上游 2：commandcode。Claude 模型只在 /messages，用 quirk 表达。
+    // 真实上游 2：commandcode。Claude 模型的位置由上游模型目录的 `supported_wires` 表达
+    // （票 49 起，原 quirk `ClaudeModelsOnAnthropicOnly` 已按 ADR-0004 删除）；harness 的
+    // 路由表仍然是脚手架，目录归票 51 的绑定层种。
     if let (Some(base), Some(key)) = (
         env.get("COMMANDCODE_BASE_URL"),
         env.get("COMMANDCODE_API_KEY"),
     ) {
-        upstreams.insert(
-            "commandcode".into(),
-            Upstream {
-                id: "commandcode".into(),
-                base_url: base,
-                auth: Auth::Bearer,
-                api_key: key,
-                path_anthropic: "/messages".into(),
-                path_openai: "/chat/completions".into(),
-                quirks: vec![Quirk::ClaudeModelsOnAnthropicOnly],
-            },
-        );
+        let mut up = Upstream::new("commandcode", "commandcode", base);
+        up.set_path(Wire::Anthropic, "/messages");
+        up.set_path(Wire::OpenAiChat, "/chat/completions");
+        keys.insert("commandcode".into(), key);
+        upstreams.insert("commandcode".into(), up);
     } else {
         eprintln!("[warn] 缺 COMMANDCODE_* 配置，commandcode 上游不可用");
     }
@@ -226,6 +211,7 @@ async fn main() -> anyhow::Result<()> {
 
     let store = Store::open(std::path::Path::new(&data_dir))?;
     let mut gw = Gateway::new(store, upstreams, routes);
+    gw.keys = keys;
     gw.ping = Duration::from_secs(env_u64("GATEWAY_PING_SECS", 15));
     gw.probe = Duration::from_secs(env_u64("GATEWAY_PROBE_SECS", 20));
     if std::env::var("GATEWAY_LOG_BODY")
