@@ -106,9 +106,16 @@ impl Gateway {
 
     /// 网关自己的 GET（`/v1/models` 这类转发面端点）。
     pub async fn get_json(&self, path: &str) -> Value {
-        reqwest::Client::new()
-            .get(format!("{}{path}", self.base))
-            .send()
+        self.get_json_with(path, &[]).await
+    }
+
+    /// 带自定义入站头的 GET（票 51：`/v1/models` 的信封形状按客户端家族给）。
+    pub async fn get_json_with(&self, path: &str, headers: &[(&str, &str)]) -> Value {
+        let mut rb = reqwest::Client::new().get(format!("{}{path}", self.base));
+        for (k, v) in headers {
+            rb = rb.header(*k, *v);
+        }
+        rb.send()
             .await
             .expect("GET 失败")
             .json()

@@ -13,7 +13,9 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
+use gateway_core::binding;
 use gateway_core::egress::provider::*;
 use gateway_core::store::Store;
 
@@ -270,6 +272,180 @@ async fn opencode_declares_no_endpoints_so_wires_come_from_doc_table() {
     }
     assert!(
         !dir_contains_bytes(&root, key.as_bytes()),
+        "库文件里不该出现明文密钥"
+    );
+}
+
+/// 票 51 验收 2：自检探针（非流式 `/v1/messages` + `max_tokens:1`，**只看状态码**）
+/// 在两条真上游各跑一次，外加票据点名的那条**已知挂住**的组合。
+///
+/// 三个形状：
+/// - opencode + `deepseek-v4.1-flash` + Chat wire（票 26 实测 1.9 秒 200）
+/// - commandcode + `claude-sonnet-5-5` + Anthropic wire（票 26 实测 2.5 秒 200）
+/// - commandcode + `deepseek/deepseek-v4.1-flash` + **Chat wire**：票 26 / 票 51:24 记的那条
+///   `max_tokens:1` 挂住（直连 curl 25 秒也无响应）→ 探针档 20 秒上限 → **504**
+///
+/// 顺带在真数据上验一次「绑定只能从上游模型目录里选」：目录里有的能绑、没有的绑不上。
+#[tokio::test]
+#[ignore = "打真上游：cargo test -p gateway-core --test upstream_live -- --ignored --nocapture"]
+async fn selfcheck_probe_on_both_live_upstreams() {
+    let env = EnvFile::load();
+    let root = tmp_root("selfcheck");
+    let store = Store::open(&root).expect("开库");
+    let http = reqwest::Client::new();
+
+    let mut oc = live_upstream("opencode", &env.get("OPENCODE_BASE_URL"));
+    // opencode 的 Go 计划要求客户端自称（票 02 / 19）：没有 UA 与 `x-opencode-session`，
+    // Chat 面直接 400 `MissingSessionID`——这是上游的硬要求，不是探针的问题。
+    oc.quirks = vec![
+        Quirk::ClientUserAgent("claude-gateway-prototype/0.0.1".into()),
+        Quirk::SessionIdHeader("x-opencode-session".into()),
+    ];
+    let cc = live_upstream("commandcode", &env.get("COMMANDCODE_BASE_URL"));
+    save_upstream(&store, &oc).await.unwrap();
+    save_upstream(&store, &cc).await.unwrap();
+    store
+        .put_credential("opencode", "default", &env.get("OPENCODE_API_KEY"))
+        .await
+        .unwrap();
+    store
+        .put_credential("commandcode", "default", &env.get("COMMANDCODE_API_KEY"))
+        .await
+        .unwrap();
+
+    // 目录条目（手工新增，`manual` 锁定）：绑定只能从目录里选。
+    for (id, model, wire) in [
+        ("opencode", "deepseek-v4.1-flash", Wire::OpenAiChat),
+        ("commandcode", "claude-sonnet-5-5", Wire::Anthropic),
+        (
+            "commandcode",
+            "deepseek/deepseek-v4.1-flash",
+            Wire::OpenAiChat,
+        ),
+    ] {
+        save_manual_model(&store, id, model, &[wire]).await.unwrap();
+    }
+
+    // 真数据上的配置期主拦：目录里有的能绑（家族槽位走真实目录条目），没有的绑不上。
+    let slot = binding::Binding::new(
+        binding::Profile::Global,
+        "claude-haiku",
+        "commandcode",
+        "claude-sonnet-5-5",
+        Wire::Anthropic,
+    );
+    match binding::save(&store, &slot).await {
+        Ok(WireChoice::Declared) => {
+            println!("\nclaude-haiku → commandcode / claude-sonnet-5-5 / anthropic：已绑")
+        }
+        other => panic!("真目录条目该能绑上：{other:?}"),
+    }
+    let bogus = binding::Binding::new(
+        binding::Profile::Codex,
+        "codex-不存在",
+        "commandcode",
+        "根本没有这个模型",
+        Wire::Anthropic,
+    );
+    match binding::save(&store, &bogus).await {
+        Err(binding::SaveError::NoCatalogEntry { .. }) => {
+            println!("目录里没有的模型：绑不上（符合 spec §7）")
+        }
+        other => panic!("目录里没有的模型必须绑不上：{other:?}"),
+    }
+    let table = binding::load(&store).await.unwrap();
+    assert_eq!(
+        table.resolve("claude-haiku", "").unwrap().real_model,
+        "claude-sonnet-5-5"
+    );
+
+    // 探针四发：两条真上游各一发（opencode 的 Chat 面按票 02 / 19 / 49 必须自称 UA + 带会话头，
+    // 不带就是 400 `MissingSessionID`），外加两条**已知形状**的样本。
+    //
+    // 期望值给 `None` 的那两发是「上游看心情」的组合：同一个三元组今天实测既见过
+    // 20.0 秒 → 504（挂住），也见过 1.4 秒 → 200。所以那两发断言的是**契约**而不是具体码：
+    // 2xx = 通过、504 = 探针档超时；两者都要如实落库。
+    let probes: [(&str, &Upstream, Wire, &str, Duration, Option<u16>); 4] = [
+        (
+            "opencode",
+            &oc,
+            Wire::OpenAiChat,
+            "deepseek-v4.1-flash",
+            binding::PROBE_DEADLINE,
+            None,
+        ),
+        (
+            "opencode",
+            &oc,
+            Wire::OpenAiChat,
+            "deepseek-v4.1-flash",
+            Duration::from_secs(90),
+            Some(200),
+        ),
+        (
+            "commandcode",
+            &cc,
+            Wire::Anthropic,
+            "claude-sonnet-5-5",
+            binding::PROBE_DEADLINE,
+            Some(200),
+        ),
+        (
+            "commandcode",
+            &cc,
+            Wire::OpenAiChat,
+            "deepseek/deepseek-v4.1-flash",
+            binding::PROBE_DEADLINE,
+            None,
+        ),
+    ];
+    println!("\n===== 自检探针（非流式 /v1/messages + max_tokens:1，只看状态码）=====");
+    let mut fails: Vec<String> = Vec::new();
+    for (id, up, wire, model, deadline, want) in probes {
+        let r = binding::selfcheck(&http, &store, up, wire, model, deadline).await;
+        println!(
+            "  {id} / {model} / {} / 上限 {}s → status={} ok={} {}ms  {}",
+            wire.as_str(),
+            deadline.as_secs(),
+            r.status,
+            r.ok,
+            r.elapsed_ms,
+            r.detail
+        );
+        match want {
+            Some(want) if r.status != want => fails.push(format!(
+                "{id} / {model} / {}（上限 {}s）：期望 {want}，实际 {}",
+                wire.as_str(),
+                deadline.as_secs(),
+                r.status
+            )),
+            // 契约：这一档要么答了（2xx / 上游自己的 4xx/5xx），要么被探针档砍在 504。
+            None if r.status != 200 && r.status != 504 => fails.push(format!(
+                "{id} / {model} / {}（上限 {}s）：只该是 200 或 504，实际 {}",
+                wire.as_str(),
+                deadline.as_secs(),
+                r.status
+            )),
+            _ => {}
+        }
+        if r.status == 504 && !r.detail.contains("超时") {
+            fails.push(format!("504 的文案该说超时：{}", r.detail));
+        }
+        // 落库：就绪判据只看 `upstreams.last_selfcheck_*` 这一列。
+        let after = load_upstream(&store, id).await.unwrap().unwrap();
+        let sc = after.last_selfcheck.expect("自检结果必须落库");
+        if sc.ok != r.ok {
+            fails.push(format!(
+                "{id} 的自检结果没落对：{sc:?} vs status={}",
+                r.status
+            ));
+        }
+    }
+    assert!(fails.is_empty(), "自检探针不合格：\n{}", fails.join("\n"));
+
+    assert!(
+        !dir_contains_bytes(&root, env.get("OPENCODE_API_KEY").as_bytes())
+            && !dir_contains_bytes(&root, env.get("COMMANDCODE_API_KEY").as_bytes()),
         "库文件里不该出现明文密钥"
     );
 }

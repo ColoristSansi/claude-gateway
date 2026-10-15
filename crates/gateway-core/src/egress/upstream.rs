@@ -134,14 +134,15 @@ pub fn guard(entry: Option<&UpstreamModel>, wire: Wire) -> Result<(), EarlyRejec
     }
 }
 
-/// 出站请求的唯一组装点：认证、协议头透传、quirk 注入。流式 / 非流式 / 计数三个出口共用，
-/// 免得「某条出口忘了带 anthropic-beta」这种事故。
+/// 出站请求的唯一组装点：认证、协议头透传、quirk 注入。流式 / 非流式 / 计数 / 自检探针
+/// 四个出口共用，免得「某条出口忘了带 anthropic-beta」这种事故。
 ///
-/// 凭据按「上游 × wire」由调用方取好再传进来（M1 是 Gateway 里的临时表，M2 起是票 42 的
-/// `Store` + DPAPI），声明式表本身**不存密钥**。
+/// 凭据按「上游 × wire」由调用方取好再传进来（`provider::wire_credential`），
+/// 声明式表本身**不存密钥**。只收 `reqwest::Client`（不收整个 `Gateway`）：绑定层的自检探针
+/// 也要用同一个组装点，而绑定层不能反过来依赖转发面的状态。
 #[allow(clippy::too_many_arguments)]
-fn request(
-    app: &Gateway,
+pub(crate) fn request(
+    client: &reqwest::Client,
     up: &Upstream,
     wire: Wire,
     auth: AuthScheme,
@@ -151,7 +152,7 @@ fn request(
     seed: &str,
     pass_headers: &[(String, String)],
 ) -> reqwest::RequestBuilder {
-    let mut rb = app.client.post(url).json(body);
+    let mut rb = client.post(url).json(body);
     rb = match auth {
         AuthScheme::Bearer => rb.header("authorization", format!("Bearer {key}")),
         AuthScheme::XApiKey => rb.header("x-api-key", key.to_string()),
@@ -190,7 +191,11 @@ fn wire_not_implemented(wire: Wire, inbound: Inbound, up_id: &str) -> Response {
 /// deepseek 直连 curl 也复现），所以只给这一档加短上限，普通生成长度不受影响。
 /// 票 26 决定 5：统一超时不加，只封这一档。上限值由 `GATEWAY_PROBE_SECS` 给（默认 20 秒，
 /// 票 30 第 9 条给测试留的旋钮——不拨短的话那条断言要真等 20 秒）。
-const PROBE_MAX_TOKENS: u64 = 16;
+pub const PROBE_MAX_TOKENS: u64 = 16;
+
+/// 探针档的上游上限（秒）：超时 504（spec §4.5 / 票 26 决定 5）。
+/// 绑定层的自检探针（`binding::selfcheck`）与转发面共用这一个值。
+pub const PROBE_DEADLINE: Duration = Duration::from_secs(20);
 
 fn with_deadline(
     rb: reqwest::RequestBuilder,
@@ -241,7 +246,7 @@ pub async fn forward_buffered(
     let t0 = Instant::now();
     let sent = with_deadline(
         request(
-            &app,
+            &app.client,
             up,
             wire,
             auth,
@@ -381,7 +386,7 @@ pub async fn count_tokens_upstream(
     let body = anthropic::encode_count_request(req);
     // shortcut: 计数是辅助端点，10 秒封顶，不让它挂住客户端；要更久就改这里。
     let resp = request(
-        app,
+        &app.client,
         up,
         Wire::Anthropic,
         auth,
@@ -425,7 +430,17 @@ pub async fn forward(
 
     let seed = first_user_text(&req);
     let rb = with_deadline(
-        request(&app, up, wire, auth, key, &url, &body, &seed, &pass_headers),
+        request(
+            &app.client,
+            up,
+            wire,
+            auth,
+            key,
+            &url,
+            &body,
+            &seed,
+            &pass_headers,
+        ),
         req.max_tokens,
         app.probe,
     );
