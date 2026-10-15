@@ -349,6 +349,7 @@ pub async fn forward_buffered(
     };
     let row = RequestLog {
         ts: 0,
+        request_id: None,
         virtual_model: client_model.clone(),
         client: Some(client.clone()),
         upstream_id: up.id.clone(),

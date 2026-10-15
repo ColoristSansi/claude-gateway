@@ -294,11 +294,26 @@ async fn main() -> anyhow::Result<()> {
     }
     let state = Arc::new(gw);
 
-    let app = router()
-        .route("/healthz", get(|| async { "ok" }))
-        // body 日志开关的测试控制面（票 30 第 7 条）：真产品里它是设置页那个开关 + 1 小时自动关。
-        .route("/__bodylog", post(set_body_log))
-        .with_state(state.clone());
+    // 票 53：harness 把**管理面也挂上**（`/api/logs*` / `/api/usage/summary`），日志页那几条
+    // 验收才走得到真实 HTTP。产品侧由 `ingress::router` 干这件事（这里要额外挂两个测试控制面，
+    // 所以自己 merge 一次，挂的仍然是同一个 `api::router`）。
+    let api_state = gateway_core::ingress::api::ApiState::new(
+        env!("CARGO_PKG_VERSION"),
+        std::path::Path::new(&data_dir)
+            .join(gateway_core::store::DB_FILE_NAME)
+            .to_string_lossy()
+            .into_owned(),
+        port,
+    )
+    .attach_logs(&state);
+    let app = gateway_core::ingress::api::router(api_state).merge(
+        router()
+            .route("/healthz", get(|| async { "ok" }))
+            // body 日志开关的测试控制面（票 30 第 7 条）：它拨的是**同一个**窗口实例，
+            // 正式入口是 `/api/logs/body-recording`（票 53）。
+            .route("/__bodylog", post(set_body_log))
+            .with_state(state.clone()),
+    );
 
     println!(
         "网关   http://127.0.0.1:{port}   (inbound: POST /v1/messages, POST /v1/messages/count_tokens, POST /v1/responses, GET /v1/models)"

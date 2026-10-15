@@ -129,6 +129,11 @@ pub async fn start(cfg: GatewayConfig) -> Result<Gateway, StartError> {
         cfg.db_path.to_string_lossy().into_owned(),
         addr.port(),
     ));
+    // 票 53：保留期清理表跟着网关起——启动立刻扫一次（把上次退出后攒下的老行清掉），之后每小时一次。
+    // 只在转发面挂了的时候起（没有库就没有日志可清）。
+    if let Some(gateway) = &cfg.forwarding {
+        crate::obs::spawn_purge_sweeper(gateway.store.clone());
+    }
     let app = crate::ingress::router((*state).clone(), cfg.forwarding);
     let (tx, rx) = oneshot::channel();
 

@@ -1116,26 +1116,34 @@ pub async fn resolved_prices(
 ) -> Result<ResolvedPrices> {
     let (upstream_id, model_id) = (upstream_id.to_string(), model_id.to_string());
     store
-        .read(move |c| {
-            let mut st = c.prepare(
-                "SELECT price_input_usd,price_output_usd,price_cache_read_usd,price_cache_write_usd
-                   FROM upstream_models WHERE upstream_id=?1 AND model_id=?2",
-            )?;
-            let mut rows = st.query(params![upstream_id, model_id])?;
-            let manual = match rows.next()? {
-                Some(r) => Prices {
-                    input: r.get(0)?,
-                    output: r.get(1)?,
-                    cache_read: r.get(2)?,
-                    cache_write: r.get(3)?,
-                },
-                None => Prices::default(),
-            };
-            drop(rows);
-            let snapshot = snapshot_prices(c, &upstream_id, &model_id)?;
-            Ok(resolve_prices(&manual, snapshot.as_ref()))
-        })
+        .read(move |c| resolved_prices_from(c, &upstream_id, &model_id))
         .await
+}
+
+/// 同上，但用调用方手里那条连接（票 53：日志写入路径要在**同一个事务/同一条连接**里取当时价，
+/// 不能为一行日志再排一次读队列——那会让「请求时冻结」与「落库」之间多一个窗口）。
+pub fn resolved_prices_from(
+    c: &Connection,
+    upstream_id: &str,
+    model_id: &str,
+) -> Result<ResolvedPrices> {
+    let mut st = c.prepare(
+        "SELECT price_input_usd,price_output_usd,price_cache_read_usd,price_cache_write_usd
+           FROM upstream_models WHERE upstream_id=?1 AND model_id=?2",
+    )?;
+    let mut rows = st.query(params![upstream_id, model_id])?;
+    let manual = match rows.next()? {
+        Some(r) => Prices {
+            input: r.get(0)?,
+            output: r.get(1)?,
+            cache_read: r.get(2)?,
+            cache_write: r.get(3)?,
+        },
+        None => Prices::default(),
+    };
+    drop(rows);
+    let snapshot = snapshot_prices(c, upstream_id, model_id)?;
+    Ok(resolve_prices(&manual, snapshot.as_ref()))
 }
 
 // ───────────────────────── models.dev 快照 ─────────────────────────

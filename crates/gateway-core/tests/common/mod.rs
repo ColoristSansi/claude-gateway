@@ -123,6 +123,18 @@ impl Gateway {
             .expect("响应不是 JSON")
     }
 
+    /// 管理面 `GET /api/*`：回 (状态码, JSON)——票 53 的日志 / 用量端点要断言状态码。
+    pub async fn get_api(&self, path: &str) -> (u16, Value) {
+        let resp = reqwest::Client::new()
+            .get(format!("{}{path}", self.base))
+            .send()
+            .await
+            .expect("GET /api 失败");
+        let status = resp.status().as_u16();
+        let v = resp.json().await.unwrap_or(Value::Null);
+        (status, v)
+    }
+
     /// mock 的请求回显（`GET <mock>/api/echo`）：头类 quirk / 路径模板 / auth 头靠它断言。
     pub async fn echo(&self) -> Value {
         reqwest::Client::new()
