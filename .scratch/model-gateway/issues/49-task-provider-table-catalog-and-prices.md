@@ -26,7 +26,8 @@ Blocked by: 42
 
 ## Answer
 
-（2026-10-15，task/49-provider-table-catalog-prices，基于集成分支 `8fea7cc`，收工前已并 `integration/model-gateway` tip `ac40394`）
+（2026-10-15，task/49-provider-table-catalog-prices，基于集成分支 `8fea7cc`，收工前已并 `integration/model-gateway`
+（先 `ac40394`，再 `e4de381`），冲突就地解决、门禁在合并后的树上重跑全绿）
 
 ### 做了什么
 
