@@ -28,7 +28,7 @@ Blocked by: 42
 
 ## Answer
 
-**引擎落地了**（2026-10-15）。代码提交 `d137db7`；随后 `git merge integration/model-gateway`（票 41 出站转发与回归基建、票 44 M1 收口）就地解决 `crates/gateway-core/Cargo.toml` 一处冲突（只并 windows-sys 的特性列表），`cargo build --workspace` 自修锁。
+**引擎落地了**（2026-10-15）。代码提交 `d137db7`、收口提交 `cd52f97`；分支 tip `8209461`（已把集成分支 tip `e4de381` 并在自己分支里，见 `git merge-base --is-ancestor integration/model-gateway HEAD` 通过）。中途 `git merge integration/model-gateway` 就地解决 `crates/gateway-core/Cargo.toml` 一处冲突（只并 windows-sys 的特性列表），`cargo build --workspace` 自修锁。
 
 ### 做了什么
 
