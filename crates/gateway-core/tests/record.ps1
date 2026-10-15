@@ -1,6 +1,9 @@
 # 录制工具（票 19 §2、票 29 第 1 条）：跑真实上游一次，把**原始 SSE 字节**连同 meta.json 写进 fixtures/。
 # 不进网关的生产路径；重录是人工动作，绝不在回归里自动发生。
 #
+# 票 41 搬到产品侧 `crates/gateway-core/tests/`：默认落点就是这个目录下的 `fixtures/`，
+# **绝不**写回冻结原型 `.scratch/model-gateway/prototype/fixtures/`。
+#
 # 例：
 #   pwsh -File .\record.ps1 -Scenario tools -Wire openai -Model deepseek-v4.1-flash `
 #     -Url "$env:OPENCODE_BASE_URL/chat/completions" -KeyVar OPENCODE_API_KEY
@@ -27,7 +30,8 @@ $ErrorActionPreference = 'Stop'
 $utf8 = New-Object System.Text.UTF8Encoding($false)
 
 # 1) 凭据：只认 prototype-upstream.env（已 gitignore），不接受命令行明文，免得写进历史。
-$envFile = Join-Path $PSScriptRoot '..\prototype-upstream.env'
+#    产品侧 tests/ 往上三层是仓库根。
+$envFile = Join-Path $PSScriptRoot '..\..\..\.scratch\model-gateway\prototype-upstream.env'
 $key = $null
 if (Test-Path $envFile) {
   foreach ($line in Get-Content $envFile) {

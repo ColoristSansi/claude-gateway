@@ -19,11 +19,11 @@ use futures_util::StreamExt;
 use serde_json::{json, Value};
 
 use crate::anthropic::{self, AnthropicAssembler, AnthropicDecoder, AnthropicEncoder};
+use crate::egress::provider::{Auth, Quirk, Upstream, Wire};
 use crate::ingress::proxy::Gateway;
 use crate::ir::{IrEvent, IrRequest};
 use crate::obs::{self, RequestLog};
 use crate::openai::{self, OpenAiDecoder};
-use crate::egress::provider::{Auth, Quirk, Upstream, Wire};
 use crate::responses::{ResponsesAssembler, ResponsesEncoder};
 use crate::sse::{self, SseParser};
 use crate::store::Store;

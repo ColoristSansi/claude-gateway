@@ -25,9 +25,9 @@ use serde_json::{json, Value};
 
 use crate::anthropic;
 use crate::binding::Route;
+use crate::egress::provider::{Upstream, Wire};
 use crate::egress::upstream::{self, Inbound};
 use crate::ir;
-use crate::egress::provider::{Upstream, Wire};
 use crate::responses;
 use crate::store::Store;
 
@@ -195,7 +195,12 @@ async fn proxy(
     req.model = rt.real_model.clone();
 
     if let Err(e) = upstream::guard(&up, wire, &rt.real_model) {
-        return err_in(inbound, StatusCode::BAD_REQUEST, "invalid_request_error", &e);
+        return err_in(
+            inbound,
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            &e,
+        );
     }
 
     // 入站的 Anthropic 协议头必须带过去：`anthropic-beta` 一丢，prompt caching / thinking 就静默失效。

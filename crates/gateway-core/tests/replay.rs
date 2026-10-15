@@ -1,6 +1,7 @@
-//! 回放集成测试（票 29 第 7 条铺开成票 30 的整套）：测试自己把**两个进程**（`gateway-harness`
-//! + `mock-upstream`）拉起来，走**真实 HTTP** 把 fixture 回一遍。断言是结构级的：解析两侧 SSE 后
-//! 逐帧逐字段比，外加 HTTP 状态码、错误信封、头注入、并发隔离、首帧延迟 —— 不再数 `event:` 名和子串。
+//! 回放集成测试（票 29 第 7 条铺开成票 30 的整套）：测试自己把**两个进程**
+//! （`gateway-harness` 与 `mock-upstream`）拉起来，走**真实 HTTP** 把 fixture 回一遍。
+//! 断言是结构级的：解析两侧 SSE 后逐帧逐字段比，外加 HTTP 状态码、错误信封、头注入、
+//! 并发隔离、首帧延迟 —— 不再数 `event:` 名和子串。
 //!
 //! 每个 `#[tokio::test]` 各起一份网关与 mock（端口按进程 id + 序号现算），所以它们能并行跑。
 //!
@@ -318,7 +319,10 @@ async fn chunking_invariance_and_header_injection() {
     gw.set_chunks("frame").await;
 
     // ③ 头类 quirk（票 19 §6.3）：mock 回显的**出站请求头**必须真带上。
-    let before = gw.echo().await["echo"].as_array().map(Vec::len).unwrap_or(0);
+    let before = gw.echo().await["echo"]
+        .as_array()
+        .map(Vec::len)
+        .unwrap_or(0);
     let body = |text: &str| {
         json!({"model":"mock-anthropic-text","max_tokens":256,"stream":true,
                "messages":[{"role":"user","content":text}]})
@@ -339,7 +343,7 @@ async fn chunking_invariance_and_header_injection() {
         )
         .await;
 
-    let echo = gw.get_json("/api/echo").await;
+    let echo = gw.echo().await;
     let entries: Vec<&Value> = echo["echo"]
         .as_array()
         .into_iter()
@@ -688,7 +692,7 @@ async fn concurrency_and_session_isolation() {
     check(&mut fails, c.0 == 200, format!("客户端甲 HTTP {}", c.0));
     check(&mut fails, d.0 == 200, format!("客户端乙 HTTP {}", d.0));
 
-    let echo = gw.get_json("/api/echo").await;
+    let echo = gw.echo().await;
     let entries: Vec<Value> = echo["echo"].as_array().cloned().unwrap_or_default();
     let session_of = |text: &str| -> Vec<String> {
         entries
@@ -954,6 +958,7 @@ async fn count_tokens_and_non_streaming() {
 }
 
 /// ⑩ 日志与脱敏（票 19 §10）：默认不写 body、开关开了能捞到、到点自动关、库里与 API 里查不到密钥。
+/// 票 41：日志从**库**里读（票 42 的 `Store` + `obs::recent`），不再经 `GET /api/logs`（归票 43 / 53）。
 #[tokio::test(flavor = "multi_thread")]
 async fn logs_are_metadata_only_and_redacted() {
     let gw = Gateway::start().await;
@@ -962,8 +967,8 @@ async fn logs_are_metadata_only_and_redacted() {
 
     // ① 默认只记元数据：body 列必须是空的。
     let _ = gw.post_messages(&request).await;
-    let logs = gw.get_json("/api/logs").await;
-    let row = logs["logs"][0].clone();
+    let logs = gw.logs(1).await;
+    let row = logs.first().cloned().unwrap_or(Value::Null);
     check(
         &mut fails,
         row["body"].is_null(),
@@ -975,20 +980,20 @@ async fn logs_are_metadata_only_and_redacted() {
         format!("元数据不对：{row}"),
     );
 
-    // ② 已知密钥反查：API 响应与库文件里都不该出现（票 19 §10 ③）。
-    let routes = gw.get_json("/api/routes").await.to_string();
-    let logs_txt = logs.to_string();
+    // ② 已知密钥反查：转发面响应与库文件里都不该出现（票 19 §10 ③）。
+    let routes = gw.get_json("/v1/models").await.to_string();
+    let logs_txt = Value::Array(logs.clone()).to_string();
     let db = gw.db_bytes();
     for secret in [SECRET_OPENCODE, SECRET_COMMANDCODE] {
         check(
             &mut fails,
             !routes.contains(secret),
-            format!("密钥 {secret} 出现在 /api/routes 里"),
+            format!("密钥 {secret} 出现在 /v1/models 里"),
         );
         check(
             &mut fails,
             !logs_txt.contains(secret),
-            format!("密钥 {secret} 出现在 /api/logs 里"),
+            format!("密钥 {secret} 出现在日志行里"),
         );
         check(
             &mut fails,
@@ -1000,7 +1005,7 @@ async fn logs_are_metadata_only_and_redacted() {
     // ③ 开关打开就能捞到 body，且是**发给上游的那一份**（出站请求体）。
     gw.set_body_log(2).await;
     let _ = gw.post_messages(&request).await;
-    let row = gw.get_json("/api/logs").await["logs"][0].clone();
+    let row = gw.logs(2).await.first().cloned().unwrap_or(Value::Null);
     let body = row["body"].as_str().unwrap_or_default().to_string();
     check(
         &mut fails,
@@ -1011,7 +1016,7 @@ async fn logs_are_metadata_only_and_redacted() {
     // ④ 到点自动关（真实窗口 1 小时，测试拨到 2 秒）。
     tokio::time::sleep(Duration::from_millis(2200)).await;
     let _ = gw.post_messages(&request).await;
-    let row = gw.get_json("/api/logs").await["logs"][0].clone();
+    let row = gw.logs(3).await.first().cloned().unwrap_or(Value::Null);
     check(
         &mut fails,
         row["body"].is_null(),
@@ -1256,17 +1261,18 @@ async fn responses_inbound_contract() {
     );
 }
 
-/// ⑪ 台账无缺口（票 19 §9 / 票 30 第 10 条）：README §2 那 7 条「必须写进代码的差异」
-/// 逐条对到一个真实存在的 fixture / 测试函数；空目标或「未覆盖」都算红。
+/// ⑪ 台账无缺口（票 19 §9 / 票 30 第 10 条 / 票 41 第 4 条）：原型 README §2 那 7 条
+/// 「必须写进代码的差异」逐条对到一个真实存在的 fixture / 测试函数；空目标或「未覆盖」都算红。
+/// 票 41：台账搬到了产品侧 `tests/LEDGER.md`（原型那份已冻结，只读）。
 #[test]
 fn ledger_has_no_gaps() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let readme =
-        std::fs::read_to_string(manifest.join("README.md")).expect("读不到 prototype/README.md");
+    let ledger = std::fs::read_to_string(manifest.join("tests").join("LEDGER.md"))
+        .expect("读不到 crates/gateway-core/tests/LEDGER.md");
 
-    // README §2 本身必须是 7 条。
-    let section2 = section_of(&readme, "## 2.", "## 3.");
-    let items = section2
+    // 「必须进代码的差异」清单本身必须是 7 条。
+    let diff = section_of(&ledger, "## 差异清单", "## 台账");
+    let items = diff
         .lines()
         .filter(|l| {
             let t = l.trim_start();
@@ -1275,14 +1281,11 @@ fn ledger_has_no_gaps() {
                 && t.contains(". ")
         })
         .count();
-    assert_eq!(
-        items, 7,
-        "README §2 应该有 7 条必须进代码的差异，实际 {items}"
-    );
+    assert_eq!(items, 7, "台账的差异清单应该有 7 条，实际 {items}");
 
-    let ledger = section_of(&readme, "## 8.", "## 9.");
+    let table = section_of(&ledger, "## 台账", "## 明确不覆盖");
     let mut rows = 0usize;
-    for line in ledger.lines() {
+    for line in table.lines() {
         let t = line.trim();
         if !t.starts_with('|') {
             continue;

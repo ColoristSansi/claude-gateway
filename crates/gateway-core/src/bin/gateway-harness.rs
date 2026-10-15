@@ -41,10 +41,8 @@ const ERROR_CODES: [&str; 4] = ["401", "403", "429", "500"];
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let root = std::env::var("GATEWAY_ROOT").unwrap_or_else(|_| ".".into());
-    let env_path = std::env::var("GATEWAY_ENV")
-        .unwrap_or_else(|_| format!("{root}/upstreams.env"));
-    let data_dir =
-        std::env::var("GATEWAY_DATA_DIR").unwrap_or_else(|_| format!("{root}/data"));
+    let env_path = std::env::var("GATEWAY_ENV").unwrap_or_else(|_| format!("{root}/upstreams.env"));
+    let data_dir = std::env::var("GATEWAY_DATA_DIR").unwrap_or_else(|_| format!("{root}/data"));
     let env = Env::load(&env_path);
     let port = env
         .port
@@ -137,8 +135,16 @@ async fn main() -> anyhow::Result<()> {
     for (name, up, model) in [
         ("claude-fable", "opencode", "deepseek-v4.1-flash"),
         ("claude-opus", "opencode", "deepseek-v4.1-flash"),
-        ("claude-sonnet", "commandcode", "deepseek/deepseek-v4.1-flash"),
-        ("claude-haiku", "commandcode", "deepseek/deepseek-v4.1-flash"),
+        (
+            "claude-sonnet",
+            "commandcode",
+            "deepseek/deepseek-v4.1-flash",
+        ),
+        (
+            "claude-haiku",
+            "commandcode",
+            "deepseek/deepseek-v4.1-flash",
+        ),
     ] {
         push(name.into(), up, model.into(), "openai", true);
     }
@@ -148,9 +154,19 @@ async fn main() -> anyhow::Result<()> {
         ("oc-deepseek", "opencode", "deepseek-v4.1-flash", "openai"),
         ("cc-sonnet", "commandcode", "claude-sonnet-5-5", "anthropic"),
         // 负例 1：opencode 的 Anthropic 端点与 Chat 端点凭据不同 → 401。
-        ("oc-anthropic-unauth", "opencode", "claude-haiku-5-5", "anthropic"),
+        (
+            "oc-anthropic-unauth",
+            "opencode",
+            "claude-haiku-5-5",
+            "anthropic",
+        ),
         // 负例 2：commandcode 的 opus 不在本计划内 → 403 MODEL_NOT_IN_PLAN。
-        ("cc-opus-no-plan", "commandcode", "claude-opus-5", "anthropic"),
+        (
+            "cc-opus-no-plan",
+            "commandcode",
+            "claude-opus-5",
+            "anthropic",
+        ),
         // 负例 3：故意错配 wire，验证 ClaudeModelsOnAnthropicOnly 这条 quirk 真的会拦。
         ("cc-opus-on-chat", "commandcode", "claude-opus-5", "openai"),
     ] {
@@ -212,7 +228,10 @@ async fn main() -> anyhow::Result<()> {
     let mut gw = Gateway::new(store, upstreams, routes);
     gw.ping = Duration::from_secs(env_u64("GATEWAY_PING_SECS", 15));
     gw.probe = Duration::from_secs(env_u64("GATEWAY_PROBE_SECS", 20));
-    if std::env::var("GATEWAY_LOG_BODY").map(|v| v == "1").unwrap_or(false) {
+    if std::env::var("GATEWAY_LOG_BODY")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
         gw.set_body_log(BODY_LOG_WINDOW.as_secs());
     }
     let state = Arc::new(gw);
