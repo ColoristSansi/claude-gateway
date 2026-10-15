@@ -21,7 +21,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 
-mod dpapi;
+// 导出 / 导入（票 62）要按「上游 × wire」解 / 加明文密钥，走的就是这里唯一的加解密入口。
+pub(crate) mod dpapi;
 mod schema;
 #[cfg(test)]
 mod tests;
