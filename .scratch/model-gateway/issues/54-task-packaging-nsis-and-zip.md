@@ -148,7 +148,7 @@ Start-Process "$env:LOCALAPPDATA\Claude Gateway\uninstall.exe" -ArgumentList '/S
 ### 遗留与坑
 
 - **并行票会互相抢 8787 与单实例互斥量**：验收期间票 44 的实例（`%TEMP%\cg44\cg44.exe`）正占着 8787。`tauri-plugin-single-instance` 的互斥量按 identifier 命名（票 18 §2 明确不开 semver feature），**所有构建的 Claude Gateway 共用一个互斥量**，所以两个票的实例不能同时跑。本次做法：等它退出后再跑，并且每次都核对「监听 8787 的进程 exe 路径 == 刚启动的 exe」，防止别的实例抢答。中途为绕开占用曾临时把端口写进共享数据目录的 `config.json`（跑完已删除，`Test-Path config.json = False` 已核）；最终证据全部是 8787 上的。
-- **卸载后保留一个注册表键**：`HKCU\Software\claudegateway\Claude Gateway` 的默认值（安装位置）在默认路径下不删（`installer.nsi:880` 在「勾选删数据」分支里），下次安装会用它复用目录（`RestorePreviousInstallLocation`）。无副作用，但要知道。
+- **卸载后保留一个注册表键**：`HKCU\Software\claudegateway\Claude Gateway` 的默认值（安装位置）在默认路径下不删（`installer.nsi:880` 在「勾选删数据」分支里），下次安装会用它复用目录（`RestorePreviousInstallLocation`）。无副作用，但要知道。验收跑完已手工 `reg delete HKCU\Software\claudegateway /f` 清掉这次安装留下的这个键，机器恢复原状（安装目录无、数据目录在、没有跑着的 gateway 进程、8787 空闲）。
 - **CI 的 bundle job 本地验不了**（要 GitHub runner + tag）：pnpm 钉 12.10.1、tauri-cli 钉 2.12.2（与本机一致）；`latest.json` 只是占位，真签名/升级在票 61。
 - **静默装/卸不写 `Installer Language`**（没有语言选择页，跟随系统）→ 界面语言只能靠人眼确认。
 - 卸载时的「还原客户端配置」（`--restore-clients --silent`）**本票没做**，归票 62；现在的卸载器不碰任何客户端配置。
