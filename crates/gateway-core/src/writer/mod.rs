@@ -47,6 +47,7 @@
 
 mod atomic;
 mod backup;
+pub mod codex;
 mod doc;
 mod engine;
 pub mod instance;
@@ -54,6 +55,8 @@ mod log;
 mod plan;
 mod state;
 
+#[cfg(test)]
+mod codex_tests;
 #[cfg(test)]
 mod tests;
 
