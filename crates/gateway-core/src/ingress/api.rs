@@ -9,6 +9,17 @@
 //! - 业务能力**全部复用已有公开 API**：`egress::provider`（票 49）、`egress::discovery`（票 50）、
 //!   `binding`（票 51）、`writer` 三客户端（票 45–48）、`clients`（本票的装配层）。这里不重写。
 //! - 界面侧只看到掩码：`/api/*` 的响应里**永远没有密钥明文**（spec §9 / 票 17 第 82 条）。
+//!
+//! 票 53 在这里挂日志与用量基础（日志页与概览要的那半，合并时原样保留）：
+//!
+//! | 端点 | 用途 |
+//! | --- | --- |
+//! | `GET /api/logs` | 元数据表格：时间倒序 50 条 + 四个筛选 + 模型名 / 请求 ID 搜索 + 翻页 |
+//! | `GET /api/logs/filters` | 筛选下拉的候选值（库里真出现过的） |
+//! | `GET/POST /api/logs/body-recording` | body 开关（默认关、开启需隐私确认、1 小时自动关） |
+//! | `GET /api/usage/summary` | 概览要的今日 / 近 7 天 × 虚拟模型 / 上游（票 53 的统计层） |
+//!
+//! 详情四段（`GET /api/logs/:requestId`）、五个时间范围与按天明细归票 59。
 
 pub mod bindings;
 pub mod clients;
@@ -22,15 +33,16 @@ use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::binding::BindingTable;
+use crate::obs::{self, BodyLogWindow, LogQuery, BODY_LOG_WINDOW};
 use crate::clients::{ClientEnv, ClientId, GatewayValues};
 use crate::store::{settings_keys, Store};
 use crate::writer::claude_code::ModelSlots;
@@ -114,6 +126,7 @@ impl AdminCtx {
             real_port: Arc::new(AtomicU16::new(0)),
         }
     }
+
 
     /// 挂上转发面（外壳与集成测试）；改配置的端点会经 [`AdminCtx::reload_forwarding`] 让它
     /// **立刻看到新表**，不必重启网关。
@@ -225,6 +238,9 @@ impl AdminCtx {
 }
 
 /// 管理 API 的共享状态。`running` 由服务生命周期翻转（`service::Gateway`）。
+///
+/// `logs` 只在转发面挂上时才有（日志库与 body 窗口都在 [`crate::ingress::proxy::Gateway`] 里，
+/// 票 53 用 [`ApiState::attach_logs`] 接过来，不另开第二个窗口实例）。
 #[derive(Clone)]
 pub struct ApiState {
     version: String,
@@ -233,6 +249,14 @@ pub struct ApiState {
     started_at: SystemTime,
     running: Arc<AtomicBool>,
     admin: Option<Arc<AdminCtx>>,
+    logs: Option<LogsState>,
+}
+
+/// 日志面的两个句柄（票 53；与转发路径共用同一个 body 窗口实例）。
+#[derive(Clone)]
+struct LogsState {
+    store: Store,
+    body_log: Arc<BodyLogWindow>,
 }
 
 impl ApiState {
@@ -245,8 +269,19 @@ impl ApiState {
             started_at: SystemTime::now(),
             running: Arc::new(AtomicBool::new(true)),
             admin: None,
+            logs: None,
         }
     }
+
+    /// 票 53：把转发面的日志库与 body 窗口接过来（日志页上的开关就是转发路径读的那个）。
+    pub fn attach_logs(mut self, forwarding: &crate::ingress::proxy::Gateway) -> Self {
+        self.logs = Some(LogsState {
+            store: forwarding.store.clone(),
+            body_log: forwarding.body_log.clone(),
+        });
+        self
+    }
+
 
     /// 带上管理面上下文（外壳与集成测试走这条）。
     pub fn with_admin(mut self, admin: Arc<AdminCtx>) -> Self {
@@ -302,6 +337,14 @@ pub struct GatewayStatus {
 pub fn router(state: ApiState) -> Router {
     Router::new()
         .route("/api/status", get(status))
+        // 票 53：日志页（表 / 筛选候选 / body 开关）与概览的用量汇总（合并时原样保留）。
+        .route("/api/logs", get(logs))
+        .route("/api/logs/filters", get(log_filters))
+        .route(
+            "/api/logs/body-recording",
+            get(body_recording).post(set_body_recording),
+        )
+        .route("/api/usage/summary", get(usage_summary))
         .merge(overview::routes())
         .merge(upstreams::routes())
         .merge(bindings::routes())
@@ -434,54 +477,178 @@ pub fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
-/// 本地时区的当日 00:00（Unix 秒）。**日边界按本机本地时区自然日**（spec §10 第 6 节）。
+/// `GET /api/logs` 的查询串。空串当没传（界面清空输入框时就是空串）。
+#[derive(Debug, Default, Deserialize)]
+struct LogParams {
+    limit: Option<usize>,
+    cursor: Option<i64>,
+    client: Option<String>,
+    upstream: Option<String>,
+    virtual_model: Option<String>,
+    status: Option<String>,
+    q: Option<String>,
+}
+
+/// 空串 → `None`：`?client=` 与不带这个参数是同一件事。
+fn non_empty(v: Option<String>) -> Option<String> {
+    v.filter(|s| !s.trim().is_empty())
+}
+
+/// 日志元数据表格：时间倒序，缺省 50 条；四个筛选维度 + 模型名 / 请求 ID 搜索 + 游标翻页。
 ///
-/// shortcut: 只对当前进程所在时区生效、不处理跨年边界的历史时刻（用量页只问「今日 / 近 N 天」）。
-#[cfg(windows)]
-pub fn local_day_start(now: i64) -> i64 {
-    use windows_sys::Win32::Foundation::SYSTEMTIME;
-    use windows_sys::Win32::System::SystemInformation::GetLocalTime;
-    let mut st: SYSTEMTIME = unsafe { std::mem::zeroed() };
-    unsafe { GetLocalTime(&mut st) };
-    // 本地墙钟 → 它的 UTC 偏移：拿同一个时刻的 UTC 本地分解算差值。
-    let offset = local_offset_secs(&st);
-    let local_now = now + offset;
-    let day = local_now.div_euclid(86_400) * 86_400;
-    day - offset
+/// `next_cursor` 只在**这一页满了**时给（等于最后一行的 `id`），界面上「加载更多」拿它再要一页。
+/// `rate` 是库里的美元→人民币汇率（票 33 第 2 节：库内美元为锚，界面按当前汇率换算）。
+async fn logs(State(state): State<ApiState>, Query(p): Query<LogParams>) -> Response {
+    let Some(logs) = &state.logs else {
+        return unavailable();
+    };
+    let limit = p.limit.filter(|v| *v > 0).unwrap_or(obs::DEFAULT_PAGE);
+    let query = LogQuery {
+        limit: Some(limit),
+        cursor: p.cursor,
+        client: non_empty(p.client),
+        upstream: non_empty(p.upstream),
+        virtual_model: non_empty(p.virtual_model),
+        status: non_empty(p.status),
+        q: non_empty(p.q),
+    };
+    match obs::list(&logs.store, &query).await {
+        Ok(rows) => {
+            let next_cursor = (rows.len() >= limit.min(500))
+                .then(|| rows.last().and_then(|r| r["id"].as_i64()))
+                .flatten();
+            Json(json!({
+                "logs": rows,
+                "limit": limit,
+                "next_cursor": next_cursor,
+                "rate": obs::usd_cny_rate(&logs.store).await.unwrap_or(None),
+                "retention_days": obs::retention_days(&logs.store).await.unwrap_or(obs::DEFAULT_RETENTION_DAYS),
+            }))
+            .into_response()
+        }
+        Err(e) => failed(format!("读日志失败：{e}")),
+    }
 }
 
-#[cfg(not(windows))]
-pub fn local_day_start(now: i64) -> i64 {
-    now.div_euclid(86_400) * 86_400
+/// 筛选下拉的候选值（客户端 / 上游 / 虚拟模型来自库，状态码四档固定）。
+async fn log_filters(State(state): State<ApiState>) -> Response {
+    let Some(logs) = &state.logs else {
+        return unavailable();
+    };
+    match obs::filters(&logs.store).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => failed(format!("读筛选候选失败：{e}")),
+    }
 }
 
-#[cfg(windows)]
-fn local_offset_secs(st: &windows_sys::Win32::Foundation::SYSTEMTIME) -> i64 {
-    // 手头这一刻的本地时间与 UTC 时间之差；同一时刻取两次，精度到秒，跨秒误差最多 1 秒。
-    let local = ymd_to_unix(
-        st.wYear as i64,
-        st.wMonth as i64,
-        st.wDay as i64,
-        st.wHour as i64,
-        st.wMinute as i64,
-        st.wSecond as i64,
-    );
-    let utc = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    local - utc
+/// `POST /api/logs/body-recording` 的请求体。
+///
+/// `seconds` 是窗口长度，缺省 = 1 小时；**上限就是 1 小时**（spec：开启后 1 小时自动关，
+/// 界面没有「一直开着」这个选项）。测试用它把窗口拨短。
+#[derive(Debug, Deserialize)]
+struct BodyRecordingBody {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    consent: bool,
+    seconds: Option<u64>,
 }
 
-/// 民用历法 → Unix 秒（days_from_civil，与 [`rfc3339_utc`] 同一套换算）。
-fn ymd_to_unix(y: i64, m: i64, d: i64, hh: i64, mm: i64, ss: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let mp = if m > 2 { m - 3 } else { m + 9 };
-    let doy = (153 * mp + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    (era * 146_097 + doe - 719_468) * 86_400 + hh * 3_600 + mm * 60 + ss
+/// body 开关的当前状态（含还剩几秒自动关）。
+async fn body_recording(State(state): State<ApiState>) -> Response {
+    let Some(logs) = &state.logs else {
+        return unavailable();
+    };
+    Json(state_json(&logs.body_log, &logs.store).await).into_response()
+}
+
+/// 开 / 关 body 开关。**开启必须带一次隐私确认**（`consent: true`），否则 400 不动开关。
+async fn set_body_recording(
+    State(state): State<ApiState>,
+    Json(body): Json<BodyRecordingBody>,
+) -> Response {
+    let Some(logs) = &state.logs else {
+        return unavailable();
+    };
+    if body.enabled {
+        if !body.consent {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": {
+                    "type": "consent_required",
+                    "message": "开启「记录完整 body」前需要一次隐私确认：请求与响应体会明文存进本机 SQLite，随日志一起保留若干天后自动清理。",
+                }})),
+            )
+                .into_response();
+        }
+        let window = body
+            .seconds
+            .filter(|s| *s > 0)
+            .unwrap_or(BODY_LOG_WINDOW.as_secs())
+            .min(BODY_LOG_WINDOW.as_secs());
+        logs.body_log.set(window);
+    } else {
+        logs.body_log.set(0);
+    }
+    Json(state_json(&logs.body_log, &logs.store).await).into_response()
+}
+
+/// 开关状态 + 保留期（界面要说清「明文存本机 SQLite、保留 N 天」）。
+async fn state_json(body_log: &BodyLogWindow, store: &Store) -> serde_json::Value {
+    json!({
+        "on": body_log.on(),
+        "seconds_remaining": body_log.seconds_remaining(),
+        "window_seconds": BODY_LOG_WINDOW.as_secs(),
+        "retention_days": obs::retention_days(store).await.unwrap_or(obs::DEFAULT_RETENTION_DAYS),
+    })
+}
+
+/// `GET /api/usage/summary?range=today|7d&dim=virtual_model|upstream|client`（概览要的那半）。
+async fn usage_summary(
+    State(state): State<ApiState>,
+    Query(p): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let Some(logs) = &state.logs else {
+        return unavailable();
+    };
+    let range = p.get("range").map(String::as_str).unwrap_or("today");
+    let dim = p.get("dim").map(String::as_str).unwrap_or("virtual_model");
+    match obs::usage_summary(&logs.store, range, dim).await {
+        Ok(mut v) => {
+            if let Some(o) = v.as_object_mut() {
+                o.insert(
+                    "rate".into(),
+                    json!(obs::usd_cny_rate(&logs.store).await.unwrap_or(None)),
+                );
+            }
+            Json(v).into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": {"type": "invalid_request_error", "message": e.to_string()}})),
+        )
+            .into_response(),
+    }
+}
+
+/// 转发面没挂上（库开不了 / 上游表读不出）时日志面也没有数据源：502 比空表诚实。
+fn unavailable() -> Response {
+    failed_status(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "日志面不可用：转发面未挂载（库或上游表读不出来）".to_string(),
+    )
+}
+
+fn failed(message: String) -> Response {
+    failed_status(StatusCode::INTERNAL_SERVER_ERROR, message)
+}
+
+fn failed_status(code: StatusCode, message: String) -> Response {
+    (
+        code,
+        Json(json!({"error": {"type": "api_error", "message": message}})),
+    )
+        .into_response()
 }
 
 /// 手写历法换算（Howard Hinnant 的 civil_from_days），不为一个时间戳引日期库。
@@ -558,18 +725,5 @@ mod tests {
         }
     }
 
-    #[test]
-    fn civil_conversion_round_trips_with_rfc3339() {
-        // 用独立来源（历法本身）验：1970-01-01 与 2000-02-29 两个已知瞬间。
-        assert_eq!(ymd_to_unix(1970, 1, 1, 0, 0, 0), 0);
-        assert_eq!(ymd_to_unix(2000, 2, 29, 0, 0, 0), 951_782_400);
-    }
 
-    #[test]
-    fn local_day_start_is_aligned_to_a_day() {
-        let now = 1_792_066_312; // 2026-10-15T12:11:52Z
-        let start = local_day_start(now);
-        assert!(start <= now && now - start < 86_400, "{start} vs {now}");
-        assert_eq!((now - start) % 60, 52 % 60, "同一天内的秒内偏移应当一致");
-    }
 }

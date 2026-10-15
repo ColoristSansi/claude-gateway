@@ -101,6 +101,9 @@ pub fn decode_request(v: &Value) -> Result<IrRequest> {
         stop,
         thinking: obj.get("thinking").cloned(),
         metadata: obj.get("metadata").cloned(),
+        // 票 57：`output_config.format` 归一化进 IR；`output_config` 本身仍走 `extra`
+        // （它的兄弟键 `effort` 不在本票的契约里，原样带过比丢掉好）。
+        format: crate::ir::ResponseFormat::from_anthropic_request(obj),
         extra,
         // Anthropic 入站没有自由格式工具这个概念（票 32 只从 Responses 侧引入）。
         freeform_tools: Vec::new(),

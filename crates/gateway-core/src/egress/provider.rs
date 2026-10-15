@@ -286,6 +286,67 @@ pub struct SelfCheck {
     pub ok: bool,
 }
 
+/// 结构化输出能力位（spec §6；票 37 定案 4 / 票 57 落地）：粒度 = **上游 × 出站协议**。
+///
+/// 它存在的唯一理由是**状态码骗人**：实测 commandcode 的 Anthropic 兼容端点对
+/// `output_config.format` 的 6 个变体全 200 且逐字静默忽略，所以「认不认」只能靠自检探针
+/// （[`crate::egress::structured::probe`]）判。wire 级事实进表、**不进 quirks**。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StructuredOutput {
+    /// 缺省：这一面认结构化输出字段。
+    Native,
+    /// 这一面会**静默忽略**结构化输出字段：客户端要结构化输出 → 请求期 400 并说明。
+    Ignore,
+}
+
+impl StructuredOutput {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            StructuredOutput::Native => "native",
+            StructuredOutput::Ignore => "ignore",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<StructuredOutput> {
+        match s {
+            "native" => Some(StructuredOutput::Native),
+            "ignore" => Some(StructuredOutput::Ignore),
+            _ => None,
+        }
+    }
+}
+
+/// 能力位的来源（spec §6）：手工标的 / 自检探针判的。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StructuredSource {
+    Manual,
+    Selfcheck,
+}
+
+impl StructuredSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            StructuredSource::Manual => "manual",
+            StructuredSource::Selfcheck => "selfcheck",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<StructuredSource> {
+        match s {
+            "manual" => Some(StructuredSource::Manual),
+            "selfcheck" => Some(StructuredSource::Selfcheck),
+            _ => None,
+        }
+    }
+}
+
+/// 一条「上游 × wire」的能力位记录：两态 + 来源。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StructuredCapability {
+    pub mode: StructuredOutput,
+    pub source: StructuredSource,
+}
+
 // ───────────────────────── 上游（声明式表） ─────────────────────────
 
 /// `upstreams` 一行。四个 wire 面共用一张卡、一个 `baseUrl`、一次自检（ADR-0004 第 1 条）。
@@ -299,6 +360,11 @@ pub struct Upstream {
     pub path_templates: BTreeMap<Wire, String>,
     pub header_passthrough: Vec<String>,
     pub quirks: Vec<Quirk>,
+    /// 结构化输出能力位，键 = wire（spec §6；票 57）。**没有记录 = `native`（缺省）**。
+    ///
+    /// 与 `last_pull` / `last_selfcheck` 同类：运行期事实，不在 [`save_upstream`] 的写入范围里
+    /// （改路径模板不该把自检判出来的结论冲掉），写入口是 [`set_structured_output`]。
+    pub structured_output: BTreeMap<Wire, StructuredCapability>,
     /// 运行期事实，不在 [`save_upstream`] 的写入范围里。
     pub last_pull: Option<PullState>,
     pub last_selfcheck: Option<SelfCheck>,
@@ -325,6 +391,7 @@ impl Upstream {
             path_templates,
             header_passthrough: Vec::new(),
             quirks: Vec::new(),
+            structured_output: BTreeMap::new(),
             last_pull: None,
             last_selfcheck: None,
         }
@@ -374,6 +441,19 @@ impl Upstream {
         self.quirks
             .iter()
             .any(|x| std::mem::discriminant(x) == std::mem::discriminant(q))
+    }
+
+    /// 这一面的结构化输出能力位；**没记录 = `native`**（缺省，spec §6）。
+    pub fn structured_output(&self, wire: Wire) -> StructuredOutput {
+        self.structured_output
+            .get(&wire)
+            .map(|c| c.mode)
+            .unwrap_or(StructuredOutput::Native)
+    }
+
+    /// 这一面的能力位记录；`None` = 从没判过（界面要区分「没判过」与「判过是 native」）。
+    pub fn structured_capability(&self, wire: Wire) -> Option<StructuredCapability> {
+        self.structured_output.get(&wire).copied()
     }
 
     /// `pathTemplates` 的 `wire=路径` 清单，反查警告里要报「我们期望的路径」。
@@ -733,6 +813,7 @@ fn upstream_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Upstream> {
     let sc_at: Option<i64> = r.get(10)?;
     let sc_status: Option<String> = r.get(11)?;
     let pull_ok_at: Option<i64> = r.get(12)?;
+    let structured_json: String = r.get(13)?;
 
     let mut auth = BTreeMap::new();
     if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&auth_json) {
@@ -780,6 +861,7 @@ fn upstream_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Upstream> {
         at,
         ok: sc_status.as_deref() == Some("ok"),
     });
+    let structured_output = structured_from_json(&structured_json);
 
     Ok(Upstream {
         id,
@@ -789,14 +871,39 @@ fn upstream_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Upstream> {
         path_templates,
         header_passthrough,
         quirks,
+        structured_output,
         last_pull,
         last_selfcheck,
     })
 }
 
+/// `structured_output_json` 的形状：`{"<wire>": {"mode":"native|ignore","source":"manual|selfcheck"}}`。
+/// 认不出的键与值一律忽略（脏行不让整条上游不可用，与 `quirks` 同一条口径）。
+fn structured_from_json(text: &str) -> BTreeMap<Wire, StructuredCapability> {
+    let mut out = BTreeMap::new();
+    let Ok(Value::Object(map)) = serde_json::from_str::<Value>(text) else {
+        return out;
+    };
+    for (wire, v) in map {
+        let (Some(wire), Some(mode), Some(source)) = (
+            Wire::parse(&wire),
+            v.get("mode")
+                .and_then(Value::as_str)
+                .and_then(StructuredOutput::parse),
+            v.get("source")
+                .and_then(Value::as_str)
+                .and_then(StructuredSource::parse),
+        ) else {
+            continue;
+        };
+        out.insert(wire, StructuredCapability { mode, source });
+    }
+    out
+}
+
 const UPSTREAM_COLS: &str = "id,name,base_url,auth_json,path_templates_json,header_passthrough_json,
      quirks_json,last_pull_at,last_pull_status,last_pull_warning,last_selfcheck_at,last_selfcheck_status,
-     last_pull_ok_at";
+     last_pull_ok_at,structured_output_json";
 
 pub async fn load_upstream(store: &Store, id: &str) -> Result<Option<Upstream>> {
     let id = id.to_string();
@@ -874,6 +981,52 @@ pub async fn set_selfcheck_result(store: &Store, id: &str, ok: bool, at: i64) ->
             c.execute(
                 "UPDATE upstreams SET last_selfcheck_at=?2,last_selfcheck_status=?3 WHERE id=?1",
                 params![id, at, status],
+            )?;
+            Ok(())
+        })
+        .await
+}
+
+/// 记一条「上游 × 出站协议」的结构化输出能力位（票 57）。
+///
+/// 单独一个写入口的理由与 `last_selfcheck_*` 同源：它是**运行期事实**（自检判出来的），
+/// 挤进 [`save_upstream`] 会让「改一次路径模板」把结论冲掉。`source` 区分手工标的与探针判的。
+pub async fn set_structured_output(
+    store: &Store,
+    upstream_id: &str,
+    wire: Wire,
+    mode: StructuredOutput,
+    source: StructuredSource,
+) -> Result<()> {
+    let upstream_id = upstream_id.to_string();
+    store
+        .write(move |c| {
+            let current: Option<String> = c
+                .query_row(
+                    "SELECT structured_output_json FROM upstreams WHERE id=?1",
+                    params![upstream_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let Some(current) = current else {
+                bail!("上游 {upstream_id} 不在库里，能力位没处落");
+            };
+            let mut map = structured_from_json(&current);
+            map.insert(wire, StructuredCapability { mode, source });
+            let json = Value::Object(
+                map.iter()
+                    .map(|(w, c)| {
+                        (
+                            w.as_str().to_string(),
+                            json!({"mode": c.mode.as_str(), "source": c.source.as_str()}),
+                        )
+                    })
+                    .collect(),
+            )
+            .to_string();
+            c.execute(
+                "UPDATE upstreams SET structured_output_json=?2 WHERE id=?1",
+                params![upstream_id, json],
             )?;
             Ok(())
         })
@@ -1234,26 +1387,34 @@ pub async fn resolved_prices(
 ) -> Result<ResolvedPrices> {
     let (upstream_id, model_id) = (upstream_id.to_string(), model_id.to_string());
     store
-        .read(move |c| {
-            let mut st = c.prepare(
-                "SELECT price_input_usd,price_output_usd,price_cache_read_usd,price_cache_write_usd
-                   FROM upstream_models WHERE upstream_id=?1 AND model_id=?2",
-            )?;
-            let mut rows = st.query(params![upstream_id, model_id])?;
-            let manual = match rows.next()? {
-                Some(r) => Prices {
-                    input: r.get(0)?,
-                    output: r.get(1)?,
-                    cache_read: r.get(2)?,
-                    cache_write: r.get(3)?,
-                },
-                None => Prices::default(),
-            };
-            drop(rows);
-            let snapshot = snapshot_prices(c, &upstream_id, &model_id)?;
-            Ok(resolve_prices(&manual, snapshot.as_ref()))
-        })
+        .read(move |c| resolved_prices_from(c, &upstream_id, &model_id))
         .await
+}
+
+/// 同上，但用调用方手里那条连接（票 53：日志写入路径要在**同一个事务/同一条连接**里取当时价，
+/// 不能为一行日志再排一次读队列——那会让「请求时冻结」与「落库」之间多一个窗口）。
+pub fn resolved_prices_from(
+    c: &Connection,
+    upstream_id: &str,
+    model_id: &str,
+) -> Result<ResolvedPrices> {
+    let mut st = c.prepare(
+        "SELECT price_input_usd,price_output_usd,price_cache_read_usd,price_cache_write_usd
+           FROM upstream_models WHERE upstream_id=?1 AND model_id=?2",
+    )?;
+    let mut rows = st.query(params![upstream_id, model_id])?;
+    let manual = match rows.next()? {
+        Some(r) => Prices {
+            input: r.get(0)?,
+            output: r.get(1)?,
+            cache_read: r.get(2)?,
+            cache_write: r.get(3)?,
+        },
+        None => Prices::default(),
+    };
+    drop(rows);
+    let snapshot = snapshot_prices(c, upstream_id, model_id)?;
+    Ok(resolve_prices(&manual, snapshot.as_ref()))
 }
 
 // ───────────────────────── models.dev 快照 ─────────────────────────

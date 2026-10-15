@@ -20,6 +20,7 @@ use serde_json::{json, Value};
 
 use crate::anthropic::{self, AnthropicAssembler, AnthropicDecoder, AnthropicEncoder};
 use crate::egress::provider::{AuthScheme, EarlyReject, Quirk, Upstream, UpstreamModel, Wire};
+use crate::egress::structured;
 use crate::ingress::proxy::Gateway;
 use crate::ir::{IrEvent, IrRequest};
 use crate::obs::{self, RequestLog};
@@ -36,6 +37,17 @@ type ByteStream =
 pub enum Inbound {
     Anthropic,
     Responses,
+}
+
+impl Inbound {
+    /// 入站协议对应的出站 wire：结构化输出的 `ResponseFormat::Other` 只在「与入站同形状」的
+    /// wire 上原样带，这个映射就是那条判据（Ollama 面没有出站 wire，将来传 `None`）。
+    pub fn format_origin(self) -> Option<Wire> {
+        match self {
+            Inbound::Anthropic => Some(Wire::Anthropic),
+            Inbound::Responses => Some(Wire::OpenAiResponses),
+        }
+    }
 }
 
 enum Decoder {
@@ -240,11 +252,27 @@ pub async fn forward_buffered(
     let Some(url) = up.url(wire) else {
         return wire_not_implemented(wire, inbound, &up.id);
     };
-    let body = match wire {
+    let mut body = match wire {
         Wire::Anthropic => anthropic::encode_request(&req, true),
         Wire::OpenAiChat => openai::encode_request(&req, true),
         Wire::OpenAiResponses => return wire_not_implemented(wire, inbound, &up.id),
     };
+    // 票 57：结构化输出的两条请求期 400（表达不了 / 能力位 ignore）在这里落地：body 就在这一步
+    // 组装，所以判据也只能在这里——关键是它排在**发出任何字节之前**。
+    if let Err(rej) = structured::apply(
+        &mut body,
+        req.format.as_ref(),
+        wire,
+        up.structured_output(wire),
+        inbound.format_origin(),
+    ) {
+        return error_response_for(
+            inbound,
+            StatusCode::from_u16(rej.status).unwrap_or(StatusCode::BAD_REQUEST),
+            rej.error_type,
+            &rej.message,
+        );
+    }
     let t0 = Instant::now();
     let sent = with_deadline(
         request(
@@ -349,6 +377,7 @@ pub async fn forward_buffered(
     };
     let row = RequestLog {
         ts: 0,
+        request_id: None,
         virtual_model: client_model.clone(),
         client: Some(client.clone()),
         upstream_id: up.id.clone(),
@@ -429,11 +458,26 @@ pub async fn forward(
     let Some(url) = up.url(wire) else {
         return wire_not_implemented(wire, inbound, &up.id);
     };
-    let body = match wire {
+    let mut body = match wire {
         Wire::Anthropic => anthropic::encode_request(&req, true),
         Wire::OpenAiChat => openai::encode_request(&req, true),
         Wire::OpenAiResponses => return wire_not_implemented(wire, inbound, &up.id),
     };
+    // 票 57：与 `forward_buffered` 同一套判据（两条出口共用，免得某条忘了拦）。
+    if let Err(rej) = structured::apply(
+        &mut body,
+        req.format.as_ref(),
+        wire,
+        up.structured_output(wire),
+        inbound.format_origin(),
+    ) {
+        return error_response_for(
+            inbound,
+            StatusCode::from_u16(rej.status).unwrap_or(StatusCode::BAD_REQUEST),
+            rej.error_type,
+            &rej.message,
+        );
+    }
 
     let seed = first_user_text(&req);
     let rb = with_deadline(

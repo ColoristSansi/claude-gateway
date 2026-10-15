@@ -16,14 +16,13 @@ use crate::clients::{ClientId, ClientState};
 use crate::egress::discovery;
 use crate::store::Store;
 
-use super::{admin, local_day_start, ok_json, unix_now, AdminCtx, ApiError, ApiFailure, ApiState};
+use super::{admin, ok_json, AdminCtx, ApiError, ApiFailure, ApiState};
 
 pub fn routes() -> Router<ApiState> {
     Router::new()
         .route("/api/sidebar/badges", get(badges))
         .route("/api/errors/recent", get(recent_errors))
         .route("/api/diagnostics/copy", post(diagnostics))
-        .route("/api/usage/summary", get(usage_summary))
         .route("/api/acceptance/run", post(run_acceptance))
 }
 
@@ -317,114 +316,6 @@ async fn credential_leak_check(store: &Store, text: &str) -> Option<String> {
         }
     }
     None
-}
-
-#[derive(serde::Deserialize)]
-struct UsageQuery {
-    range: Option<String>,
-    dim: Option<String>,
-}
-
-/// 用量汇总：概览用 `range=today|7d`，用量页（票 59）用更长的档。
-/// **同一份实现**（frontend.md 第 10 / 39 条是同一份数据两种粒度）。
-async fn usage_summary(
-    State(state): State<ApiState>,
-    Query(q): Query<UsageQuery>,
-) -> Result<Json<Value>, ApiFailure> {
-    let admin = admin(&state)?;
-    let range = q.range.unwrap_or_else(|| "today".to_string());
-    let dim = q.dim.unwrap_or_else(|| "virtual_model".to_string());
-    if !["virtual_model", "upstream", "client"].contains(&dim.as_str()) {
-        return Err(ApiFailure::new(
-            StatusCode::BAD_REQUEST,
-            ApiError::new(
-                StatusCode::BAD_REQUEST,
-                format!("未知的维度：{dim}"),
-                "维度只有 virtual_model / upstream / client 三个",
-            ),
-        ));
-    }
-    let now = unix_now();
-    let since = match range.as_str() {
-        "today" => local_day_start(now),
-        "7d" => local_day_start(now) - 6 * 86_400,
-        "30d" => local_day_start(now) - 29 * 86_400,
-        "all" => 0,
-        other => {
-            return Err(ApiFailure::new(
-                StatusCode::BAD_REQUEST,
-                ApiError::new(
-                    StatusCode::BAD_REQUEST,
-                    format!("未知的时间范围：{other}"),
-                    "范围只有 today / 7d / 30d / all",
-                ),
-            ))
-        }
-    };
-    let column = match dim.as_str() {
-        "upstream" => "upstream_id",
-        "client" => "client",
-        _ => "virtual_model",
-    };
-    let sql = format!(
-        "SELECT COALESCE({column},'（未知）') AS k,
-                COUNT(*),
-                SUM(CASE WHEN cost_usd IS NULL THEN 0 ELSE cost_usd END),
-                SUM(CASE WHEN cost_usd IS NULL THEN 1 ELSE 0 END),
-                SUM(CASE WHEN input_tokens IS NULL AND output_tokens IS NULL THEN 1 ELSE 0 END),
-                SUM(COALESCE(input_tokens,0)),
-                SUM(COALESCE(output_tokens,0)),
-                SUM(COALESCE(cache_read,0))
-           FROM requests WHERE ts >= ?1
-          GROUP BY k ORDER BY 3 DESC, 2 DESC"
-    );
-    let rows = admin
-        .store
-        .read(move |c| {
-            let mut st = c.prepare(&sql)?;
-            let it = st.query_map(rusqlite::params![since], |r| {
-                Ok(json!({
-                    "key": r.get::<_, String>(0)?,
-                    "requests": r.get::<_, i64>(1)?,
-                    "costUsd": r.get::<_, Option<f64>>(2)?,
-                    "noPriceRequests": r.get::<_, Option<i64>>(3)?,
-                    "unknownTokenRequests": r.get::<_, Option<i64>>(4)?,
-                    "inputTokens": r.get::<_, Option<i64>>(5)?,
-                    "outputTokens": r.get::<_, Option<i64>>(6)?,
-                    "cacheReadTokens": r.get::<_, Option<i64>>(7)?,
-                }))
-            })?;
-            Ok(it.collect::<rusqlite::Result<Vec<_>>>()?)
-        })
-        .await
-        .map_err(ApiFailure::from)?;
-
-    let sum = |key: &str| -> f64 {
-        rows.iter()
-            .filter_map(|r| r.get(key).and_then(Value::as_f64))
-            .sum()
-    };
-    let sum_i = |key: &str| -> i64 {
-        rows.iter()
-            .filter_map(|r| r.get(key).and_then(Value::as_i64))
-            .sum()
-    };
-    Ok(ok_json(json!({
-        "range": range,
-        "dim": dim,
-        "since": since,
-        "rate": admin.exchange_rate().await,
-        "totals": {
-            "requests": sum_i("requests"),
-            "costUsd": sum("costUsd"),
-            "noPriceRequests": sum_i("noPriceRequests"),
-            "unknownTokenRequests": sum_i("unknownTokenRequests"),
-            "inputTokens": sum_i("inputTokens"),
-            "outputTokens": sum_i("outputTokens"),
-            "cacheReadTokens": sum_i("cacheReadTokens"),
-        },
-        "rows": rows,
-    })))
 }
 
 /// 端到端验收（三步全绿后的那颗按钮）：用 **haiku 槽位**发一条非流式最短请求。
