@@ -17,12 +17,31 @@ jobs:
         shell: pwsh
         run: ./check.ps1 -Quick -Replay
 
-  # 打 tag 出包（NSIS per-user + 免安装 zip + latest.json + updater 签名）：
-  # 票 18 / M4 落地前先占位，不产出任何产物。
+  # 打 tag 出包（票 54）：NSIS per-user 安装包 + 免安装 zip + latest.json 占位。
+  # 与手工打包共用 pack.ps1，不另写一套配置。真签名与升级流在票 61：届时给
+  # createUpdaterArtifacts + TAURI_SIGNING_PRIVATE_KEY（Secret），并让 latest.json 带签名。
   bundle:
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: windows-latest
     steps:
-      - name: 占位
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.10.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      # pack.ps1 用 cargo tauri build；runner 上没有 cargo-tauri，现装（与本地 2.12.2 对齐）。
+      - name: 装 tauri-cli
+        run: cargo install tauri-cli --version 2.12.2 --locked
+      - name: pack.ps1（NSIS + zip + latest.json 占位）
         shell: pwsh
-        run: Write-Host '占位：tag 出包待 M4（票 18：NSIS + zip + latest.json，updater 私钥进 Secret）。'
+        run: ./pack.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: claude-gateway-${{ github.ref_name }}
+          path: |
+            target/release/bundle/nsis/*.exe
+            target/release/bundle/zip/*
