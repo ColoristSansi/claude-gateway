@@ -1,7 +1,7 @@
 //! 转发面 `/v1/*`：入站协议 → IR → 绑定查表 → 出站转发（spec §3 / §4）。
 //!
 //! 票 41 的落点：这里只放**转发链**，出站细节在 [`crate::egress::upstream`]，
-//! 供应商表在 [`crate::provider`]。管理面 `/api/*` 归票 43 的 `ingress/api.rs`，本模块不碰；
+//! 供应商表在 [`crate::egress::provider`]。管理面 `/api/*` 归票 43 的 `ingress/api.rs`，本模块不碰；
 //! 路由表从哪来归票 49 / 51，这里只拿一张现成的 [`Route`] 表查。
 //!
 //! `router()` 是这一面的唯一入口：外壳（票 43 的 `service`）与回放 harness 都挂它，
@@ -49,6 +49,19 @@ pub struct Gateway {
     pub probe: Duration,
     /// body 日志开关的到点时间：`None` = 关。
     pub body_log_until: Mutex<Option<Instant>>,
+}
+
+impl std::fmt::Debug for Gateway {
+    /// 手写而不是 `derive`：供应商表里带着 API key，`Debug` 打出来就等于把密钥写进日志。
+    /// 只报条数与旋钮。
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Gateway")
+            .field("upstreams", &self.upstreams.len())
+            .field("routes", &self.routes.len())
+            .field("ping", &self.ping)
+            .field("probe", &self.probe)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Gateway {

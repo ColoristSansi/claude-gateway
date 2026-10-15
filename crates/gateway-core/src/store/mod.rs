@@ -30,8 +30,8 @@ pub use schema::SCHEMA_VERSION;
 
 /// 数据目录名 = Tauri identifier（票 18）：`%APPDATA%\com.claudegateway.desktop\`。
 pub const DATA_DIR_NAME: &str = "com.claudegateway.desktop";
-/// 库文件名（票 18）。
-pub(crate) const DB_FILE_NAME: &str = "gateway.db";
+/// 库文件名（票 18）。外壳拼 `/api/status` 的库路径时用同一份常量。
+pub const DB_FILE_NAME: &str = "gateway.db";
 
 /// `settings` 的键（spec §9：端口、日志保留、汇率、快照刷新时间）。
 pub mod settings_keys {

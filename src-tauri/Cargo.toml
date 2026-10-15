@@ -9,5 +9,9 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 gateway-core = { path = "../crates/gateway-core" }
-# tray-icon：托盘常驻（票 18；trayIcon 配置随之生效）
-tauri = { version = "2", features = ["tray-icon"] }
+serde_json = "1"
+# tray-icon：托盘常驻（票 18 §2）；image-png：托盘图标两态换图要在运行时解码 PNG
+# （tauri.conf.json 里的配置图标由 tauri-build 在编译期解码，运行时不走这条路）。
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+# 单实例：第二次启动被挡住并把已有窗口提到前面；不开 semver feature（票 18 §2）。
+tauri-plugin-single-instance = "2"

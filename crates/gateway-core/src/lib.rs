@@ -35,6 +35,7 @@ pub mod ir;
 pub mod obs;
 pub mod openai;
 pub mod responses;
+pub mod service;
 pub mod sse;
 pub mod store;
 pub mod writer;
