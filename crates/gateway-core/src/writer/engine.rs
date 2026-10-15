@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{anyhow, bail, Context, Result};
+use serde::Serialize;
 use serde_json::Value as Json;
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -31,6 +32,62 @@ use super::plan::{
     ConflictMode, FileOutcome, FileSpec, RollbackOutcome, WritePlan, WriteReport, WriteRoots,
 };
 use super::state::{self, Snapshot};
+
+/// 一条接管键的「当前值 vs 期望值」（客户端页对照表的左列）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FieldDiff {
+    /// `env.ANTHROPIC_BASE_URL` 这种人看的键名。
+    pub key: String,
+    /// 网关要写下去的值。
+    pub expected: Json,
+    /// 磁盘上现在的值（缺席 = `null`）。
+    pub current: Json,
+    /// 已经一致。
+    pub matches: bool,
+}
+
+/// 一个「客户端 × 文件」的实读比对结果（**每次都真读，不缓存**）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileInspect {
+    /// 绝对路径。
+    pub path: PathBuf,
+    /// 文件在不在。
+    pub exists: bool,
+    pub fields: Vec<FieldDiff>,
+    /// 解析 / 读取失败的原始错误（`Some` 时状态判不了，界面照实报）。
+    pub error: Option<String>,
+}
+
+impl FileInspect {
+    /// 这个文件现在完全等于网关要写的样子。
+    pub fn is_gateway_state(&self) -> bool {
+        self.exists && self.error.is_none() && self.fields.iter().all(|f| f.matches)
+    }
+
+    /// 不一致的接管键（「值不匹配」的对照表就列这些，界面标黄）。
+    pub fn mismatches(&self) -> impl Iterator<Item = &FieldDiff> {
+        self.fields.iter().filter(|f| !f.matches)
+    }
+
+    /// 一个网关接管键都没有（= 文件就是客户端官方态）。摘键还原后、从没写过时都是这样。
+    pub fn has_no_gateway_keys(&self) -> bool {
+        self.error.is_none() && self.fields.iter().all(|f| f.current.is_null())
+    }
+}
+
+/// `client_config_state` 一行里界面要看的那部分（`client_config_state` 是唯一真相，ADR-0006）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordedState {
+    /// 上一次动作：`write` / `restore`。
+    pub last_op: String,
+    /// 首写快照（常驻不清理）。
+    pub backup_path: Option<PathBuf>,
+    pub existed_at_first_write: bool,
+    pub last_write_at: i64,
+}
 
 /// 配置写入引擎。一个实例 = 一个写入根 + 一个存储句柄；可克隆使用。
 #[derive(Clone)]
@@ -55,6 +112,128 @@ impl Writer {
     /// 目标文件的绝对路径（配置根 + 计划里的相对路径）。
     pub fn abs_path(&self, spec: &FileSpec) -> PathBuf {
         self.roots.config_root.join(&spec.rel_path)
+    }
+
+    /// 读 `client_config_state` 里这个「客户端 × 文件」的一行（界面要判「已回官方」与列备份路径）。
+    pub async fn recorded(&self, client: &str, rel: &Path) -> Result<Option<RecordedState>> {
+        Ok(
+            state::load(&self.store, client, &rel_key(rel))
+                .await?
+                .map(|r| RecordedState {
+                    last_op: r.last_op,
+                    backup_path: r.backup_path,
+                    existed_at_first_write: r.existed_at_first_write,
+                    last_write_at: r.last_write_at,
+                }),
+        )
+    }
+
+    /// 备份目录：`<备份根>\<客户端>`（spec §8.4 第 7 条）。
+    pub fn backup_dir(&self, client: &str) -> PathBuf {
+        self.roots.backup_root.join(client)
+    }
+
+    /// 这次写入/还原**会落到哪个备份路径**（只算不算写）：二次确认弹窗要先把绝对路径与
+    /// 备份路径摆给用户看（票 17 第 11 条 / spec §10 客户端段）。
+    ///
+    /// 同一秒内第二次备份引擎会加 `-1` 后缀，这里只报第一个候选（给人看的预告，不是判据）。
+    pub fn preview_backup(&self, spec: &FileSpec) -> PathBuf {
+        self.preview_backup_at(spec, &backup::stamp_now())
+    }
+
+    /// 同 [`Writer::preview_backup`]，但时间戳由调用方给（好断言）。
+    pub fn preview_backup_at(&self, spec: &FileSpec, stamp: &str) -> PathBuf {
+        self.backup_dir(&spec.client).join(format!(
+            "{}.{stamp}",
+            file_name_of(&spec.rel_path).unwrap_or_default()
+        ))
+    }
+
+    /// 这个「客户端 × 文件」已有的备份（新到旧）。二次确认弹窗与客户端卡片都要列它。
+    pub fn list_backups(&self, spec: &FileSpec) -> Vec<PathBuf> {
+        let dir = self.backup_dir(&spec.client);
+        let Ok(name) = file_name_of(&spec.rel_path) else {
+            return Vec::new();
+        };
+        let prefix = format!("{name}.");
+        let Ok(entries) = fs::read_dir(&dir) else {
+            return Vec::new();
+        };
+        let mut found: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with(&prefix))
+                    .unwrap_or(false)
+            })
+            .collect();
+        found.sort();
+        found.reverse();
+        found
+    }
+
+    /// 「保留我的修改」：把**磁盘现值**记成网关记录，下次写入不再判冲突（先备份再覆盖接管键）。
+    ///
+    /// 不写文件。解析不了就报错（形状不对不猜，与写入路径同一条判据）。
+    pub async fn remember(&self, spec: &FileSpec, last_op: &str) -> Result<()> {
+        let abs = self.abs_path(spec);
+        let bytes = read_optional(&abs)?;
+        let doc = Doc::parse(spec.format, bytes.as_deref())?;
+        let snap = snapshot_of(&doc, spec);
+        state::save(
+            &self.store,
+            &spec.client,
+            &rel_key(&spec.rel_path),
+            &snap,
+            last_op,
+            None,
+            bytes.is_some(),
+        )
+        .await
+    }
+
+    /// 读盘比对：接管键的**当前值 vs 期望值**（「客户端」页四态的判据，spec §10 第 4 节）。
+    ///
+    /// 每次都真读文件、不缓存（缓存会撒谎）。文件不存在不是错误（`exists = false`），
+    /// 解析失败才是（`error` 有值，对照表仍尽量给出来）。
+    pub async fn inspect(&self, spec: &FileSpec) -> FileInspect {
+        let abs = self.abs_path(spec);
+        let bytes = match read_optional(&abs) {
+            Ok(b) => b,
+            Err(e) => {
+                return FileInspect {
+                    path: abs,
+                    exists: true,
+                    fields: Vec::new(),
+                    error: Some(format!("读文件失败：{e}")),
+                }
+            }
+        };
+        let mut out = FileInspect {
+            path: abs,
+            exists: bytes.is_some(),
+            fields: Vec::new(),
+            error: None,
+        };
+        let doc = match Doc::parse(spec.format, bytes.as_deref()) {
+            Ok(doc) => doc,
+            Err(e) => {
+                // 解析不了就不猜：四个状态一起判不了，交给调用方按「不匹配 + 原始错误」显示。
+                out.error = Some(format!("{e}"));
+                return out;
+            }
+        };
+        for op in &spec.write_ops {
+            out.fields.push(FieldDiff {
+                key: op.display_key(),
+                expected: op.expected().cloned().unwrap_or(Json::Null),
+                current: doc.slot(op),
+                matches: doc.satisfies(op),
+            });
+        }
+        out
     }
 
     /// 按依赖序写一份计划里的所有文件。

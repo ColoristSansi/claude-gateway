@@ -15,7 +15,7 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
-use crate::ingress::api::{ApiState, GatewayStatus};
+use crate::ingress::api::{AdminCtx, ApiState, GatewayStatus};
 
 /// 只监听回环：网关是本机客户端的私有上游（spec §3）。
 pub const HOST: &str = "127.0.0.1";
@@ -31,6 +31,9 @@ pub struct GatewayConfig {
     /// 转发面 `/v1/*` 的状态（票 41 的 [`crate::ingress::proxy::Gateway`]）。
     /// `None` = 只起管理面：外壳还没接出站转发（供应商表与绑定表来自票 49 / 51）时就是这一档。
     pub forwarding: Option<Arc<crate::ingress::proxy::Gateway>>,
+    /// 管理面 `/api/*` 的业务上下文（库 + 三个客户端的配置根 + 外壳句柄，票 52）。
+    /// `None` = 只挂 `/api/status` 那一条（M1 单测那档）。
+    pub admin: Option<Arc<AdminCtx>>,
 }
 
 #[derive(Debug)]
@@ -124,11 +127,17 @@ pub async fn start(cfg: GatewayConfig) -> Result<Gateway, StartError> {
         source: e,
     })?;
 
-    let state = Arc::new(ApiState::new(
+    let mut api_state = ApiState::new(
         cfg.version,
         cfg.db_path.to_string_lossy().into_owned(),
         addr.port(),
-    ));
+    );
+    if let Some(admin) = cfg.admin.clone() {
+        // 绑定成功之后才知道真端口（`port = 0` 是操作系统挑的）：写回管理面上下文。
+        admin.set_real_port(addr.port());
+        api_state = api_state.with_admin(admin);
+    }
+    let state = Arc::new(api_state);
     let app = crate::ingress::router((*state).clone(), cfg.forwarding);
     let (tx, rx) = oneshot::channel();
 

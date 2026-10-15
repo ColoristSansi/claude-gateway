@@ -936,6 +936,124 @@ pub async fn delete_upstream(store: &Store, id: &str) -> Result<DeleteOutcome> {
     Ok(DeleteOutcome::Deleted)
 }
 
+/// 删上游 + **一并删掉引用它的绑定**（界面二次确认后走这条，票 17 第 39 条 / 票 49 第 20 条）。
+pub async fn delete_upstream_forced(store: &Store, id: &str) -> Result<usize> {
+    let refs = upstream_references(store, id).await?;
+    let id = id.to_string();
+    let removed = refs.len();
+    store
+        .write(move |c| {
+            let tx = c.transaction()?;
+            tx.execute("DELETE FROM virtual_models WHERE upstream_id=?1", params![id])?;
+            tx.execute("DELETE FROM upstreams WHERE id=?1", params![id])?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await?;
+    Ok(removed)
+}
+
+// ───────────────────────── 声明式供应商表（向导第①步的预填） ─────────────────────────
+
+/// 随包内置的供应商预填表（`providers.json`）：models.dev 给不出 baseUrl 的那几家，
+/// 由这张表补（research/providers.md 逐条有据）。
+pub const BUNDLED_PROVIDERS: &str = include_str!("providers.json");
+
+/// 一条供应商预填：向导选中它就预填 baseUrl 与协议倾向，仍可手改。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderPreset {
+    pub id: String,
+    pub name: String,
+    pub base_url: String,
+    /// 协议倾向（选它当默认 wire）。
+    pub wire: String,
+    /// 逐 wire 的路径模板（缺的用 [`Upstream::new`] 的默认值）。
+    pub paths: BTreeMap<String, String>,
+    /// 逐 wire 的认证方式（缺的继承 `default`）。
+    pub auth: BTreeMap<String, String>,
+    /// quirk 名（有载荷的写成 `名:载荷`）。
+    pub quirks: Vec<String>,
+    pub note: String,
+    pub doc_url: String,
+}
+
+/// 解析随包预填表（坏数据就回空表：向导退化成手填，不阻断）。
+pub fn provider_presets() -> Vec<ProviderPreset> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Raw {
+        id: String,
+        name: String,
+        base_url: String,
+        wire: String,
+        #[serde(default)]
+        paths: BTreeMap<String, String>,
+        #[serde(default)]
+        auth: BTreeMap<String, String>,
+        #[serde(default)]
+        quirks: Vec<Vec<String>>,
+        #[serde(default)]
+        note: String,
+        #[serde(default)]
+        doc_url: String,
+    }
+    serde_json::from_str::<Vec<Raw>>(BUNDLED_PROVIDERS)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| ProviderPreset {
+            id: r.id,
+            name: r.name,
+            base_url: r.base_url,
+            wire: r.wire,
+            paths: r.paths,
+            auth: r.auth,
+            quirks: r
+                .quirks
+                .iter()
+                .map(|q| {
+                    let name = q.first().cloned().unwrap_or_default();
+                    match q.get(1) {
+                        Some(arg) if !arg.is_empty() => format!("{name}:{arg}"),
+                        _ => name,
+                    }
+                })
+                .collect(),
+            note: r.note,
+            doc_url: r.doc_url,
+        })
+        .collect()
+}
+
+/// 把一条预填变成一张还没保存的上游表（向导第②步的起点）。
+pub fn preset_to_upstream(preset: &ProviderPreset) -> Upstream {
+    let mut up = Upstream::new(preset.id.clone(), preset.name.clone(), preset.base_url.clone());
+    up.path_templates.clear();
+    for (wire, path) in &preset.paths {
+        if let Some(w) = Wire::parse(wire) {
+            up.set_path(w, path.clone());
+        }
+    }
+    if up.path_templates.is_empty() {
+        // 预填表只给了一个 wire 面：另一面用 spec §6 的默认模板，用户可手改。
+        up.path_templates = Upstream::new("", "", "").path_templates;
+    }
+    up.auth.clear();
+    up.set_auth("default", AuthScheme::Bearer);
+    for (wire, scheme) in &preset.auth {
+        up.set_auth(wire, AuthScheme::parse(scheme));
+    }
+    up.quirks = preset
+        .quirks
+        .iter()
+        .filter_map(|q| {
+            let (name, arg) = q.split_once(':').unwrap_or((q.as_str(), ""));
+            Quirk::parse(name, arg)
+        })
+        .collect();
+    up
+}
+
 // ───────────────────────── 目录读写 ─────────────────────────
 
 fn model_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<UpstreamModel> {

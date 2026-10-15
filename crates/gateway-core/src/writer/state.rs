@@ -53,6 +53,8 @@ pub(crate) struct Record {
     pub last_op: String,
     pub backup_path: Option<PathBuf>,
     pub existed_at_first_write: bool,
+    /// 上次写入 / 还原的时间（Unix 秒）。
+    pub last_write_at: i64,
 }
 
 /// 读一行（没有记录 = 首次接管）。
@@ -62,7 +64,7 @@ pub(crate) async fn load(store: &Store, client: &str, rel: &str) -> Result<Optio
         .read(move |c| {
             let row = c
                 .query_row(
-                    "SELECT owned_keys_json,last_op,backup_path,existed_at_first_write
+                    "SELECT owned_keys_json,last_op,backup_path,existed_at_first_write,last_write_at
                        FROM client_config_state WHERE client=?1 AND file_path=?2",
                     params![client, rel],
                     |r| {
@@ -71,17 +73,19 @@ pub(crate) async fn load(store: &Store, client: &str, rel: &str) -> Result<Optio
                             r.get::<_, String>(1)?,
                             r.get::<_, Option<String>>(2)?,
                             r.get::<_, i64>(3)?,
+                            r.get::<_, i64>(4)?,
                         ))
                     },
                 )
                 .optional()?;
             match row {
                 None => Ok(None),
-                Some((json, last_op, backup, existed)) => Ok(Some(Record {
+                Some((json, last_op, backup, existed, at)) => Ok(Some(Record {
                     snapshot: Snapshot::from_json(&json)?,
                     last_op,
                     backup_path: backup.map(PathBuf::from),
                     existed_at_first_write: existed != 0,
+                    last_write_at: at,
                 })),
             }
         })

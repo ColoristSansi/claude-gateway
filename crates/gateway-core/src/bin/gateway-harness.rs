@@ -282,8 +282,8 @@ async fn main() -> anyhow::Result<()> {
     let table = binding::load(&store).await?;
     let catalog = provider::catalog_map(&store).await?;
 
-    let mut gw = Gateway::new(store, s.upstreams, table);
-    gw.catalog = catalog;
+    let gw = Gateway::new(store, s.upstreams, table);
+    gw.set_catalog(catalog);
     gw.ping = Duration::from_secs(env_u64("GATEWAY_PING_SECS", 15));
     gw.probe = Duration::from_secs(env_u64("GATEWAY_PROBE_SECS", 20));
     if std::env::var("GATEWAY_LOG_BODY")
@@ -306,8 +306,8 @@ async fn main() -> anyhow::Result<()> {
     println!("mock   http://127.0.0.1:{mock_port}  (独立进程 mock-upstream)");
     println!(
         "绑定表（{} 条绑定 / {} 个暴露模型）:",
-        state.bindings.len(),
-        state.bindings.exposed().len()
+        state.read_bindings().len(),
+        state.read_bindings().exposed().len()
     );
 
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;

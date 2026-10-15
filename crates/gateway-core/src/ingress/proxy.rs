@@ -11,7 +11,7 @@
 use std::{
     collections::HashMap,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
     time::{Duration, Instant},
 };
 
@@ -39,11 +39,14 @@ pub const BODY_LOG_WINDOW: Duration = Duration::from_secs(3600);
 pub struct Gateway {
     pub client: reqwest::Client,
     /// 声明式供应商表：id → 上游（路径模板 / 认证 / quirks）。**不含密钥**（票 49）。
-    pub upstreams: HashMap<String, Upstream>,
+    ///
+    /// 三张运行期表都可**热重载**（票 52）：界面里加上游 / 拉模型 / 绑槽位之后立刻生效，
+    /// 不必重启网关（否则「绑完槽位再问客户端」会 404）。
+    pub upstreams: RwLock<HashMap<String, Upstream>>,
     /// 上游模型目录：`(上游 id, 真实模型)` → 目录条目（票 49 的三层校验第二层用它早拒）。
-    pub catalog: HashMap<(String, String), UpstreamModel>,
+    pub catalog: RwLock<HashMap<(String, String), UpstreamModel>>,
     /// 绑定表（票 51）：虚拟模型名 + 客户端档案 → 上游 / 真实模型 / wire。
-    pub bindings: BindingTable,
+    pub bindings: RwLock<BindingTable>,
     /// 日志落点与**出站凭据**的来源（票 42 的 `Store`；密钥 DPAPI 密文入库，明文只在内存）。
     pub store: Store,
     /// 上游静默超过它就向前发一帧 `ping`（票 30 第 6 条）。
@@ -59,9 +62,9 @@ impl std::fmt::Debug for Gateway {
     /// 只报条数与旋钮。
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Gateway")
-            .field("upstreams", &self.upstreams.len())
-            .field("catalog", &self.catalog.len())
-            .field("bindings", &self.bindings.len())
+            .field("upstreams", &self.upstreams.read().map(|t| t.len()).unwrap_or(0))
+            .field("catalog", &self.catalog.read().map(|t| t.len()).unwrap_or(0))
+            .field("bindings", &self.bindings.read().map(|t| t.len()).unwrap_or(0))
             .field("ping", &self.ping)
             .field("probe", &self.probe)
             .finish_non_exhaustive()
@@ -69,6 +72,60 @@ impl std::fmt::Debug for Gateway {
 }
 
 impl Gateway {
+    /// 绑定表（读锁）。**只在该次读里用**：别把 guard 带过 `.await`。
+    pub fn read_bindings(&self) -> std::sync::RwLockReadGuard<'_, BindingTable> {
+        self.bindings.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn read_upstreams(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, Upstream>> {
+        self.upstreams.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn read_catalog(
+        &self,
+    ) -> std::sync::RwLockReadGuard<'_, HashMap<(String, String), UpstreamModel>> {
+        self.catalog.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 一条上游（克隆出来，guard 不跨 `.await`）。
+    pub fn upstream(&self, id: &str) -> Option<Upstream> {
+        self.read_upstreams().get(id).cloned()
+    }
+
+    /// 一条目录条目（三层校验第二层用它早拒）。
+    pub fn catalog_entry(&self, upstream_id: &str, model: &str) -> Option<UpstreamModel> {
+        self.read_catalog()
+            .get(&(upstream_id.to_string(), model.to_string()))
+            .cloned()
+    }
+
+    /// 换一份目录（启动装配与热重载用）。
+    pub fn set_catalog(&self, catalog: HashMap<(String, String), UpstreamModel>) {
+        *self.catalog.write().unwrap_or_else(|e| e.into_inner()) = catalog;
+    }
+
+    /// 往目录里补一条（测试与热重载的细粒度入口）。
+    pub fn set_catalog_entry(&self, upstream_id: &str, model: &str, entry: UpstreamModel) {
+        self.catalog
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((upstream_id.to_string(), model.to_string()), entry);
+    }
+
+    /// **三张运行期表全部从库里重读**（票 52：界面改完配置立刻生效，不必重启网关）。
+    pub async fn reload(&self) -> anyhow::Result<()> {
+        let upstreams = crate::egress::provider::list_upstreams(&self.store).await?;
+        let catalog = crate::egress::provider::catalog_map(&self.store).await?;
+        let bindings = crate::binding::load(&self.store).await?;
+        *self.upstreams.write().unwrap_or_else(|e| e.into_inner()) = upstreams
+            .into_iter()
+            .map(|u| (u.id.clone(), u))
+            .collect();
+        self.set_catalog(catalog);
+        *self.bindings.write().unwrap_or_else(|e| e.into_inner()) = bindings;
+        Ok(())
+    }
+
     /// 装配运行态。出站客户端 300 秒总超时（探针档另有更短的 deadline）。
     pub fn new(store: Store, upstreams: HashMap<String, Upstream>, bindings: BindingTable) -> Self {
         Gateway {
@@ -76,9 +133,9 @@ impl Gateway {
                 .timeout(Duration::from_secs(300))
                 .build()
                 .unwrap_or_default(),
-            upstreams,
-            catalog: HashMap::new(),
-            bindings,
+            upstreams: RwLock::new(upstreams),
+            catalog: RwLock::new(HashMap::new()),
+            bindings: RwLock::new(bindings),
             store,
             ping: Duration::from_secs(15),
             probe: binding::PROBE_DEADLINE,
@@ -155,7 +212,7 @@ async fn proxy(
     let name = virtual_model(&body);
     // 票 51：客户端档案归属按入站 `user-agent` + 客户端标识头判（同一槽位按客户端走不同上游）。
     let identity = client_identity(&headers);
-    let profile = app.bindings.profile_for(&identity);
+    let profile = app.read_bindings().profile_for(&identity);
     // 票 15：记下客户端真实打的路径与协议头，用来定 base URL 语义。
     println!(
         "[in] {} proto={} model={name} profile={} ua={:?} ver={:?} beta={:?}",
@@ -174,7 +231,7 @@ async fn proxy(
     // body 日志开着时把入站体落盘：Codex 的真实请求形状只有它说得清（票 32）。
     dump_inbound(&app, &body);
 
-    let rt = match app.bindings.resolve(&name, &identity) {
+    let rt = match app.read_bindings().resolve(&name, &identity) {
         Ok(rt) => rt,
         Err(e) => {
             return err_in(
@@ -189,8 +246,8 @@ async fn proxy(
         .get("stream")
         .and_then(|s| s.as_bool())
         .unwrap_or(false);
-    let up = match app.upstreams.get(&rt.upstream_id) {
-        Some(u) => u.clone(),
+    let up = match app.upstream(&rt.upstream_id) {
+        Some(u) => u,
         None => {
             return err_in(
                 inbound,
@@ -221,10 +278,8 @@ async fn proxy(
 
     // 三层校验的第二层（ADR-0004）：目录声明过这个模型的 wire 就早拒 400；未声明放行给自检。
     // 排在取凭据之前：配置错了就不该去碰密钥。
-    let entry = app
-        .catalog
-        .get(&(rt.upstream_id.clone(), rt.real_model.clone()));
-    if let Err(rej) = upstream::guard(entry, wire) {
+    let entry = app.catalog_entry(&rt.upstream_id, &rt.real_model);
+    if let Err(rej) = upstream::guard(entry.as_ref(), wire) {
         return err_in(
             inbound,
             StatusCode::from_u16(rej.status).unwrap_or(StatusCode::BAD_REQUEST),
@@ -353,9 +408,9 @@ async fn count_tokens(
     println!(
         "[in] {} count_tokens model={name} profile={}",
         uri.path_and_query().map(|p| p.as_str()).unwrap_or(""),
-        app.bindings.profile_for(&identity).id(),
+        app.read_bindings().profile_for(&identity).id(),
     );
-    let rt = match app.bindings.resolve(&name, &identity) {
+    let rt = match app.read_bindings().resolve(&name, &identity) {
         Ok(rt) => rt,
         Err(e) => {
             return err(
@@ -381,7 +436,8 @@ async fn count_tokens(
     let mut source = "local";
     let mut n = None;
     if wire == Wire::Anthropic {
-        if let Some(up) = app.upstreams.get(&rt.upstream_id) {
+        if let Some(up) = app.upstream(&rt.upstream_id) {
+            let up = &up;
             if let Some(key) = credential(&app, &rt.upstream_id, wire).await {
                 n = upstream::count_tokens_upstream(
                     &app,
@@ -430,9 +486,9 @@ fn protocol_headers(headers: &HeaderMap) -> Vec<(String, String)> {
 /// （它是 OpenAI 系客户端，只认 `object: list` + `data[].object: model`）。
 async fn list_models(State(app): State<Arc<Gateway>>, headers: HeaderMap) -> Response {
     let identity = client_identity(&headers);
-    let profile = app.bindings.profile_for(&identity);
+    let profile = app.read_bindings().profile_for(&identity);
     let data: Vec<Value> = app
-        .bindings
+        .read_bindings()
         .exposed()
         .into_iter()
         .map(|m| {

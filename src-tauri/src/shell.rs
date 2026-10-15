@@ -15,10 +15,11 @@ use tauri::menu::{Menu, MenuEvent, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{App, AppHandle, Manager, Window, WindowEvent, Wry};
 
-use gateway_core::ingress::api::rfc3339_utc;
+use gateway_core::clients::ClientEnv;
+use gateway_core::ingress::api::{rfc3339_utc, AdminCtx, GatewayControl};
 use gateway_core::ingress::proxy;
 use gateway_core::service::{self, Gateway, GatewayConfig};
-use gateway_core::store::Store;
+use gateway_core::store::{self, Store};
 
 /// 外壳的常驻状态：网关句柄 + 「网关状态」菜单项（要改文案的那一条）。
 #[derive(Default)]
@@ -67,6 +68,21 @@ pub fn load_port(data_dir: &Path) -> u16 {
         .unwrap_or(service::DEFAULT_PORT)
 }
 
+/// 库里的端口（票 52 起 `settings.port` 是唯一真相）；读不到回 `None`，由 [`load_port`] 兜底。
+pub fn port_from_store(store: &Store) -> Option<u16> {
+    let value = tauri::async_runtime::block_on(store.read(|c| {
+        Ok(c.query_row(
+            "SELECT value FROM settings WHERE key='port'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .ok())
+    }))
+    .ok()
+    .flatten()?;
+    value.trim().parse::<u16>().ok().filter(|p| *p != 0)
+}
+
 /// 数据目录下的日志目录（票 18 §5：`logs\` 放外壳 / 网关自身运行日志）。
 pub fn logs_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("logs")
@@ -82,6 +98,158 @@ pub fn append_log(logs_dir: &Path, line: &str) -> std::io::Result<()> {
     writeln!(file, "[{}] {line}", rfc3339_utc(SystemTime::now()))
 }
 
+/// 外壳替网关做的两件事（管理 API 跑在网关进程里，重启自己得靠外壳）。
+///
+/// 两个方法都**立刻返回**：真正的启停在后台任务里做——请求正跑在网关自己的 runtime 上，
+/// 同步等自己停会死锁。
+struct TauriControl {
+    app: AppHandle,
+}
+
+impl GatewayControl for TauriControl {
+    fn start(&self) -> Result<(), String> {
+        let app = self.app.clone();
+        tauri::async_runtime::spawn(async move {
+            let port = current_port();
+            if let Err(e) = start_gateway(&app, port).await {
+                eprintln!("[外壳] 启动网关失败：{e}");
+            }
+        });
+        Ok(())
+    }
+
+    fn restart(&self, port: u16) -> Result<(), String> {
+        let app = self.app.clone();
+        tauri::async_runtime::spawn(async move {
+            stop_gateway(&app);
+            if let Err(e) = start_gateway(&app, port).await {
+                eprintln!("[外壳] 按新端口 {port} 重启网关失败：{e}");
+                update_tray_status(&app, false, port);
+            }
+        });
+        Ok(())
+    }
+}
+
+/// 当前端口：库优先，其次 `config.json`，再其次默认。
+fn current_port() -> u16 {
+    let Ok(data_dir) = store::default_data_dir() else {
+        return service::DEFAULT_PORT;
+    };
+    match Store::open(&data_dir) {
+        Ok(store) => port_from_store(&store).unwrap_or_else(|| load_port(&data_dir)),
+        Err(_) => load_port(&data_dir),
+    }
+}
+
+/// 读库里的上游 / 目录 / 绑定表，装出转发面（起不来就只挂管理面）。
+async fn build_forwarding(
+    store: &Store,
+) -> Option<Arc<proxy::Gateway>> {
+    let upstreams = gateway_core::egress::provider::list_upstreams(store).await;
+    let catalog = gateway_core::egress::provider::catalog_map(store).await;
+    let bindings = gateway_core::binding::load(store).await;
+    match (upstreams, catalog, bindings) {
+        (Ok(upstreams), Ok(catalog), Ok(bindings)) => {
+            let upstreams = upstreams
+                .into_iter()
+                .map(|u| (u.id.clone(), u))
+                .collect::<HashMap<_, _>>();
+            let gw = proxy::Gateway::new(store.clone(), upstreams, bindings);
+            gw.set_catalog(catalog);
+            Some(Arc::new(gw))
+        }
+        (u, c, b) => {
+            let e = u.err().or(c.err()).or(b.err()).map(|e| e.to_string());
+            eprintln!("[外壳] 上游 / 绑定表读不出，转发面未挂载：{e:?}");
+            None
+        }
+    }
+}
+
+/// 管理面上下文（票 52）：库 + 三个客户端的配置根 + 外壳句柄。
+fn build_admin(
+    app: &AppHandle,
+    data_dir: &Path,
+    store: Store,
+    db_path: &Path,
+    proxy: Option<Arc<proxy::Gateway>>,
+) -> Option<Arc<AdminCtx>> {
+    match ClientEnv::production(data_dir) {
+        Ok(env) => {
+            let ctx = AdminCtx::new(
+                store,
+                data_dir.to_path_buf(),
+                env,
+                Arc::new(TauriControl { app: app.clone() }),
+                env!("CARGO_PKG_VERSION"),
+                db_path.to_string_lossy().into_owned(),
+            );
+            Some(Arc::new(match proxy {
+                Some(gw) => ctx.with_proxy(gw),
+                None => ctx,
+            }))
+        }
+        Err(e) => {
+            eprintln!("[外壳] 客户端配置根算不出来，管理面聚合端点将不可用：{e}");
+            None
+        }
+    }
+}
+
+/// 起网关（`setup` 与「启动网关」按钮共用一条路径）。
+async fn start_gateway(app: &AppHandle, port: u16) -> Result<(), String> {
+    let data_dir = store::default_data_dir().map_err(|e| e.to_string())?;
+    let logs = logs_dir(&data_dir);
+    let _ = fs::create_dir_all(&logs);
+    let db_path = data_dir.join(store::DB_FILE_NAME);
+    let store = Store::open(&data_dir).map_err(|e| e.to_string())?;
+    let forwarding = build_forwarding(&store).await;
+    let admin = build_admin(app, &data_dir, store, &db_path, forwarding.clone());
+    let config = GatewayConfig {
+        port,
+        db_path: db_path.clone(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        forwarding,
+        admin,
+    };
+    let gateway = service::start(config).await.map_err(|e| {
+        let line = format!("网关启动失败：{e}");
+        eprintln!("{line}");
+        let _ = append_log(&logs, &line);
+        line
+    })?;
+    let real = gateway.port();
+    let line = format!(
+        "网关已启动：http://{}:{}（库：{}）",
+        service::HOST,
+        real,
+        db_path.display()
+    );
+    println!("{line}");
+    let _ = append_log(&logs, &line);
+    let shell = app.state::<Shell>();
+    if let Ok(mut slot) = shell.gateway.lock() {
+        *slot = Some(gateway);
+    }
+    update_tray_status(app, true, real);
+    Ok(())
+}
+
+/// 托盘「网关状态」那一行与图标跟着走。
+fn update_tray_status(app: &AppHandle, running: bool, port: u16) {
+    let shell = app.state::<Shell>();
+    if let Ok(item) = shell.status_item.lock() {
+        if let Some(item) = item.as_ref() {
+            let _ = item.set_text(status_label(running, port));
+        }
+    }
+    if let Some(tray) = app.tray_by_id("main") {
+        let _ = tray.set_icon(Some(tray_icon(running)));
+        let _ = tray.set_tooltip(Some(format!("Claude Gateway · {}", status_label(running, port))));
+    }
+}
+
 /// `setup`：备目录 → 起网关 → 建托盘。网关起不来也**继续建托盘**，
 /// 好让用户看到「未运行」并去改端口（spec §10 故障态）。
 pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
@@ -90,46 +258,38 @@ pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     let logs = logs_dir(&data_dir);
     fs::create_dir_all(&logs)?;
 
-    let db_path = data_dir.join(gateway_core::store::DB_FILE_NAME);
-    let port = load_port(&data_dir);
+    let db_path = data_dir.join(store::DB_FILE_NAME);
 
-    // 转发面 `/v1/*` 接进同一个进程（票 44 交付）：库由外壳开，落点就是上面那个 db_path。
-    // 票 51 起装配路径也是**从库里读**：供应商表 + 上游模型目录 + 绑定表（家族槽位 / 每客户端
-    // 档案覆盖）。空库下三张表都是空的，未知模型按入站协议回 `not_found_error` 信封，
-    // 而不是 axum 的裸 404，所以空库也照样挂上。
-    let forwarding = match Store::open(&data_dir) {
-        Ok(store) => {
-            let loaded = tauri::async_runtime::block_on(async {
-                let upstreams = gateway_core::egress::provider::list_upstreams(&store).await;
-                let catalog = gateway_core::egress::provider::catalog_map(&store).await;
-                let bindings = gateway_core::binding::load(&store).await;
-                (upstreams, catalog, bindings)
-            });
-            match loaded {
-                (Ok(upstreams), Ok(catalog), Ok(bindings)) => {
-                    let upstreams = upstreams
-                        .into_iter()
-                        .map(|u| (u.id.clone(), u))
-                        .collect::<HashMap<_, _>>();
-                    let mut gw = proxy::Gateway::new(store, upstreams, bindings);
-                    gw.catalog = catalog;
-                    Some(Arc::new(gw))
-                }
-                (u, c, b) => {
-                    let e = u.err().or(c.err()).or(b.err()).map(|e| e.to_string());
-                    let line = format!("上游 / 绑定表读不出，转发面未挂载：{e:?}");
-                    eprintln!("{line}");
-                    let _ = append_log(&logs, &line);
-                    None
-                }
-            }
-        }
+    // 库先开：端口、管理面上下文、转发面装配都从它来（票 52 起 `settings.port` 是唯一真相，
+    // `config.json` 只当老配置的迁移兜底）。
+    let store = match Store::open(&data_dir) {
+        Ok(store) => Some(store),
         Err(e) => {
-            let line = format!("库打开失败，转发面未挂载：{e}");
+            let line = format!("库打开失败，转发面与管理面聚合未挂载：{e}");
             eprintln!("{line}");
             let _ = append_log(&logs, &line);
             None
         }
+    };
+    let port = store
+        .as_ref()
+        .and_then(port_from_store)
+        .unwrap_or_else(|| load_port(&data_dir));
+
+    // 转发面 `/v1/*`：装配路径**从库里读**（票 51）——空库下三张表都是空的，
+    // 未知模型按入站协议回 `not_found_error` 信封，而不是 axum 的裸 404，所以空库也照样挂上。
+    let forwarding = match store.as_ref() {
+        Some(store) => tauri::async_runtime::block_on(build_forwarding(store)),
+        None => None,
+    };
+    let admin = match (store.as_ref(), forwarding.as_ref()) {
+        (Some(store), Some(gw)) => {
+            build_admin(app.handle(), &data_dir, store.clone(), &db_path, Some(gw.clone()))
+        }
+        (Some(store), None) => {
+            build_admin(app.handle(), &data_dir, store.clone(), &db_path, None)
+        }
+        (None, _) => None,
     };
 
     let config = GatewayConfig {
@@ -137,6 +297,7 @@ pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
         db_path: db_path.clone(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         forwarding,
+        admin,
     };
 
     // 网关与外壳同进程（票 18 §2 定案：不是 sidecar）。
