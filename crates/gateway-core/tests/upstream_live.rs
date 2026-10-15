@@ -14,6 +14,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+use gateway_core::egress::discovery::*;
 use gateway_core::egress::provider::*;
 use gateway_core::store::Store;
 
@@ -267,6 +268,156 @@ async fn opencode_declares_no_endpoints_so_wires_come_from_doc_table() {
         } else {
             assert_eq!(m.source, Source::Doc, "{} 的来源应是 doc", m.model_id);
         }
+    }
+    assert!(
+        !dir_contains_bytes(&root, key.as_bytes()),
+        "库文件里不该出现明文密钥"
+    );
+}
+
+// ───────────────── 票 50 验收 3：走「拉模型」整条流程（discovery::run_pull）打真上游 ─────────────────
+
+/// commandcode：带凭据一路成功，拉到 89～90 条且每一条都带 `supported_endpoints`（→ 逐条有 wire 判定）。
+#[tokio::test]
+#[ignore = "打真上游：cargo test --test upstream_live -- --ignored --nocapture"]
+async fn ticket50_commandcode_pull_flow_lands_89_to_90_with_endpoints() {
+    let env = EnvFile::load();
+    let base = env.get("COMMANDCODE_BASE_URL");
+    let key = env.get("COMMANDCODE_API_KEY");
+    let root = tmp_root("t50-commandcode");
+    let store = Store::open(&root).expect("开库");
+
+    let mut up = live_upstream("commandcode", &base);
+    up.quirks = vec![]; // 尽力而为：有 default 就用它，不退匿名
+    save_upstream(&store, &up).await.unwrap();
+    store
+        .put_credential("commandcode", "default", &key)
+        .await
+        .unwrap();
+
+    let http = reqwest::Client::new();
+    let report = run_pull(&store, &http, &up, 1_760_000_300).await.unwrap();
+    println!(
+        "\n[t50] commandcode：结局 {:?} / 凭据 {:?} / 拉到 {} 条（新增 {} 更新 {} 清掉 {} 手改锁定 {}）/ 反查警告 {} 条",
+        report.disposition,
+        report.credential,
+        report.applied.fetched,
+        report.applied.added,
+        report.applied.updated,
+        report.applied.removed,
+        report.applied.kept_manual,
+        report.warnings.len()
+    );
+    assert_eq!(report.disposition, PullDisposition::Fetched, "{report:?}");
+    assert_eq!(
+        report.credential,
+        PullCredential::Credentialed,
+        "有 default 就该带凭据拉，不该退匿名"
+    );
+    assert!(
+        report.warnings.is_empty(),
+        "端点全对得上 pathTemplates：{:?}",
+        report.warnings
+    );
+    assert_eq!(report.applied.undeclared, 0, "每条都有端点 → 不该有未声明");
+    let n = report.applied.fetched;
+    assert!(
+        (89..=90).contains(&n),
+        "票 50 验收 3 观测 89～90 条带 supported_endpoints，这次 {n} 条：上游清单变了先确认真实变化，再改这条断言"
+    );
+    let models = list_models(&store, "commandcode").await.unwrap();
+    assert_eq!(models.len(), n);
+    for m in &models {
+        assert!(
+            !m.supported_wires.is_empty(),
+            "{} 没有 wire 判定：说明这条没带 supported_endpoints",
+            m.model_id
+        );
+        assert_eq!(m.source, Source::Upstream);
+    }
+    assert!(
+        !dir_contains_bytes(&root, key.as_bytes()),
+        "库文件里不该出现明文密钥"
+    );
+}
+
+/// opencode：只拉带凭据那份（Console 面 19 / 匿名 85 是权限过滤）；wire 只来自随包文档表。
+#[tokio::test]
+#[ignore = "打真上游：cargo test --test upstream_live -- --ignored --nocapture"]
+async fn ticket50_opencode_pull_flow_uses_the_credentialed_list() {
+    let env = EnvFile::load();
+    let base = env.get("OPENCODE_BASE_URL");
+    let key = env.get("OPENCODE_API_KEY");
+    let root = tmp_root("t50-opencode");
+    let store = Store::open(&root).expect("开库");
+
+    // 向导的 opencode 预设要带这条 quirk（没凭据不拉 / 带凭据 404·零条才退匿名）。
+    let mut up = live_upstream("opencode", &base);
+    up.quirks = vec![Quirk::ModelsListNeedsCredential];
+    save_upstream(&store, &up).await.unwrap();
+    store
+        .put_credential("opencode", "default", &key)
+        .await
+        .unwrap();
+
+    let http = reqwest::Client::new();
+    let report = run_pull(&store, &http, &up, 1_760_000_400).await.unwrap();
+    println!(
+        "\n[t50] opencode：结局 {:?} / 凭据 {:?} / 拉到 {} 条（未声明 {}）/ 反查警告 {} 条",
+        report.disposition,
+        report.credential,
+        report.applied.fetched,
+        report.applied.undeclared,
+        report.warnings.len()
+    );
+    assert_eq!(report.disposition, PullDisposition::Fetched, "{report:?}");
+    assert_eq!(
+        report.credential,
+        PullCredential::Credentialed,
+        "带凭据拉得到就不退匿名（票 35 第 8 条）"
+    );
+    assert!(report.applied.fetched > 0);
+    assert_eq!(report.credential.note(), None, "带凭据那份没有任何额外提示");
+
+    // 逐条 wire 只能来自随包文档表；文档表不认的保持未声明（不猜名字）。
+    let models = list_models(&store, "opencode").await.unwrap();
+    let from_doc = models
+        .iter()
+        .filter(|m| m.source == Source::Doc && !m.supported_wires.is_empty())
+        .count();
+    println!(
+        "[t50] opencode 目录 {} 条，其中文档表判定 {from_doc} 条",
+        models.len()
+    );
+    assert!(from_doc > 0, "文档表至少要认出几条（票 23）");
+    for m in &models {
+        assert_eq!(
+            m.supported_wires,
+            doc_wires(&m.model_id),
+            "{} 的 wire 只能来自文档表",
+            m.model_id
+        );
+        if m.supported_wires.is_empty() {
+            assert_eq!(
+                m.source,
+                Source::Upstream,
+                "{} 是未声明的上游条目",
+                m.model_id
+            );
+        } else {
+            assert_eq!(m.source, Source::Doc, "{} 的来源应是 doc", m.model_id);
+        }
+    }
+
+    // 同一条上游匿名拉一次：只打印条数（Go 面与凭据无关；Console 面 19/85 是权限过滤），
+    // 证明「带凭据优先、404/空才退匿名」里那条兜底不会被走到。
+    match pull_models(&http, &up, MODELS_PATH, None).await {
+        PullOutcome::Fetched(v) => println!(
+            "[t50] opencode 匿名那份 {} 条（带凭据那次 {} 条）",
+            v.len(),
+            report.applied.fetched
+        ),
+        other => println!("[t50] opencode 匿名那条：{other:?}"),
     }
     assert!(
         !dir_contains_bytes(&root, key.as_bytes()),

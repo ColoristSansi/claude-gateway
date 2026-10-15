@@ -1,5 +1,6 @@
 {"exempt":{
-  "NoModelsEndpoint":"上游级事实（不提供模型发现端点），只在拉模型那一步读它，不产生回放 fixture；票 49 落库，拉取用例归票 50。",
+  "NoModelsEndpoint":"上游级事实（不提供模型发现端点），只在拉模型那一步读它，不产生回放 fixture；票 49 落库，执法点与用例在票 50：tests/discovery.rs::no_models_endpoint_quirk_skips_the_request_and_asks_for_a_hand_written_id。",
+  "ModelsListNeedsCredential":"上游级事实（模型清单只有带凭据那份可信），只在拉模型那一步读它，不产生回放 fixture；执法点 = egress::discovery::run_pull 的凭据分支，用例在 tests/discovery.rs::credential_scoped_upstream_without_a_key_does_not_pull 与 credentialed_pull_is_tried_first_and_only_falls_back_on_no_discovery。",
   "TemperatureMax2":"spec §6 给的待实现 quirk：转换代码里还没有执法点；实现后必须同批补一条 fixture。",
   "EmptyThinkingSignature":"spec §6 给的待实现 quirk：转换代码里还没有执法点；实现后必须同批补一条 fixture。",
   "SilentTruncate":"spec §6 给的待实现 quirk：转换代码里还没有执法点；实现后必须同批补一条 fixture。"
