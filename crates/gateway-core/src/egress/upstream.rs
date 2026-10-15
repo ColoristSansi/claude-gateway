@@ -37,6 +37,27 @@ type ByteStream =
 pub enum Inbound {
     Anthropic,
     Responses,
+    /// 票 56：Ollama 兼容面（`/api/chat`）——NDJSON 传输、单层错误信封。
+    Ollama,
+}
+
+impl Inbound {
+    /// 日志与人话里用的名字。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Inbound::Anthropic => "anthropic",
+            Inbound::Responses => "responses",
+            Inbound::Ollama => "ollama",
+        }
+    }
+
+    /// 流式响应的 Content-Type：Ollama 面是 NDJSON，另两张脸是 SSE（spec §4.4）。
+    fn stream_content_type(self) -> &'static str {
+        match self {
+            Inbound::Anthropic | Inbound::Responses => "text/event-stream",
+            Inbound::Ollama => "application/x-ndjson",
+        }
+    }
 }
 
 impl Inbound {
@@ -46,6 +67,8 @@ impl Inbound {
         match self {
             Inbound::Anthropic => Some(Wire::Anthropic),
             Inbound::Responses => Some(Wire::OpenAiResponses),
+            // Ollama 面只有入站、没有出站 wire（票 56）：`Other` 到它这里也没有「同形状」可言。
+            Inbound::Ollama => None,
         }
     }
 }
@@ -64,10 +87,12 @@ impl Decoder {
     }
 }
 
-/// 入站编码器的两个形态（票 32）：同一批 IR 事件，编成 Anthropic SSE 或 Responses SSE。
+/// 入站编码器的形态（票 32 / 56）：同一批 IR 事件，编成 Anthropic SSE、Responses SSE 或
+/// Ollama NDJSON。
 enum ClientEncoder {
     A(AnthropicEncoder),
     R(ResponsesEncoder),
+    L(crate::ingress::ollama::OllamaEncoder),
 }
 
 impl ClientEncoder {
@@ -75,6 +100,7 @@ impl ClientEncoder {
         match inbound {
             Inbound::Anthropic => ClientEncoder::A(AnthropicEncoder::new(model)),
             Inbound::Responses => ClientEncoder::R(ResponsesEncoder::new(model, freeform)),
+            Inbound::Ollama => ClientEncoder::L(crate::ingress::ollama::OllamaEncoder::new(model)),
         }
     }
 
@@ -82,6 +108,17 @@ impl ClientEncoder {
         match self {
             ClientEncoder::A(e) => e.push(ev),
             ClientEncoder::R(e) => e.push(ev),
+            ClientEncoder::L(e) => e.push(ev),
+        }
+    }
+
+    /// 上游静默到点时向前发的那一帧：SSE 两张脸发 ping，Ollama 面**没有保活帧型**（空串）。
+    fn keepalive(&mut self) -> String {
+        match self {
+            ClientEncoder::A(_) | ClientEncoder::R(_) => {
+                sse::frame("ping", &json!({"type":"ping"}).to_string())
+            }
+            ClientEncoder::L(_) => String::new(),
         }
     }
 }
@@ -90,6 +127,7 @@ impl ClientEncoder {
 enum ClientAssembler {
     A(AnthropicAssembler),
     R(ResponsesAssembler),
+    L(crate::ingress::ollama::OllamaAssembler),
 }
 
 impl ClientAssembler {
@@ -97,6 +135,9 @@ impl ClientAssembler {
         match inbound {
             Inbound::Anthropic => ClientAssembler::A(AnthropicAssembler::default()),
             Inbound::Responses => ClientAssembler::R(ResponsesAssembler::new(freeform)),
+            Inbound::Ollama => {
+                ClientAssembler::L(crate::ingress::ollama::OllamaAssembler::default())
+            }
         }
     }
 
@@ -104,6 +145,7 @@ impl ClientAssembler {
         match self {
             ClientAssembler::A(a) => a.push(ev),
             ClientAssembler::R(a) => a.push(ev),
+            ClientAssembler::L(a) => a.push(ev),
         }
     }
 
@@ -111,6 +153,7 @@ impl ClientAssembler {
         match self {
             ClientAssembler::A(a) => a.ended(),
             ClientAssembler::R(a) => a.ended(),
+            ClientAssembler::L(a) => a.ended(),
         }
     }
 
@@ -118,6 +161,7 @@ impl ClientAssembler {
         match self {
             ClientAssembler::A(a) => a.error(),
             ClientAssembler::R(a) => a.error(),
+            ClientAssembler::L(a) => a.error(),
         }
     }
 
@@ -125,6 +169,7 @@ impl ClientAssembler {
         match self {
             ClientAssembler::A(a) => a.usage(),
             ClientAssembler::R(a) => a.usage(),
+            ClientAssembler::L(a) => a.usage(),
         }
     }
 
@@ -132,6 +177,7 @@ impl ClientAssembler {
         match self {
             ClientAssembler::A(a) => a.message(model),
             ClientAssembler::R(a) => a.response(model),
+            ClientAssembler::L(a) => a.body(model),
         }
     }
 }
@@ -576,13 +622,12 @@ pub async fn forward(
             let next = match tokio::time::timeout(p.ping, p.inner.next()).await {
                 Ok(next) => next,
                 Err(_) => {
-                    return Some((
-                        Ok::<String, std::io::Error>(sse::frame(
-                            "ping",
-                            &json!({"type":"ping"}).to_string(),
-                        )),
-                        p,
-                    ))
+                    let ping = p.enc.keepalive();
+                    // Ollama 面没有保活帧型：静默就继续等，不向前发空帧。
+                    if ping.is_empty() {
+                        continue;
+                    }
+                    return Some((Ok::<String, std::io::Error>(ping), p));
                 }
             };
             match next {
@@ -612,7 +657,7 @@ pub async fn forward(
 
     Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CONTENT_TYPE, inbound.stream_content_type())
         .header(header::CACHE_CONTROL, "no-cache")
         .body(Body::from_stream(stream))
         .unwrap_or_else(|_| {
@@ -808,6 +853,9 @@ pub fn error_response(status: StatusCode, kind: &str, message: &str) -> Response
 /// 错误信封按**入站**协议给形状：Anthropic 是 `{"type":"error","error":{…}}`，
 /// OpenAI 系是 `{"error":{"message","type","code"}}`。Codex 只认后者，回错了它就只能
 /// 抛一句无语境的「stream disconnected」（票 32）。
+///
+/// Ollama 面（票 56）是**第三种**：单层 `{"error":"<字符串>"}`（spec §4.4）——
+/// 与 OpenAI 的嵌套形状不能混用。
 pub fn error_response_for(
     inbound: Inbound,
     status: StatusCode,
@@ -816,6 +864,7 @@ pub fn error_response_for(
 ) -> Response {
     match inbound {
         Inbound::Anthropic => error_response(status, kind, message),
+        Inbound::Ollama => (status, axum::Json(json!({"error": message}))).into_response(),
         Inbound::Responses => (
             status,
             axum::Json(json!({"error":{"message":message,"type":kind,"code":Value::Null}})),
