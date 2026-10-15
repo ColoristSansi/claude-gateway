@@ -18,10 +18,119 @@ pub struct IrRequest {
     pub stop: Vec<String>,
     pub thinking: Option<Value>,
     pub metadata: Option<Value>,
+    /// 结构化输出（spec §5；票 37 定案 1）。**归一化**槽位：四种入站形状解成
+    /// [`ResponseFormat`] 的三个变体，出站再按目标 wire 编成逐字形状（票 57）。
+    pub format: Option<ResponseFormat>,
     pub extra: Map<String, Value>,
     /// 自由格式工具（Responses 的 `type:"custom"`）的名字：对上游声明成「一个字符串参数」，
     /// 回给客户端时要还原成 `custom_tool_call`（票 32）。
     pub freeform_tools: Vec<String>,
+}
+
+/// 结构化输出在 IR 里的归一化形状（spec §5；票 37 定案 1）。
+///
+/// **不原样透传**：四条入站协议（Anthropic `output_config.format` / Chat `response_format` /
+/// Responses `text.format` / Ollama `format`）各自解成下面三个变体，出站再按目标 wire 编回去
+/// （[`crate::egress::structured::apply`]）。表达不了的一律**请求期 400**，不静默丢弃。
+#[derive(Debug, Clone, PartialEq)]
+pub enum ResponseFormat {
+    /// 无 schema 的 JSON mode：Chat / Responses 的 `{"type":"json_object"}`、Ollama 的 `"json"`。
+    Json,
+    /// 带 schema。`name` / `strict` **只有入站显式给了才填**（`None` = 没给，不是 `false`）——
+    /// spec §5 硬规则 1：`undefined`（没传）与 `null`（传了但不适用）必须分开。
+    JsonSchema {
+        schema: Value,
+        name: Option<String>,
+        strict: Option<bool>,
+    },
+    /// 没见过的形状：原样兜底，**只在「与入站同形状」的出站 wire 上原样带**（spec §5）。
+    ///
+    /// 值 = 该入站协议自己那个字段的**整份**值（Anthropic 是 `output_config`、Chat 是
+    /// `response_format`、Responses 是 `text`、Ollama 是 `format`），这样「原样带」就是把它
+    /// 放回同一个字段，不做任何猜测性改写。
+    Other(Value),
+}
+
+impl ResponseFormat {
+    /// Anthropic 入站：顶层 `output_config.format`（3 层，无 `name` / `strict` / `json_schema` 包裹）。
+    ///
+    /// `output_config` 里除 `format` 之外的兄弟键（如 `effort`）**不在这里建模**：它们不在
+    /// `known` 名单里，仍走 `extra` 原样带过（见 [`crate::anthropic::decode_request`]）。
+    pub fn from_anthropic_request(obj: &Map<String, Value>) -> Option<ResponseFormat> {
+        let output_config = obj.get("output_config")?;
+        let format = output_config.get("format")?;
+        if format.get("type").and_then(Value::as_str) != Some("json_schema") {
+            return Some(ResponseFormat::Other(output_config.clone()));
+        }
+        match format.get("schema") {
+            Some(schema) if schema.is_object() => Some(ResponseFormat::JsonSchema {
+                schema: schema.clone(),
+                name: None,
+                strict: None,
+            }),
+            _ => Some(ResponseFormat::Other(output_config.clone())),
+        }
+    }
+
+    /// OpenAI Chat 入站：顶层 `response_format`（4 层：`response_format` → `json_schema` → …）。
+    pub fn from_chat_request(obj: &Map<String, Value>) -> Option<ResponseFormat> {
+        let rf = obj.get("response_format")?;
+        match rf.get("type").and_then(Value::as_str) {
+            Some("json_object") => Some(ResponseFormat::Json),
+            // `{"type":"text"}` 是官方缺省值（明确「不要结构化输出」）：与没传同一个下场。
+            Some("text") => None,
+            Some("json_schema") => match rf.get("json_schema") {
+                Some(js) if js.get("schema").is_some() => Some(ResponseFormat::JsonSchema {
+                    schema: js.get("schema").cloned().unwrap_or(Value::Null),
+                    name: js.get("name").and_then(Value::as_str).map(str::to_string),
+                    strict: js.get("strict").and_then(Value::as_bool),
+                }),
+                _ => Some(ResponseFormat::Other(rf.clone())),
+            },
+            _ => Some(ResponseFormat::Other(rf.clone())),
+        }
+    }
+
+    /// OpenAI Responses 入站：顶层 `text.format`（3 层，比 Chat 少一层 `json_schema` 包裹；
+    /// `name` 与 `schema` 都必填）。`Other` 兜底带的是整份 `text`（放回同一个字段）。
+    pub fn from_responses_request(obj: &Map<String, Value>) -> Option<ResponseFormat> {
+        let text = obj.get("text")?;
+        let format = text.get("format")?;
+        match format.get("type").and_then(Value::as_str) {
+            Some("json_object") => Some(ResponseFormat::Json),
+            Some("text") => None,
+            Some("json_schema") => match format.get("schema") {
+                Some(schema) => Some(ResponseFormat::JsonSchema {
+                    schema: schema.clone(),
+                    name: format
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    strict: format.get("strict").and_then(Value::as_bool),
+                }),
+                None => Some(ResponseFormat::Other(text.clone())),
+            },
+            _ => Some(ResponseFormat::Other(text.clone())),
+        }
+    }
+
+    /// Ollama 入站：顶层 `format` —— 裸 schema 对象或字符串 `"json"`（spec §4.4）。
+    ///
+    /// **只解不编**：Ollama 面只有入站（`/api/chat` 归票 56），出站仍走上面三条 wire。
+    /// 空串与 `null` 都是「没要结构化输出」（官方 `format` 缺省即无）。
+    pub fn from_ollama_request(obj: &Map<String, Value>) -> Option<ResponseFormat> {
+        match obj.get("format")? {
+            Value::String(s) if s == "json" => Some(ResponseFormat::Json),
+            Value::String(s) if s.trim().is_empty() => None,
+            Value::Null => None,
+            Value::Object(_) => Some(ResponseFormat::JsonSchema {
+                schema: obj.get("format").cloned().unwrap_or(Value::Null),
+                name: None,
+                strict: None,
+            }),
+            other => Some(ResponseFormat::Other(other.clone())),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -195,6 +304,7 @@ mod tests {
             stop: Vec::new(),
             thinking: None,
             metadata: None,
+            format: None,
             extra: Map::new(),
             freeform_tools: Vec::new(),
         }
