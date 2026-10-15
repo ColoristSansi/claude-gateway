@@ -196,7 +196,9 @@ impl UpdateSource for ShellUpdater {
             {
                 let mut inner = self.inner.lock().expect("升级状态锁");
                 if inner.checking {
-                    return Err("正在检查更新，稍等一下".to_string());
+                    // 已经有人在查（比如启动后那次静默检查正好在跑）：把当前状态原样回给他，
+                    // 别报错——「检查更新」点两下不该是一个错误。
+                    return Ok(self.status_with(&inner));
                 }
                 inner.checking = true;
             }
@@ -240,9 +242,11 @@ impl UpdateSource for ShellUpdater {
         {
             let mut inner = self.inner.lock().expect("升级状态锁");
             if inner.installing {
-                return Err("已经有一次升级在跑了".to_string());
+                // 幂等：界面重复点「下载并安装」不该报错，回当前进度就行。
+                return Ok(self.status_with(&inner));
             }
             if inner.checking {
+                // 这一次是真冲突：检查还没回来，不知道要装哪个版本。
                 return Err("正在检查更新，稍等一下再装".to_string());
             }
             inner.installing = true;
