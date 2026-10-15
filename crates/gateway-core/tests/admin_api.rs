@@ -450,6 +450,98 @@ async fn client_states_are_read_from_disk_not_cached() {
     h.stop().await;
 }
 
+/// 票 55 回归：**「已回官方」的判据是「网关写下去的值都不在了」，不是「文件里一个键都没有」**。
+///
+/// Desktop 的 `_meta.json` 摘掉网关条目后，`appliedId` 必须指回剩下那条客户端档案（`Default`），
+/// 于是那个文件永远不可能「零键」。旧判据（每个接管键现值都是 `null`）把还原后的 Desktop 误报成
+/// 「值不匹配」，侧栏也跟着一直挂着一个待办。同时钉住另一半：**网关键还在、只是被外部改过，仍是
+/// 「值不匹配」**（两个口径不许搅在一起）。
+#[tokio::test]
+async fn desktop_restore_is_official_and_a_hand_edit_is_still_mismatch() {
+    use gateway_core::writer::desktop;
+
+    let h = Harness::start("desktop-official").await;
+    let mock = mock_upstream().await;
+    onboard_upstream(&h, &mock, "mock").await;
+    h.put(
+        "/api/bindings/claude-haiku",
+        json!({"upstreamId": "mock", "realModel": "mock-fast", "wire": "anthropic"}),
+    )
+    .await;
+
+    let card = |body: &Value, id: &str| -> Value {
+        body["clients"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == id)
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    let state = |body: &Value, id: &str| card(body, id)["state"].clone();
+
+    // 现场：3P 的 configLibrary 里已经有客户端自己那份 `_meta.json`（这个网关从没写过）。
+    let desktop_root = h.root.join("clients").join("claude-desktop");
+    std::fs::create_dir_all(&desktop_root).unwrap();
+    let meta = desktop_root.join(desktop::META_FILE);
+    std::fs::write(
+        &meta,
+        "{\n  \"entries\": [\n    {\n      \"id\": \"local-default\",\n      \"name\": \"Default\"\n    }\n  ],\n  \"appliedId\": \"local-default\"\n}\n",
+    )
+    .unwrap();
+    let profile = desktop_root.join(desktop::profile_rel_path());
+
+    // ① 从没由网关写过 → 未配置（不是「值不匹配」：那要先把值改坏）。
+    let (_, body) = h.get("/api/clients").await;
+    assert_eq!(state(&body, "claude-desktop"), "not-configured", "{body}");
+
+    // ② 三个都切到网关 → 三张卡生效，侧栏没有待办。
+    for id in ["claude-desktop", "claude-code", "codex"] {
+        let (status, body) = h.post(&format!("/api/clients/{id}/apply"), json!({})).await;
+        assert_eq!(status, 200, "{id}: {body}");
+        assert_eq!(body["client"]["state"], "effective", "{id}: {body}");
+    }
+    let (_, badges) = h.get("/api/sidebar/badges").await;
+    assert_eq!(badges["clientsNotEffective"], 0, "{badges}");
+
+    // ③ 把网关写下的值改坏 → 如实报「值不匹配」（键还在，只是不是我们的值了）。
+    let mut doc: Value = serde_json::from_str(&std::fs::read_to_string(&profile).unwrap()).unwrap();
+    doc["inferenceGatewayBaseUrl"] = json!("http://127.0.0.1:1/hand-edited");
+    std::fs::write(&profile, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+    let (_, body) = h.get("/api/clients").await;
+    assert_eq!(state(&body, "claude-desktop"), "mismatch", "{body}");
+
+    // ④ 一键还原三个 → 三张卡都是「已回官方」，侧栏归 0（用户自己还原的，不是待办）。
+    for id in ["claude-desktop", "claude-code", "codex"] {
+        let (status, body) = h
+            .post(&format!("/api/clients/{id}/restore"), json!({}))
+            .await;
+        assert_eq!(status, 200, "{id}: {body}");
+        assert_eq!(body["client"]["state"], "official", "{id}: {body}");
+        assert_eq!(body["client"]["stateLabel"], "已回官方", "{id}: {body}");
+    }
+    let (_, badges) = h.get("/api/sidebar/badges").await;
+    assert_eq!(badges["clientsNotEffective"], 0, "{badges}");
+    assert!(
+        badges["clientsNotEffectiveList"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "{badges}"
+    );
+
+    // `appliedId` 回到了客户端自己那条档案，网关的条目与值都不在了。
+    let restored: Value = serde_json::from_str(&std::fs::read_to_string(&meta).unwrap()).unwrap();
+    assert_eq!(restored["appliedId"], "local-default", "{restored}");
+    assert_eq!(
+        restored["entries"].as_array().unwrap().len(),
+        1,
+        "{restored}"
+    );
+
+    h.stop().await;
+}
+
 #[tokio::test]
 async fn port_probe_and_change_syncs_only_effective_clients() {
     let h = Harness::start("port").await;

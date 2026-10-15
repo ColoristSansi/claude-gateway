@@ -28,6 +28,10 @@ pub fn routes() -> Router<ApiState> {
 
 /// 侧栏两个徽标：**未通过自检的上游数** + **未生效的客户端数**（spec §10 故障态）。
 /// 拉取警告与发现失败**不计入**（票 35 第 7 条）。
+///
+/// 客户端这一格只数**还需要动作**的两态：`未配置`（可以切过来）与 `值不匹配`（文件被动过）。
+/// `已生效`当然不算，`已回官方`（用户自己还原过）也不算——那是用户的选择，不是待办
+/// （票 55：三个客户端都还原之后徽标要归 0）。
 async fn badges(State(state): State<ApiState>) -> Result<Json<Value>, ApiFailure> {
     let admin = admin(&state)?;
     let tally = discovery::upstream_tally(&admin.store)
@@ -39,7 +43,10 @@ async fn badges(State(state): State<ApiState>) -> Result<Json<Value>, ApiFailure
         let card = crate::clients::status(&admin.env, &admin.store, id, &values)
             .await
             .map_err(ApiFailure::from)?;
-        if card.state != ClientState::Effective {
+        if matches!(
+            card.state,
+            ClientState::NotConfigured | ClientState::Mismatch
+        ) {
             not_effective.push(json!({"id": card.id, "state": card.state_label}));
         }
     }

@@ -171,6 +171,19 @@ impl Doc {
         }
     }
 
+    /// 这条接管键上**还留着网关写下去的值**吗（四态的「没有网关键」判据用它）。
+    ///
+    /// 与 [`Doc::satisfies`] 不能合并：`satisfies` 是幂等判据（「现在正是网关要写的样子」），
+    /// 这里判的是「网关的值还在不在」。用户手改过的键两者都是 `false`，但手改**不代表**网关没写过——
+    /// 所以四态判定用的是「一个文件的接管键里还有没有网关的值」，不是「键在不在」。
+    ///
+    /// 只有「写下去一个值」的动作（`Set` / `SetElement`）才有「网关的值」可言；摘键类动作
+    /// 本来就不留值。`appliedId` 是普通 `Set`，还原后变成客户端自己的档案 id → 判 `false`：
+    /// 键还在、网关的值不在了，这正是「已回官方」的判据。
+    pub fn carries_gateway_value(&self, op: &OwnedOp) -> bool {
+        op.expected().is_some() && self.satisfies(op)
+    }
+
     /// 冲突比对用的「这条键现在的槽值」（缺席 = `null`）——记录里存的是同一个口径。
     pub fn slot(&self, op: &OwnedOp) -> Json {
         match op {
