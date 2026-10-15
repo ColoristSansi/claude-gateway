@@ -120,6 +120,12 @@ async fn last_echo(gw: &Gateway) -> Value {
         .unwrap_or(Value::Null)
 }
 
+/// 发一发请求，等日志攒到 `n` 行，回最新那一行（票 53 的 body 开关用例用）。
+async fn post_and_latest(gw: &Gateway, request: &Value, n: usize) -> Value {
+    let _ = gw.post_messages(request).await;
+    gw.logs(n).await.first().cloned().unwrap_or(Value::Null)
+}
+
 /// ① 台账矩阵：15 格的状态码、首帧、末帧，加上逐帧逐字段的黄金比对，
 /// 以及几条**独立于黄金**的语义断言（黄金是离线核对过的，这里是第二把尺）。
 #[tokio::test(flavor = "multi_thread")]
@@ -1468,6 +1474,103 @@ async fn client_profile_override_and_models_exposure() {
     assert!(
         fails.is_empty(),
         "客户端档案覆盖与 /v1/models {} 处不合格：\n{}",
+        fails.len(),
+        fails.join("\n")
+    );
+}
+
+/// ⑬ 日志页的 body 开关（票 53）：默认关 → 开启必须先过隐私确认 → 开启后这一发的出站 body
+/// 能捞到 → 到点自动关。**走管理面那个真实端点**（`/api/logs/body-recording`），证明界面上
+/// 的开关与转发路径读的是同一个窗口；窗口拨到 2 秒（真实值 1 小时，票 30 第 7 条的照搬）。
+#[tokio::test(flavor = "multi_thread")]
+async fn body_recording_switch_drives_the_proxy_window() {
+    let gw = Gateway::start().await;
+    let mut fails: Vec<String> = Vec::new();
+    let request = fixture_request(&gw, "text", "anthropic");
+    let switch = "/api/logs/body-recording";
+
+    // ① 默认关：这一发的 body 不写。
+    let (status, state) = gw.get_api(switch).await;
+    check(
+        &mut fails,
+        status == 200 && state["on"] == json!(false),
+        format!("默认该关：HTTP {status} / {state}"),
+    );
+    let row = post_and_latest(&gw, &request, 1).await;
+    check(
+        &mut fails,
+        row["body"].is_null(),
+        format!("默认不该写 body，实际 {}", row["body"]),
+    );
+
+    // ② 开启没带隐私确认 → 400，且开关一动不动。
+    let (status, body) = gw.post_json(switch, &json!({"enabled": true})).await;
+    check(
+        &mut fails,
+        status == 400 && body["error"]["type"] == "consent_required",
+        format!("缺隐私确认该 400：HTTP {status} / {body}"),
+    );
+    let (_, state) = gw.get_api(switch).await;
+    check(
+        &mut fails,
+        state["on"] == json!(false),
+        format!("被拒之后不该偷偷打开：{state}"),
+    );
+
+    // ③ 带确认、窗口拨到 2 秒 → 这一发能捞到**发给上游的那一份**（出站请求体）。
+    let (status, state) = gw
+        .post_json(
+            switch,
+            &json!({"enabled": true, "consent": true, "seconds": 2}),
+        )
+        .await;
+    check(
+        &mut fails,
+        status == 200 && state["on"] == json!(true),
+        format!("该开起来：HTTP {status} / {state}"),
+    );
+    check(
+        &mut fails,
+        state["seconds_remaining"]
+            .as_u64()
+            .map(|s| s <= 2)
+            .unwrap_or(false),
+        format!("该报剩余秒数（1 小时自动关的倒计时）：{state}"),
+    );
+    let row = post_and_latest(&gw, &request, 2).await;
+    let body = row["body"].as_str().unwrap_or_default().to_string();
+    check(
+        &mut fails,
+        body.contains("你好") && body.contains("mock-text"),
+        format!("开关打开后 body 应该能捞到，实际 {body:?}"),
+    );
+
+    // ④ 到点自动关：再发一发，body 又不写了。
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    let (_, state) = gw.get_api(switch).await;
+    check(
+        &mut fails,
+        state["on"] == json!(false),
+        format!("到点该自己关掉：{state}"),
+    );
+    let row = post_and_latest(&gw, &request, 3).await;
+    check(
+        &mut fails,
+        row["body"].is_null(),
+        format!("到点后不该再写 body，实际 {}", row["body"]),
+    );
+
+    // ⑤ 手动关也是同一条路（`enabled: false` 不需要确认）。
+    let (status, state) = gw.post_json(switch, &json!({"enabled": false})).await;
+    check(
+        &mut fails,
+        status == 200 && state["on"] == json!(false),
+        format!("手动关：HTTP {status} / {state}"),
+    );
+
+    assert!(
+        fails.is_empty(),
+        "body 开关 {} 处不合格：\n{}",
         fails.len(),
         fails.join("\n")
     );
