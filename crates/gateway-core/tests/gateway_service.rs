@@ -18,6 +18,8 @@ fn config(port: u16, db_path: &str) -> GatewayConfig {
         forwarding: None,
         // 维护面（票 62）在 tests/dist_api.rs 里单独挂：那一格要真库与真数据目录。
         maintenance: None,
+        // 升级面（票 61）要 Tauri updater 插件，只有外壳递得进来；这里不挂（端点是 503）。
+        updater: None,
     }
 }
 

@@ -16,6 +16,7 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{App, AppHandle, Manager, Window, WindowEvent, Wry};
 
 use gateway_core::dist::autostart::{self, HkcuRun};
+use gateway_core::dist::update::UpdateSource;
 use gateway_core::ingress::api::{rfc3339_utc, Maintenance};
 use gateway_core::ingress::proxy;
 use gateway_core::service::{self, Gateway, GatewayConfig};
@@ -109,6 +110,13 @@ pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     let db_path = data_dir.join(gateway_core::store::DB_FILE_NAME);
     let port = load_port(&data_dir);
 
+    // 升级面（票 61）：插件已在 main 里注册，这里建句柄 → 随网关挂进管理 API → 启动后静默检查一次。
+    let updater = crate::updater::ShellUpdater::new(
+        app.handle().clone(),
+        data_dir.clone(),
+        env!("CARGO_PKG_VERSION"),
+    );
+
     // 转发面 `/v1/*` 接进同一个进程（票 44 交付）：库由外壳开，落点就是上面那个 db_path。
     // 票 51 起装配路径也是**从库里读**：供应商表 + 上游模型目录 + 绑定表（家族槽位 / 每客户端
     // 档案覆盖）。空库下三张表都是空的，未知模型按入站协议回 `not_found_error` 信封，
@@ -157,6 +165,8 @@ pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
         version: env!("CARGO_PKG_VERSION").to_string(),
         forwarding,
         maintenance,
+        // 升级面（票 61）：同一个句柄也留着给启动后的静默检查。
+        updater: Some(updater.clone() as Arc<dyn UpdateSource>),
     };
 
     // 网关与外壳同进程（票 18 §2 定案：不是 sidecar）。
@@ -186,6 +196,9 @@ pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
         autostart_item: Mutex::new(None),
     });
     build_tray(app.handle(), running, port)?;
+    // 启动后静默检查一次（票 18 §3）：只把结果放进 `/api/update/status`，不弹窗；
+    // 网关没起来也照样检查（那是网络的事，与端口无关）。
+    updater.spawn_startup_check();
 
     // Run 键拉起来的那次（`--startup`）：直接进托盘，不弹窗口。网关照常起。
     if is_startup_launch(&std::env::args().collect::<Vec<_>>()) {

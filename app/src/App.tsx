@@ -7,6 +7,7 @@
 
 import { useEffect, useState, type ReactElement } from 'react';
 import { LogsPage } from './pages/LogsPage';
+import { UpdateBanner } from './UpdateBanner';
 
 type Page = { slug: string; title: string; render?: () => ReactElement; owner: string };
 
@@ -50,6 +51,8 @@ export function App() {
           </a>
         ))}
       </nav>
+      {/* 升级横幅（票 61）：有新版 / 正在静默安装 / 升级失败时才出现。 */}
+      <UpdateBanner />
       <main>
         {page.render ? (
           page.render()

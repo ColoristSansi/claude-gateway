@@ -97,6 +97,49 @@ function logQuery(f: LogFilters, cursor: number | null): string {
   return s ? `?${s}` : '';
 }
 
+/**
+ * 自动升级（票 61）：`/api/update/*` 的响应体。
+ *
+ * 检查 / 下载 / 安装都是**外壳**（Tauri updater 插件）干的：前端只发三个请求 + 轮询 status。
+ * 安装时进程会被安装器接管（装完自动重启），所以 install 是「立刻应答」，进度看 status。
+ */
+export type AvailableUpdate = {
+  version: string;
+  notes: string | null;
+  pubDate: string | null;
+  downloadUrl: string;
+};
+
+export type LocalPackage = {
+  fileName: string;
+  path: string;
+  bytes: number;
+  version: string | null;
+};
+
+export type UpdateRollback = {
+  /** 回退指引原文（设置页「关于」/帮助里直接显示）。 */
+  guide: string;
+  installersDir: string;
+  packages: LocalPackage[];
+  previous: LocalPackage | null;
+  lastUpdate: { from: string; to: string; at: string; package: string } | null;
+};
+
+export type UpdateStatus = {
+  currentVersion: string;
+  endpoints: string[];
+  checking: boolean;
+  installing: boolean;
+  lastCheckedAt: string | null;
+  available: AvailableUpdate | null;
+  downloadedBytes: number;
+  totalBytes: number | null;
+  installingPackage: string | null;
+  error: string | null;
+  rollback: UpdateRollback;
+};
+
 export const api = {
   logs: (f: LogFilters, cursor: number | null = null) =>
     req<LogsResponse>(`/api/logs${logQuery(f, cursor)}`),
@@ -109,4 +152,9 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(seconds === undefined ? { enabled, consent } : { enabled, consent, seconds }),
     }),
+  /** 升级：查一次（查不动会抛错，错误原文来自后端）。 */
+  updateCheck: () => req<UpdateStatus>('/api/update/check', { method: 'POST' }),
+  /** 升级：下载 + 验签 + 静默安装（立刻应答；装完由安装器把应用拉起来）。 */
+  updateInstall: () => req<UpdateStatus>('/api/update/install', { method: 'POST' }),
+  updateStatus: () => req<UpdateStatus>('/api/update/status'),
 };

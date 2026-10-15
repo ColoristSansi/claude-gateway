@@ -71,6 +71,9 @@ async fn start(tag: &str) -> Env {
             root.clone(),
             value_name.clone(),
         )),
+        // 升级面（票 61）在这一格里不挂（要 Tauri updater 插件）；它自己的接口测试在
+        // tests/update_api.rs（用一个假的 UpdateSource）。
+        updater: None,
     })
     .await
     .expect("起服务");
@@ -304,6 +307,7 @@ async fn maintenance_endpoints_are_503_when_the_shell_did_not_wire_them() {
         version: "0.1.0-test".to_string(),
         forwarding: None,
         maintenance: None,
+        updater: None,
     })
     .await
     .expect("起服务");

@@ -34,6 +34,9 @@ pub struct GatewayConfig {
     /// 维护面（票 62）：开机自启开关 / 导出 / 导入要动数据目录与库。
     /// `None` = 这些端点是 503（只起管理面 / 测试不带）。
     pub maintenance: Option<crate::ingress::api::Maintenance>,
+    /// 升级面（票 61）：检查更新 / 下载 / 静默安装走 Tauri 的 updater 插件，由外壳实现
+    /// [`crate::dist::update::UpdateSource`] 后递进来。`None` = `/api/update/*` 是 503。
+    pub updater: Option<Arc<dyn crate::dist::update::UpdateSource>>,
 }
 
 #[derive(Debug)]
@@ -135,6 +138,11 @@ pub async fn start(cfg: GatewayConfig) -> Result<Gateway, StartError> {
     // 票 62：维护面（导出 / 导入 / 自启开关）跟着库走，不管转发面挂没挂。
     let state = match cfg.maintenance {
         Some(maint) => state.with_maintenance(maint),
+        None => state,
+    };
+    // 票 61：升级面（检查更新 / 静默安装）同样由外壳递进来；没递进来就是 503。
+    let state = match cfg.updater {
+        Some(updater) => state.with_updater(updater),
         None => state,
     };
     let state = Arc::new(state);
