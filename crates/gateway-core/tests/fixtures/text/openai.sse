@@ -1,0 +1,11 @@
+data: {"id":"chatcmpl-mock-text","object":"chat.completion.chunk","created":0,"model":"mock-upstream","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-mock-text","object":"chat.completion.chunk","created":0,"model":"mock-upstream","choices":[{"index":0,"delta":{"content":"你好，"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-mock-text","object":"chat.completion.chunk","created":0,"model":"mock-upstream","choices":[{"index":0,"delta":{"content":"这是 mock 上游的纯文本回放。"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-mock-text","object":"chat.completion.chunk","created":0,"model":"mock-upstream","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"id":"chatcmpl-mock-text","object":"chat.completion.chunk","created":0,"model":"mock-upstream","choices":[],"usage":{"prompt_tokens":12,"completion_tokens":18,"total_tokens":30,"prompt_tokens_details":{"cached_tokens":0}}}
+
+data: [DONE]

@@ -24,7 +24,7 @@
 //! - 价格优先级：**手工 > 快照 > 未知**，逐项判定；手工填了就锁定，快照刷新不动它。
 //! - 拉取：20 秒超时、不自动重试（票 35 第 9 条）；快照刷新 30 秒、同样不重试（票 49 自定）。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -140,6 +140,32 @@ impl Quirk {
         "EmptyThinkingSignature",
         "SilentTruncate",
     ];
+
+    /// 枚举值的全集（载荷留空）：票 19 §6 的双向守卫拿它跟 fixture 标签对齐。
+    pub fn all() -> Vec<Quirk> {
+        vec![
+            Quirk::ClientUserAgent(String::new()),
+            Quirk::SessionIdHeader(String::new()),
+            Quirk::NoModelsEndpoint,
+            Quirk::TemperatureMax2,
+            Quirk::EmptyThinkingSignature,
+            Quirk::SilentTruncate,
+        ]
+    }
+
+    /// 票 19 §6.2：每个 quirk 必须声明它作用的出站 wire / 请求头 / 请求体。
+    pub fn acts_on(&self) -> &'static str {
+        match self {
+            Quirk::ClientUserAgent(_) => "出站请求头 user-agent（注入网关自称）",
+            Quirk::SessionIdHeader(_) => {
+                "出站请求头（头名由变体载荷给出，值为按首条 user 文本派生的会话 ID）"
+            }
+            Quirk::NoModelsEndpoint => "上游级事实：不提供模型发现端点（向导不必尝试拉取）",
+            Quirk::TemperatureMax2 => "出站请求体：temperature 上限 2",
+            Quirk::EmptyThinkingSignature => "出站转换：thinking 签名可能为空串",
+            Quirk::SilentTruncate => "出站响应：上游可能静默截断（不给终态）",
+        }
+    }
 
     pub fn name(&self) -> &'static str {
         match self {
@@ -342,6 +368,55 @@ impl Upstream {
             .map(|(w, p)| format!("{}={}", w.as_str(), p))
             .collect::<Vec<_>>()
             .join("、")
+    }
+
+    /// 会话 ID：同一段对话稳定即可（上游用于路由与 prompt 缓存优化）。FNV-1a 够用。
+    /// 载荷是 [`Quirk::SessionIdHeader`] 声明的头名。
+    pub fn session_id(&self, seed: &str) -> String {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in seed.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
+        format!("gw-{h:016x}")
+    }
+}
+
+// ---------- env（M1 脚手架：凭据还从 .env 来） ----------
+
+/// 极简 KEY=VALUE 凭据文件（票 41 从原型搬入）。
+///
+/// 正式路径是票 42 的 [`Store`] + DPAPI（`credentials` 表）；M1 与回放 harness 先用它把
+/// 两条真上游接起来，票 51 把路由表改成「按绑定种库」后这个脚手架就该退场。
+#[derive(Default)]
+pub struct Env {
+    pub vars: HashMap<String, String>,
+    pub port: Option<u16>,
+}
+
+impl Env {
+    /// 极简 KEY=VALUE 解析：只要几个键，不值得为它引一个 dotenv 依赖。
+    pub fn load(path: &str) -> Env {
+        let mut e = Env::default();
+        let Ok(text) = std::fs::read_to_string(path) else {
+            eprintln!("[warn] 读不到 {path}，真实上游将不可用（只有 mock 能跑）");
+            return e;
+        };
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some((k, v)) = line.split_once('=') {
+                e.vars.insert(k.trim().to_string(), v.trim().to_string());
+            }
+        }
+        e.port = e.get("GATEWAY_PORT").and_then(|v| v.parse().ok());
+        e
+    }
+
+    pub fn get(&self, k: &str) -> Option<String> {
+        self.vars.get(k).filter(|v| !v.is_empty()).cloned()
     }
 }
 
@@ -1392,4 +1467,158 @@ fn now_unix() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    //! quirk 的两向守卫（票 19 §6，票 41 随产品侧 fixtures 搬入）：枚举值 ⇄ fixture 标签。
+    //! 票 49 删掉 `ClaudeModelsOnAnthropicOnly`（ADR-0004 第 5 条），它的豁免条目一并删；
+    //! spec §6 新给的四个值还没有转换代码执法点，先在豁免表里写明理由。
+
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    fn fixtures_dir() -> PathBuf {
+        // fixtures 在产品侧 `tests/fixtures/`（冻结原型那份只读）。
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+    }
+
+    /// 每份 `<scenario>/<wire>.meta.json`。
+    fn fixture_metas(dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let Ok(scenarios) = std::fs::read_dir(dir) else {
+            return out;
+        };
+        for scenario in scenarios.flatten().filter(|e| e.path().is_dir()) {
+            let Ok(files) = std::fs::read_dir(scenario.path()) else {
+                continue;
+            };
+            for f in files.flatten() {
+                let p = f.path();
+                let name = p
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                if name.ends_with(".meta.json") {
+                    out.push(p);
+                }
+            }
+        }
+        out
+    }
+
+    /// 每份 meta.json 的 `quirks` 标签 = 它覆盖的 quirk 名。
+    fn tagged_quirks(dir: &Path) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for p in fixture_metas(dir) {
+            let Ok(text) = std::fs::read_to_string(&p) else {
+                continue;
+            };
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+                continue;
+            };
+            for n in v
+                .get("quirks")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+            {
+                out.push((n.to_string(), p.display().to_string()));
+            }
+        }
+        out
+    }
+
+    /// 豁免表：只有真有理由的 quirk 才准留在这里，理由写在值里。
+    fn exemptions(dir: &Path) -> HashMap<String, String> {
+        let Ok(text) = std::fs::read_to_string(dir.join("quirk-exempt.json")) else {
+            return HashMap::new();
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+            return HashMap::new();
+        };
+        v.get("exempt")
+            .and_then(serde_json::Value::as_object)
+            .map(|o| {
+                o.iter()
+                    .map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn every_quirk_declares_what_it_acts_on() {
+        for q in Quirk::all() {
+            assert!(!q.acts_on().is_empty(), "quirk {} 没声明作用对象", q.name());
+        }
+    }
+
+    /// 双向守卫（票 19 §6.1）：枚举值 ⇄ fixture 标签，任一侧多出来都红。
+    /// 反向验证（票 30 第 12 条）：抽掉一份带标签的 fixture，这条就变红。
+    #[test]
+    fn every_quirk_is_covered_by_a_fixture_or_explicitly_exempt() {
+        let dir = fixtures_dir();
+        let tags = tagged_quirks(&dir);
+        let exempt = exemptions(&dir);
+        assert!(
+            !tags.is_empty(),
+            "fixtures 里没有任何 quirk 标签，守卫等于没网"
+        );
+        for q in Quirk::all() {
+            let n = q.name();
+            assert!(
+                tags.iter().any(|(t, _)| t == n) || exempt.contains_key(n),
+                "quirk {n} 既没有 fixture 的 quirks 标签，也没写进 fixtures/quirk-exempt.json"
+            );
+        }
+        for (name, why) in &exempt {
+            assert!(
+                Quirk::all().iter().any(|q| q.name() == name),
+                "豁免表里的 {name} 不是现存枚举值"
+            );
+            assert!(!why.trim().is_empty(), "豁免 {name} 没写理由");
+        }
+    }
+
+    /// 标签写错字也算守卫失败：否则枚举值能靠一个拼错的标签「假装」被覆盖。
+    #[test]
+    fn fixture_quirk_tags_are_real_enum_values() {
+        for (tag, path) in tagged_quirks(&fixtures_dir()) {
+            assert!(
+                Quirk::all().iter().any(|q| q.name() == tag),
+                "{path} 标了不存在的 quirk {tag}"
+            );
+        }
+    }
+
+    /// 标签指着的 fixture 必须真有字节：抽掉一份 `.sse`，守卫就得红（票 30 第 12 条的反向验证）。
+    #[test]
+    fn every_tagged_fixture_has_bytes() {
+        let dir = fixtures_dir();
+        for meta in fixture_metas(&dir) {
+            let name = meta
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            let sse = meta.with_file_name(name.replace(".meta.json", ".sse"));
+            assert!(sse.exists(), "{} 没有对应的字节文件", sse.display());
+            let Ok(text) = std::fs::read_to_string(&meta) else {
+                continue;
+            };
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+                panic!("{} 不是合法 JSON", meta.display());
+            };
+            for key in ["scenario", "outbound_wire", "model", "request"] {
+                assert!(
+                    !v.get(key).unwrap_or(&serde_json::Value::Null).is_null(),
+                    "{} 缺字段 {key}",
+                    meta.display()
+                );
+            }
+        }
+    }
 }

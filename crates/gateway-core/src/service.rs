@@ -28,6 +28,9 @@ pub struct GatewayConfig {
     pub port: u16,
     pub db_path: PathBuf,
     pub version: String,
+    /// 转发面 `/v1/*` 的状态（票 41 的 [`crate::ingress::proxy::Gateway`]）。
+    /// `None` = 只起管理面：外壳还没接出站转发（供应商表与绑定表来自票 49 / 51）时就是这一档。
+    pub forwarding: Option<Arc<crate::ingress::proxy::Gateway>>,
 }
 
 #[derive(Debug)]
@@ -126,7 +129,7 @@ pub async fn start(cfg: GatewayConfig) -> Result<Gateway, StartError> {
         cfg.db_path.to_string_lossy().into_owned(),
         addr.port(),
     ));
-    let app = crate::ingress::router((*state).clone());
+    let app = crate::ingress::router((*state).clone(), cfg.forwarding);
     let (tx, rx) = oneshot::channel();
 
     let task = tokio::spawn(async move {

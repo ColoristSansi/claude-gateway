@@ -1,0 +1,6 @@
+{"exempt":{
+  "NoModelsEndpoint":"上游级事实（不提供模型发现端点），只在拉模型那一步读它，不产生回放 fixture；票 49 落库，拉取用例归票 50。",
+  "TemperatureMax2":"spec §6 给的待实现 quirk：转换代码里还没有执法点；实现后必须同批补一条 fixture。",
+  "EmptyThinkingSignature":"spec §6 给的待实现 quirk：转换代码里还没有执法点；实现后必须同批补一条 fixture。",
+  "SilentTruncate":"spec §6 给的待实现 quirk：转换代码里还没有执法点；实现后必须同批补一条 fixture。"
+}}

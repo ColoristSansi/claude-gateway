@@ -13,6 +13,9 @@ fn config(port: u16, db_path: &str) -> GatewayConfig {
         port,
         db_path: PathBuf::from(db_path),
         version: "0.1.0-test".to_string(),
+        // 票 43 的验收只测管理面与生命周期；转发面由票 41 的回放套件起 harness 单测（见
+        // tests/replay.rs），票 51 接了真绑定表之后再从这里挂上。
+        forwarding: None,
     }
 }
 
