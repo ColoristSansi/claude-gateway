@@ -232,6 +232,8 @@ pub async fn forward_buffered(
     key: &str,
     req: IrRequest,
     client_model: String,
+    // 客户端档案 id（票 51）：只进日志行，转发逻辑不看它。
+    client: String,
     pass_headers: Vec<(String, String)>,
     inbound: Inbound,
 ) -> Response {
@@ -273,6 +275,7 @@ pub async fn forward_buffered(
                 wire,
                 status.as_u16() as i64,
                 &client_model,
+                &client,
                 Some(msg.clone()),
             )
             .await;
@@ -290,6 +293,7 @@ pub async fn forward_buffered(
             wire,
             status.as_u16() as i64,
             &client_model,
+            &client,
             Some(msg.clone()),
         )
         .await;
@@ -346,6 +350,7 @@ pub async fn forward_buffered(
     let row = RequestLog {
         ts: 0,
         virtual_model: client_model.clone(),
+        client: Some(client.clone()),
         upstream_id: up.id.clone(),
         real_model: req.model.clone(),
         wire: wire.as_str().into(),
@@ -416,6 +421,8 @@ pub async fn forward(
     key: &str,
     req: IrRequest,
     client_model: String,
+    // 客户端档案 id（票 51）：只进日志行，转发逻辑不看它。
+    client: String,
     pass_headers: Vec<(String, String)>,
     inbound: Inbound,
 ) -> Response {
@@ -457,6 +464,7 @@ pub async fn forward(
                 wire,
                 status.as_u16() as i64,
                 &client_model,
+                &client,
                 Some(msg.clone()),
             )
             .await;
@@ -475,6 +483,7 @@ pub async fn forward(
             wire,
             status.as_u16() as i64,
             &client_model,
+            &client,
             Some(msg.clone()),
         )
         .await;
@@ -503,6 +512,7 @@ pub async fn forward(
         row: RequestLog {
             ts: 0,
             virtual_model: client_model,
+            client: Some(client),
             upstream_id: up.id.clone(),
             real_model: req.model.clone(),
             wire: wire.as_str().into(),
@@ -681,6 +691,8 @@ impl Drop for Pump {
     }
 }
 
+/// 转发还没进流就失败时的日志行（连接失败 / 上游非 2xx）：这一发没有终态可等，一个字段一个字段地拼。
+#[allow(clippy::too_many_arguments)]
 async fn log_plain(
     store: &Store,
     upstream_id: &str,
@@ -688,12 +700,14 @@ async fn log_plain(
     wire: Wire,
     status: i64,
     client_model: &str,
+    client: &str,
     error: Option<String>,
 ) {
     let _ = obs::log(
         store,
         &RequestLog {
             virtual_model: client_model.to_string(),
+            client: Some(client.to_string()),
             upstream_id: upstream_id.to_string(),
             real_model: real_model.to_string(),
             wire: wire.as_str().into(),

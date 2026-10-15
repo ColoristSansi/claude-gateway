@@ -28,7 +28,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 
 use crate::store::{settings_keys, Store};
@@ -126,16 +126,21 @@ pub enum Quirk {
     SessionIdHeader(String),
     /// 该上游根本不提供模型发现端点：向导不必尝试，直接给手填入口。
     NoModelsEndpoint,
+    /// 模型清单**只有带凭据那份可信**：不带凭据会拿到未授权的全量目录（opencode 实测 19/85，
+    /// 差异是权限过滤，未授权模型调用一律 403）。含义：没凭据就不拉；带凭据 404 / 零条才退匿名兜底
+    /// （票 35 第 8 条；执法点在 [`crate::egress::discovery::run_pull`]）。
+    ModelsListNeedsCredential,
     TemperatureMax2,
     EmptyThinkingSignature,
     SilentTruncate,
 }
 
 impl Quirk {
-    pub const NAMES: [&'static str; 6] = [
+    pub const NAMES: [&'static str; 7] = [
         "ClientUserAgent",
         "SessionIdHeader",
         "NoModelsEndpoint",
+        "ModelsListNeedsCredential",
         "TemperatureMax2",
         "EmptyThinkingSignature",
         "SilentTruncate",
@@ -147,6 +152,7 @@ impl Quirk {
             Quirk::ClientUserAgent(String::new()),
             Quirk::SessionIdHeader(String::new()),
             Quirk::NoModelsEndpoint,
+            Quirk::ModelsListNeedsCredential,
             Quirk::TemperatureMax2,
             Quirk::EmptyThinkingSignature,
             Quirk::SilentTruncate,
@@ -161,6 +167,9 @@ impl Quirk {
                 "出站请求头（头名由变体载荷给出，值为按首条 user 文本派生的会话 ID）"
             }
             Quirk::NoModelsEndpoint => "上游级事实：不提供模型发现端点（向导不必尝试拉取）",
+            Quirk::ModelsListNeedsCredential => {
+                "上游级事实：模型清单只有带凭据那份可信（没凭据不拉，带凭据 404/零条才退匿名）"
+            }
             Quirk::TemperatureMax2 => "出站请求体：temperature 上限 2",
             Quirk::EmptyThinkingSignature => "出站转换：thinking 签名可能为空串",
             Quirk::SilentTruncate => "出站响应：上游可能静默截断（不给终态）",
@@ -172,6 +181,7 @@ impl Quirk {
             Quirk::ClientUserAgent(_) => "ClientUserAgent",
             Quirk::SessionIdHeader(_) => "SessionIdHeader",
             Quirk::NoModelsEndpoint => "NoModelsEndpoint",
+            Quirk::ModelsListNeedsCredential => "ModelsListNeedsCredential",
             Quirk::TemperatureMax2 => "TemperatureMax2",
             Quirk::EmptyThinkingSignature => "EmptyThinkingSignature",
             Quirk::SilentTruncate => "SilentTruncate",
@@ -191,6 +201,7 @@ impl Quirk {
             "ClientUserAgent" => Some(Quirk::ClientUserAgent(arg.to_string())),
             "SessionIdHeader" => Some(Quirk::SessionIdHeader(arg.to_string())),
             "NoModelsEndpoint" => Some(Quirk::NoModelsEndpoint),
+            "ModelsListNeedsCredential" => Some(Quirk::ModelsListNeedsCredential),
             "TemperatureMax2" => Some(Quirk::TemperatureMax2),
             "EmptyThinkingSignature" => Some(Quirk::EmptyThinkingSignature),
             "SilentTruncate" => Some(Quirk::SilentTruncate),
@@ -258,9 +269,13 @@ impl PullStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PullState {
+    /// 上次**尝试**拉取的时间（失败也算尝试过）。
     pub at: i64,
+    /// 上次**成功**拉取（真的换过目录）的时间；从没成功过 = `None`。
+    /// 失败与「不提供模型发现」不动它，所以卡片能报「沿用上次结果（时间）」（票 35 第 5 条）。
+    pub ok_at: Option<i64>,
     pub status: PullStatus,
-    /// 「上次拉取警告」：wire 反查不到的端点 / 拉取失败原因。成功拉取时清空。
+    /// 「上次拉取警告」：wire 反查不到的端点 / 拉取失败原因。**只有成功拉取才清**（票 35 第 1 条）。
     pub warning: Option<String>,
 }
 
@@ -717,6 +732,7 @@ fn upstream_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Upstream> {
     let pull_warning: Option<String> = r.get(9)?;
     let sc_at: Option<i64> = r.get(10)?;
     let sc_status: Option<String> = r.get(11)?;
+    let pull_ok_at: Option<i64> = r.get(12)?;
 
     let mut auth = BTreeMap::new();
     if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&auth_json) {
@@ -755,6 +771,7 @@ fn upstream_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Upstream> {
     let last_pull = pull_at.and_then(|at| {
         Some(PullState {
             at,
+            ok_at: pull_ok_at,
             status: PullStatus::parse(pull_status.as_deref()?)?,
             warning: pull_warning.clone(),
         })
@@ -778,7 +795,8 @@ fn upstream_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Upstream> {
 }
 
 const UPSTREAM_COLS: &str = "id,name,base_url,auth_json,path_templates_json,header_passthrough_json,
-     quirks_json,last_pull_at,last_pull_status,last_pull_warning,last_selfcheck_at,last_selfcheck_status";
+     quirks_json,last_pull_at,last_pull_status,last_pull_warning,last_selfcheck_at,last_selfcheck_status,
+     last_pull_ok_at";
 
 pub async fn load_upstream(store: &Store, id: &str) -> Result<Option<Upstream>> {
     let id = id.to_string();
@@ -808,20 +826,42 @@ pub async fn list_upstreams(store: &Store) -> Result<Vec<Upstream>> {
 
 /// 「上次拉取时间 / 结果 / 警告」的写入点。`warning` 为 `None` 即清空（下次成功拉取自动清）。
 pub async fn set_pull_result(store: &Store, id: &str, pull: &PullState) -> Result<()> {
-    let (id, at, status, warning) = (
+    let (id, at, ok_at, status, warning) = (
         id.to_string(),
         pull.at,
+        pull.ok_at,
         pull.status.as_str().to_string(),
         pull.warning.clone(),
     );
     store
         .write(move |c| {
             c.execute(
-                "UPDATE upstreams SET last_pull_at=?2,last_pull_status=?3,last_pull_warning=?4
+                "UPDATE upstreams SET last_pull_at=?2,last_pull_ok_at=?3,last_pull_status=?4,
+                                      last_pull_warning=?5
                  WHERE id=?1",
-                params![id, at, status, warning],
+                params![id, at, ok_at, status, warning],
             )?;
             Ok(())
+        })
+        .await
+}
+
+/// 库里现存的「上次成功拉取时间」与「上次拉取警告」。
+///
+/// 失败与「不提供模型发现」两支要**保留**这两个事实（票 35 第 1 / 5 条：只有成功拉取才移动成功
+/// 时间、才清角标），所以它们从库里现读，而不是信调用方手里那份 `Upstream`（可能是拉取前的旧快照）。
+pub async fn carried_pull_facts(store: &Store, id: &str) -> Result<(Option<i64>, Option<String>)> {
+    let id = id.to_string();
+    store
+        .read(move |c| {
+            let row = c
+                .query_row(
+                    "SELECT last_pull_ok_at,last_pull_warning FROM upstreams WHERE id=?1",
+                    params![id],
+                    |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<String>>(1)?)),
+                )
+                .optional()?;
+            Ok(row.unwrap_or((None, None)))
         })
         .await
 }
@@ -1259,18 +1299,18 @@ pub async fn pull_models(
     }
     let resp = match rb.send().await {
         Ok(r) => r,
-        Err(e) => return PullOutcome::Failed(format!("拉模型失败：{e}")),
+        Err(e) => return PullOutcome::Failed(format!("拉取失败：{e}")),
     };
     let status = resp.status();
     if status.as_u16() == 404 || status.as_u16() == 405 {
         return PullOutcome::NoDiscovery;
     }
     if !status.is_success() {
-        return PullOutcome::Failed(format!("拉模型失败：上游 {status}"));
+        return PullOutcome::Failed(format!("拉取失败：上游 {status}"));
     }
     let body: Value = match resp.json().await {
         Ok(v) => v,
-        Err(e) => return PullOutcome::Failed(format!("拉模型失败：响应不是 JSON（{e}）")),
+        Err(e) => return PullOutcome::Failed(format!("拉取失败：响应不是 JSON（{e}）")),
     };
     let list = body.get("data").and_then(Value::as_array);
     let Some(list) = list else {
@@ -1305,31 +1345,46 @@ pub async fn pull_models(
 
 /// 拉模型用哪份凭据：先 `default`；没有 `default` 时只有一份就用它；多份回 `None`（界面下拉选）。
 pub async fn pull_credential(store: &Store, upstream_id: &str) -> Result<Option<String>> {
-    let id = upstream_id.to_string();
-    let wires: Vec<String> = store
-        .read(move |c| {
-            let mut st =
-                c.prepare("SELECT wire FROM credentials WHERE upstream_id=?1 ORDER BY wire")?;
-            let rows = st.query_map(params![id], |r| r.get::<_, String>(0))?;
-            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-        })
-        .await?;
-    let wire = if wires.iter().any(|w| w == "default") {
-        Some("default".to_string())
-    } else if wires.len() == 1 {
-        wires.first().cloned()
-    } else {
-        None
-    };
+    let wire = pull_credential_wire(store, upstream_id).await?;
     match wire {
         Some(w) => store.credential_secret(upstream_id, &w).await,
         None => Ok(None),
     }
 }
 
+/// 该上游存了哪几份凭据（wire 名，排序）。空 = 一份都没有。
+///
+/// [`pull_credential`] 回 `None` 有两种截然不同的原因（一份都没有 / 多份且没有 `default`），
+/// 界面处置不同（「去填 key」vs「选一份」），所以这两个事实要能分别问出来。
+pub async fn credential_wires(store: &Store, upstream_id: &str) -> Result<Vec<String>> {
+    let id = upstream_id.to_string();
+    store
+        .read(move |c| {
+            let mut st =
+                c.prepare("SELECT wire FROM credentials WHERE upstream_id=?1 ORDER BY wire")?;
+            let rows = st.query_map(params![id], |r| r.get::<_, String>(0))?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .await
+}
+
+/// 拉模型该用哪一份凭据（`default` 优先 → 唯一一份 → 多份且无 `default` = 交给界面）。
+async fn pull_credential_wire(store: &Store, upstream_id: &str) -> Result<Option<String>> {
+    let wires = credential_wires(store, upstream_id).await?;
+    if wires.iter().any(|w| w == "default") {
+        Ok(Some("default".to_string()))
+    } else if wires.len() == 1 {
+        Ok(wires.into_iter().next())
+    } else {
+        Ok(None)
+    }
+}
+
 /// 一次拉取对目录做了什么（给界面回执用）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PullApplied {
+    /// 本次上游报回来的条目数（拉取失败与「不提供模型发现」都是 0）。
+    pub fetched: usize,
     pub added: usize,
     pub updated: usize,
     pub removed: usize,
@@ -1352,11 +1407,14 @@ pub async fn apply_pull(
 ) -> Result<PullApplied> {
     let remotes = match outcome {
         PullOutcome::Failed(msg) => {
+            // 失败只记「上次尝试」：成功时间与旧角标留给成功那次去动（票 35 第 5 条）。
+            let (ok_at, _) = carried_pull_facts(store, &up.id).await?;
             set_pull_result(
                 store,
                 &up.id,
                 &PullState {
                     at,
+                    ok_at,
                     status: PullStatus::Failed,
                     warning: Some(msg),
                 },
@@ -1365,13 +1423,16 @@ pub async fn apply_pull(
             return Ok(PullApplied::default());
         }
         PullOutcome::NoDiscovery => {
+            // 「不提供模型发现」不算成功：不动目录、不动成功时间，也**不清**上一次的角标。
+            let (ok_at, warning) = carried_pull_facts(store, &up.id).await?;
             set_pull_result(
                 store,
                 &up.id,
                 &PullState {
                     at,
+                    ok_at,
                     status: PullStatus::NoDiscovery,
-                    warning: None,
+                    warning,
                 },
             )
             .await?;
@@ -1400,6 +1461,7 @@ pub async fn apply_pull(
 
     let upstream_id = up.id.clone();
     let mut applied = PullApplied {
+        fetched: remotes.len(),
         warnings: warnings.clone(),
         ..Default::default()
     };
@@ -1478,6 +1540,7 @@ pub async fn apply_pull(
         &up.id,
         &PullState {
             at,
+            ok_at: Some(at),
             status: PullStatus::Ok,
             warning: warning_text,
         },

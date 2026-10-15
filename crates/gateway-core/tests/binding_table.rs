@@ -204,6 +204,31 @@ fn exposed_models_list_family_slots_first_then_normal_models() {
     );
     let flags: Vec<bool> = t.exposed().into_iter().map(|m| m.is_family).collect();
     assert_eq!(flags, vec![true, true, true, true, false]);
+    // 每条带的三元组默认按 `global` 解析；按档案看用 `exposed_for`（Codex 目录写描述用）。
+    let haiku = t
+        .exposed()
+        .into_iter()
+        .find(|m| m.name == "claude-haiku")
+        .unwrap()
+        .binding
+        .expect("夹具里绑好了");
+    assert_eq!(haiku.upstream_id, "cc");
+    let haiku_codex = t
+        .exposed_for(Profile::Codex)
+        .into_iter()
+        .find(|m| m.name == "claude-haiku")
+        .unwrap()
+        .binding
+        .expect("codex 档案里有覆盖");
+    assert_eq!(haiku_codex.real_model, "gpt-5.1-codex");
+    // 还没绑的家族槽位照样暴露名字，只是没有三元组（请求期 404）。
+    let bare = BindingTable::new(Vec::new(), default_profiles());
+    let unbound = bare
+        .exposed()
+        .into_iter()
+        .find(|m| m.name == "claude-opus")
+        .unwrap();
+    assert!(unbound.binding.is_none());
     // 同名跨档案只出一条（含 Codex 的覆盖名）。
     let t2 = BindingTable::new(
         vec![

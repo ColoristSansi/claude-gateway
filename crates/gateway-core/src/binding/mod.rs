@@ -234,9 +234,50 @@ impl BindingTable {
     /// 请求期解析：去首尾空白、大小写敏感；档案没有那份就落回 `global`。
     pub fn resolve(&self, raw_name: &str, identity: &str) -> Result<Binding, ResolveError> {
         let name = raw_name.trim();
-        let profile = self.profile_for(identity);
-        let hit = self
-            .rows
+        self.find(name, self.profile_for(identity))
+            .cloned()
+            .ok_or_else(|| ResolveError {
+                name: name.to_string(),
+            })
+    }
+
+    /// 网关暴露的模型清单（`GET /v1/models` 与 Codex 模型目录的同一份来源，票 31）：
+    /// 四个家族槽位恒在且在最前，其余虚拟模型按名排序；跨档案同名只出一条。
+    ///
+    /// **不按客户端过滤**（spec §8.2 第 2 条：过滤在配置层完成，发现层用同一判据）；
+    /// 只是信封形状按客户端家族给（`ingress::proxy::list_models`）。
+    /// 每条带的三元组按 `global` 解析；要在 Codex 目录里写「该档案实际走哪条」用
+    /// [`BindingTable::exposed_for`]。
+    pub fn exposed(&self) -> Vec<ExposedModel> {
+        self.exposed_for(Profile::Global)
+    }
+
+    /// 同上，但每条描述里的三元组按给定档案解析（该档案的覆盖优先，落回 `global`）。
+    pub fn exposed_for(&self, profile: Profile) -> Vec<ExposedModel> {
+        let mut names: Vec<(String, bool)> = FAMILY_SLOTS
+            .iter()
+            .map(|name| ((*name).to_string(), true))
+            .collect();
+        let mut normal: BTreeSet<&str> = BTreeSet::new();
+        for row in &self.rows {
+            if !row.is_family() {
+                normal.insert(row.name.as_str());
+            }
+        }
+        names.extend(normal.into_iter().map(|name| (name.to_string(), false)));
+        names
+            .into_iter()
+            .map(|(name, is_family)| ExposedModel {
+                binding: self.find(&name, profile).cloned(),
+                name,
+                is_family,
+            })
+            .collect()
+    }
+
+    /// 「档案里的那份 → 没有就落回 global」的查表（[`BindingTable::resolve`] 与暴露清单共用）。
+    fn find(&self, name: &str, profile: Profile) -> Option<&Binding> {
+        self.rows
             .iter()
             .find(|r| r.profile == profile && r.name == name)
             .or_else(|| {
@@ -247,44 +288,17 @@ impl BindingTable {
                             .find(|r| r.profile == Profile::Global && r.name == name)
                     })
                     .flatten()
-            });
-        hit.cloned().ok_or_else(|| ResolveError {
-            name: name.to_string(),
-        })
-    }
-
-    /// 网关暴露的模型清单（`GET /v1/models` 与 Codex 模型目录的同一份来源，票 31）：
-    /// 四个家族槽位恒在且在最前，其余虚拟模型按名排序；跨档案同名只出一条。
-    ///
-    /// **不按客户端过滤**（spec §8.2 第 2 条：过滤在配置层完成，发现层用同一判据）；
-    /// 只是信封形状按客户端家族给（`ingress::proxy::list_models`）。
-    pub fn exposed(&self) -> Vec<ExposedModel> {
-        let mut out: Vec<ExposedModel> = FAMILY_SLOTS
-            .iter()
-            .map(|name| ExposedModel {
-                name: (*name).to_string(),
-                is_family: true,
             })
-            .collect();
-        let mut normal: BTreeSet<&str> = BTreeSet::new();
-        for row in &self.rows {
-            if !row.is_family() {
-                normal.insert(row.name.as_str());
-            }
-        }
-        out.extend(normal.into_iter().map(|name| ExposedModel {
-            name: name.to_string(),
-            is_family: false,
-        }));
-        out
     }
 }
 
-/// `/v1/models` 与 Codex 目录里的一项。
+/// `/v1/models` 与 Codex 目录里的一项：暴露的名字 + 它在（某档案下）解析到的三元组。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExposedModel {
     pub name: String,
     pub is_family: bool,
+    /// 还没绑全的家族槽位是 `None`（名字照样暴露，请求期 404）。
+    pub binding: Option<Binding>,
 }
 
 // ───────────────────────── 落库 ─────────────────────────

@@ -1439,6 +1439,32 @@ async fn client_profile_override_and_models_exposure() {
         format!("普通虚拟模型也该在清单里：{exposed:?}"),
     );
 
+    // ⑤ 日志行记下**归属到的档案**（票 51）：`requests.client` 是按客户端聚合的唯一依据（票 53）。
+    let logs = gw.logs(3).await;
+    let haiku_rows: Vec<Value> = logs
+        .into_iter()
+        .filter(|r| r["virtual_model"] == "claude-haiku")
+        .collect();
+    let client_of = |status: i64| -> Vec<String> {
+        haiku_rows
+            .iter()
+            .filter(|r| r["status"] == json!(status))
+            .filter_map(|r| r["client"].as_str().map(str::to_string))
+            .collect()
+    };
+    check(
+        &mut fails,
+        client_of(200) == vec!["codex".to_string()],
+        format!("codex 档案那一发该记 client=codex：{:?}", client_of(200)),
+    );
+    let mut failed_clients = client_of(502);
+    failed_clients.sort();
+    check(
+        &mut fails,
+        failed_clients == vec!["claude-code".to_string(), "global".to_string()],
+        format!("落回全局的两发该记 claude-code / global：{failed_clients:?}"),
+    );
+
     assert!(
         fails.is_empty(),
         "客户端档案覆盖与 /v1/models {} 处不合格：\n{}",

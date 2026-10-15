@@ -18,6 +18,9 @@ pub struct RequestLog {
     /// Unix 秒（UTC）；0 = 落库时现算。
     pub ts: i64,
     pub virtual_model: String,
+    /// 客户端档案 id（`global` / `claude-desktop` / `claude-code` / `codex`，票 51）：
+    /// 按客户端维度聚合用量就看这一列（票 53）。
+    pub client: Option<String>,
     pub upstream_id: String,
     pub real_model: String,
     pub wire: String,
@@ -42,13 +45,14 @@ pub async fn log(store: &Store, row: &RequestLog) -> Result<()> {
             // 一行日志 + 它的 body 必须一起可见（票 41：测试读的是「有行就有 body」）。
             let tx = c.transaction()?;
             tx.execute(
-                "INSERT INTO requests(ts,virtual_model,upstream_id,real_model,wire,status,
+                "INSERT INTO requests(ts,virtual_model,client,upstream_id,real_model,wire,status,
                                       first_byte_ms,total_ms,input_tokens,output_tokens,cache_read,
                                       aborted,error)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
                 params![
                     ts,
                     row.virtual_model,
+                    row.client,
                     row.upstream_id,
                     row.real_model,
                     row.wire,
@@ -80,7 +84,7 @@ pub async fn recent(store: &Store, limit: usize) -> Result<Vec<Value>> {
     store
         .read(move |c| {
             let mut st = c.prepare(
-                "SELECT r.ts,r.virtual_model,r.upstream_id,r.real_model,r.wire,r.status,
+                "SELECT r.ts,r.virtual_model,r.client,r.upstream_id,r.real_model,r.wire,r.status,
                         r.first_byte_ms,r.total_ms,r.input_tokens,r.output_tokens,r.cache_read,
                         r.aborted,r.error,b.request_body
                    FROM requests r
@@ -91,18 +95,19 @@ pub async fn recent(store: &Store, limit: usize) -> Result<Vec<Value>> {
                 Ok(json!({
                     "ts": r.get::<_, i64>(0)?,
                     "virtual_model": r.get::<_, Option<String>>(1)?,
-                    "upstream": r.get::<_, Option<String>>(2)?,
-                    "real_model": r.get::<_, Option<String>>(3)?,
-                    "wire": r.get::<_, Option<String>>(4)?,
-                    "status": r.get::<_, Option<i64>>(5)?,
-                    "first_byte_ms": r.get::<_, Option<i64>>(6)?,
-                    "total_ms": r.get::<_, Option<i64>>(7)?,
-                    "input_tokens": r.get::<_, Option<i64>>(8)?,
-                    "output_tokens": r.get::<_, Option<i64>>(9)?,
-                    "cache_read": r.get::<_, Option<i64>>(10)?,
-                    "aborted": r.get::<_, i64>(11)? != 0,
-                    "error": r.get::<_, Option<String>>(12)?,
-                    "body": r.get::<_, Option<String>>(13)?,
+                    "client": r.get::<_, Option<String>>(2)?,
+                    "upstream": r.get::<_, Option<String>>(3)?,
+                    "real_model": r.get::<_, Option<String>>(4)?,
+                    "wire": r.get::<_, Option<String>>(5)?,
+                    "status": r.get::<_, Option<i64>>(6)?,
+                    "first_byte_ms": r.get::<_, Option<i64>>(7)?,
+                    "total_ms": r.get::<_, Option<i64>>(8)?,
+                    "input_tokens": r.get::<_, Option<i64>>(9)?,
+                    "output_tokens": r.get::<_, Option<i64>>(10)?,
+                    "cache_read": r.get::<_, Option<i64>>(11)?,
+                    "aborted": r.get::<_, i64>(12)? != 0,
+                    "error": r.get::<_, Option<String>>(13)?,
+                    "body": r.get::<_, Option<String>>(14)?,
                 }))
             })?;
             Ok(it.collect::<rusqlite::Result<Vec<_>>>()?)

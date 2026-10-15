@@ -155,6 +155,7 @@ async fn proxy(
     let name = virtual_model(&body);
     // 票 51：客户端档案归属按入站 `user-agent` + 客户端标识头判（同一槽位按客户端走不同上游）。
     let identity = client_identity(&headers);
+    let profile = app.bindings.profile_for(&identity);
     // 票 15：记下客户端真实打的路径与协议头，用来定 base URL 语义。
     println!(
         "[in] {} proto={} model={name} profile={} ua={:?} ver={:?} beta={:?}",
@@ -163,7 +164,7 @@ async fn proxy(
             Inbound::Anthropic => "anthropic",
             Inbound::Responses => "responses",
         },
-        app.bindings.profile_for(&identity).id(),
+        profile.id(),
         headers.get("user-agent").and_then(|v| v.to_str().ok()),
         headers
             .get("anthropic-version")
@@ -247,9 +248,33 @@ async fn proxy(
     let pass = protocol_headers(&headers);
 
     if streaming {
-        upstream::forward(app, &up, wire, auth, &key, req, name, pass, inbound).await
+        upstream::forward(
+            app,
+            &up,
+            wire,
+            auth,
+            &key,
+            req,
+            name,
+            profile.id().to_string(),
+            pass,
+            inbound,
+        )
+        .await
     } else {
-        upstream::forward_buffered(app, &up, wire, auth, &key, req, name, pass, inbound).await
+        upstream::forward_buffered(
+            app,
+            &up,
+            wire,
+            auth,
+            &key,
+            req,
+            name,
+            profile.id().to_string(),
+            pass,
+            inbound,
+        )
+        .await
     }
 }
 

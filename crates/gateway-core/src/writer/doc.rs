@@ -554,7 +554,10 @@ fn json_at_mut<'a>(root: &'a mut Json, path: &[String]) -> Result<Option<&'a mut
 
 fn json_ensure_array<'a>(root: &'a mut Json, path: &[String]) -> Result<&'a mut Vec<Json>> {
     let slot = json_ensure(root, path)?;
-    if slot.is_null() {
+    // `json_ensure` 给**缺失**的键建的是空对象，`Set` 到过 `null` 的槽位是 null——两者都要归一成
+    // 空数组。桌面写入器的 `_meta.json` 第一次被网关新建时，`entries` 走的正是这条路
+    // （票 46：`SetElement` 必须能自己把数组建出来）。
+    if slot.is_null() || slot.as_object().is_some_and(|o| o.is_empty()) {
         *slot = Json::Array(Vec::new());
     }
     slot.as_array_mut()
