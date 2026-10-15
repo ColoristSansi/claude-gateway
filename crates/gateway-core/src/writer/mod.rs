@@ -47,6 +47,7 @@
 
 mod atomic;
 mod backup;
+pub mod claude_code;
 mod doc;
 mod engine;
 pub mod instance;
