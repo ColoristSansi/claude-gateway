@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 
 use crate::anthropic;
 use crate::binding::Route;
-use crate::egress::provider::{Upstream, Wire};
+use crate::egress::provider::{Upstream, UpstreamModel, Wire};
 use crate::egress::upstream::{self, Inbound};
 use crate::ir;
 use crate::responses;
@@ -37,8 +37,16 @@ pub const BODY_LOG_WINDOW: Duration = Duration::from_secs(3600);
 /// 网关运行态：出站客户端、供应商表、绑定表、日志落点与三个旋钮。
 pub struct Gateway {
     pub client: reqwest::Client,
-    /// 声明式供应商表：id → 上游（路径模板 / 认证 / quirks）。
+    /// 声明式供应商表：id → 上游（路径模板 / 认证 / quirks）。**不含密钥**（票 49）。
     pub upstreams: HashMap<String, Upstream>,
+    /// 上游模型目录：`(上游 id, 真实模型)` → 目录条目（票 49 的三层校验第二层用它早拒）。
+    pub catalog: HashMap<(String, String), UpstreamModel>,
+    /// 出站凭据：上游 id → 明文 key。
+    ///
+    /// M1 脚手架（票 41 的 `Gateway.env` 那套）：正式路径是票 42 的 `Store` + DPAPI
+    /// （`credentials` 表按「上游 × wire」各存一份），票 51 的绑定层接手后这里退场。
+    /// 只活在内存里，`Debug` 不打印（见下方手写实现）。
+    pub keys: HashMap<String, String>,
     /// 绑定表：虚拟模型名 → 上游 + 真实模型 + wire。
     pub routes: Vec<Route>,
     /// 日志落点（票 42 的 `Store`）。
@@ -52,11 +60,13 @@ pub struct Gateway {
 }
 
 impl std::fmt::Debug for Gateway {
-    /// 手写而不是 `derive`：供应商表里带着 API key，`Debug` 打出来就等于把密钥写进日志。
+    /// 手写而不是 `derive`：`keys` 是明文密钥，`Debug` 打出来就等于把密钥写进日志。
     /// 只报条数与旋钮。
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Gateway")
             .field("upstreams", &self.upstreams.len())
+            .field("catalog", &self.catalog.len())
+            .field("keys", &self.keys.len())
             .field("routes", &self.routes.len())
             .field("ping", &self.ping)
             .field("probe", &self.probe)
@@ -73,6 +83,8 @@ impl Gateway {
                 .build()
                 .unwrap_or_default(),
             upstreams,
+            catalog: HashMap::new(),
+            keys: HashMap::new(),
             routes,
             store,
             ping: Duration::from_secs(15),
@@ -189,6 +201,16 @@ async fn proxy(
         }
     };
     let wire = Wire::parse(&rt.wire).unwrap_or(Wire::Anthropic);
+    // M1 脚手架：出站凭据从 Gateway.keys 取；票 51 起改成按「上游 × wire」查票 42 的 Store。
+    let Some(key) = app.keys.get(&rt.upstream_id).cloned() else {
+        return err_in(
+            inbound,
+            StatusCode::BAD_GATEWAY,
+            "api_error",
+            &format!("上游 {} 未配置（缺 key）", rt.upstream_id),
+        );
+    };
+    let auth = up.auth_for(wire);
 
     let decoded = match inbound {
         Inbound::Anthropic => anthropic::decode_request(&body),
@@ -207,12 +229,16 @@ async fn proxy(
     };
     req.model = rt.real_model.clone();
 
-    if let Err(e) = upstream::guard(&up, wire, &rt.real_model) {
+    // 三层校验的第二层（ADR-0004）：目录声明过这个模型的 wire 就早拒 400；未声明放行给自检。
+    let entry = app
+        .catalog
+        .get(&(rt.upstream_id.clone(), rt.real_model.clone()));
+    if let Err(rej) = upstream::guard(entry, wire) {
         return err_in(
             inbound,
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            &e,
+            StatusCode::from_u16(rej.status).unwrap_or(StatusCode::BAD_REQUEST),
+            rej.error_type,
+            &rej.message,
         );
     }
 
@@ -220,9 +246,9 @@ async fn proxy(
     let pass = protocol_headers(&headers);
 
     if streaming {
-        upstream::forward(app, &up, wire, req, name, pass, inbound).await
+        upstream::forward(app, &up, wire, auth, &key, req, name, pass, inbound).await
     } else {
-        upstream::forward_buffered(app, &up, wire, req, name, pass, inbound).await
+        upstream::forward_buffered(app, &up, wire, auth, &key, req, name, pass, inbound).await
     }
 }
 
@@ -283,8 +309,19 @@ async fn count_tokens(
     let mut source = "local";
     let mut n = None;
     if wire == Wire::Anthropic {
-        if let Some(up) = app.upstreams.get(&rt.upstream_id) {
-            n = upstream::count_tokens_upstream(&app, up, &req, &protocol_headers(&headers)).await;
+        if let (Some(up), Some(key)) = (
+            app.upstreams.get(&rt.upstream_id),
+            app.keys.get(&rt.upstream_id),
+        ) {
+            n = upstream::count_tokens_upstream(
+                &app,
+                up,
+                up.auth_for(wire),
+                key,
+                &req,
+                &protocol_headers(&headers),
+            )
+            .await;
             source = if n.is_some() {
                 "upstream"
             } else {
