@@ -8,7 +8,7 @@
 import { useCallback, useEffect, useState } from 'react';
 
 import { api, type BindingsView, type UpstreamModelView, type UpstreamView } from '../api';
-import { ErrorBlock, json, Pill } from '../components';
+import { ErrorBlock, json, Pill, type PageSlug } from '../components';
 import type { ShellCtx } from '../App';
 
 const SLOT_LABELS: Record<string, string> = {
@@ -30,6 +30,8 @@ export function ModelsPage({ ctx }: { ctx: ShellCtx }) {
   const [models, setModels] = useState<Record<string, UpstreamModelView[]>>({});
   const [pricing, setPricing] = useState<{ upstream: string; model: string } | null>(null);
   const [newModel, setNewModel] = useState({ name: '', upstreamId: '', realModel: '', wire: 'anthropic' });
+  /** 上一次没存下去的那一条（错误块的主按钮要能原样重试它）。 */
+  const [failed, setFailed] = useState<{ slot: string; draft: Draft } | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -41,8 +43,10 @@ export function ModelsPage({ ctx }: { ctx: ShellCtx }) {
         catalog[up.id] = (await api.upstreamModels(up.id)).models;
       }
       setModels(catalog);
+      setFailed(null);
       setError(null);
     } catch (e) {
+      setFailed(null);
       setError(e);
     }
   }, [client]);
@@ -65,6 +69,7 @@ export function ModelsPage({ ctx }: { ctx: ShellCtx }) {
       await load();
       await ctx.refresh();
     } catch (e) {
+      setFailed({ slot, draft: d });
       setError(e);
     }
   };
@@ -140,6 +145,12 @@ export function ModelsPage({ ctx }: { ctx: ShellCtx }) {
             const d = draftFor(row.slot, row.binding);
             const catalog = models[d.upstreamId] ?? [];
             const entry = catalog.find((m) => m.modelId === d.realModel);
+            // 这条模型声明过的 wire（空集合 = 未声明，照票 23 自由选）。
+            const declared = entry && entry.supportedWires.length > 0 ? entry.supportedWires : [];
+            // 受控 select 的候选里没有当前值时，浏览器会把**显示**回退到第一项，而 state 还是旧值：
+            // 不在这儿把 draft 拨正，发出去的就是界面上没显示的那个 wire（票 60b：换模型后界面显示
+            // openai-chat、实际发 anthropic → 400「协议不在这条模型的声明里」）。
+            const draft: Draft = declared.length > 0 && !declared.includes(d.wire) ? { ...d, wire: declared[0] } : d;
             return (
               <tr key={row.slot}>
                 <td>
@@ -176,10 +187,10 @@ export function ModelsPage({ ctx }: { ctx: ShellCtx }) {
                 </td>
                 <td>
                   <select
-                    value={d.wire}
+                    value={draft.wire}
                     onChange={(e) => setDrafts({ ...drafts, [row.slot]: { ...d, wire: e.target.value } })}
                   >
-                    {(entry && entry.supportedWires.length > 0 ? entry.supportedWires : ['anthropic', 'openai-chat', 'openai-responses']).map(
+                    {(declared.length > 0 ? declared : ['anthropic', 'openai-chat', 'openai-responses']).map(
                       (wire) => (
                         <option key={wire} value={wire}>
                           {wire}
@@ -194,7 +205,7 @@ export function ModelsPage({ ctx }: { ctx: ShellCtx }) {
                   {probe[row.slot] && <div className="muted">{probe[row.slot]}</div>}
                 </td>
                 <td>
-                  <button className="primary" onClick={() => save(row.slot, d)} disabled={!d.upstreamId || !d.realModel}>
+                  <button className="primary" onClick={() => save(row.slot, draft)} disabled={!draft.upstreamId || !draft.realModel}>
                     存
                   </button>
                   {row.binding && (
@@ -284,7 +295,17 @@ export function ModelsPage({ ctx }: { ctx: ShellCtx }) {
       </div>
 
       {pricing && <PriceDialog target={pricing} onClose={() => setPricing(null)} />}
-      <ErrorBlock error={error} />
+      <ErrorBlock
+        error={error}
+        onAction={(kind, page) => {
+          if (kind === 'goto' && page) ctx.goto(page as PageSlug);
+        }}
+        fallbackAction={
+          failed
+            ? { label: '重试存这一条', onClick: () => void save(failed.slot, failed.draft) }
+            : { label: '重新读一次', onClick: () => void load() }
+        }
+      />
     </section>
   );
 }
