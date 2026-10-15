@@ -8,12 +8,7 @@
 //! `router()` 是这一面的唯一入口：外壳（票 43 的 `service`）与回放 harness 都挂它，
 //! 不各自拼一套 `/v1/*`。
 
-use std::{
-    collections::HashMap,
-    path::PathBuf,
-    sync::{Arc, Mutex},
-    time::{Duration, Instant},
-};
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
 use axum::{
     extract::State,
@@ -33,7 +28,9 @@ use crate::responses;
 use crate::store::Store;
 
 /// body 日志窗口：开启后 1 小时自动关（票 11 的日志定案 / 票 30 第 7 条）。
-pub const BODY_LOG_WINDOW: Duration = Duration::from_secs(3600);
+/// 窗口本体在 [`crate::obs::BodyLogWindow`]（票 53 起管理面 `/api/logs/body-recording` 与这里
+/// 共用同一个实例），这个常量只是转发面测试与 harness 的默认拨法。
+pub use crate::obs::BODY_LOG_WINDOW;
 
 /// 网关运行态：出站客户端、供应商表、绑定表、日志落点与三个旋钮。
 pub struct Gateway {
@@ -50,8 +47,8 @@ pub struct Gateway {
     pub ping: Duration,
     /// 探针档（`max_tokens <= PROBE_MAX_TOKENS`）的上游上限（票 26 决定 5）。
     pub probe: Duration,
-    /// body 日志开关的到点时间：`None` = 关。
-    pub body_log_until: Mutex<Option<Instant>>,
+    /// body 日志开关的窗口：`None` = 关。与 `/api/logs/body-recording` **同一个**实例（票 53）。
+    pub body_log: Arc<crate::obs::BodyLogWindow>,
 }
 
 impl std::fmt::Debug for Gateway {
@@ -82,26 +79,17 @@ impl Gateway {
             store,
             ping: Duration::from_secs(15),
             probe: binding::PROBE_DEADLINE,
-            body_log_until: Mutex::new(None),
+            body_log: Arc::new(crate::obs::BodyLogWindow::new()),
         }
     }
 
     pub fn body_log_on(&self) -> bool {
-        self.body_log_until
-            .lock()
-            .map(|until| until.map(|d| Instant::now() < d).unwrap_or(false))
-            .unwrap_or(false)
+        self.body_log.on()
     }
 
     /// 拨 body 日志窗口：`0` = 立即关，其余 = 从现在起这么多秒（到点自关）。
     pub fn set_body_log(&self, seconds: u64) {
-        if let Ok(mut until) = self.body_log_until.lock() {
-            *until = if seconds == 0 {
-                None
-            } else {
-                Some(Instant::now() + Duration::from_secs(seconds))
-            };
-        }
+        self.body_log.set(seconds);
     }
 }
 

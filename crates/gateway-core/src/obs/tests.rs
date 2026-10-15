@@ -1,0 +1,561 @@
+//! obs 的单测：成本冻结 / 价格口径 / 保留期清理 / 日志查询与筛选 / 用量汇总 / body 窗口。
+//!
+//! 一律指向临时目录（写入根参数化）：**不碰真实 `%APPDATA%\com.claudegateway.desktop\`**。
+//! 期望值取「手算的已知字面量」——不用被测函数反算（票 33 的三个口径：手工 > 快照 > 未知、
+//! 缺价不计入总额、上游没回 usage = token 未知）。
+
+use super::*;
+use crate::egress::provider::{self, Prices, ResolvedPrice, ResolvedPrices};
+use crate::store::Store;
+use std::path::PathBuf;
+
+fn tmp_root(tag: &str) -> PathBuf {
+    let root = std::env::temp_dir().join("cg53-obs-tests").join(tag);
+    let _ = std::fs::remove_dir_all(&root);
+    root
+}
+
+/// 一句筛选条件 → 一份 [`LogQuery`]（测试里读起来像那句话本身）。
+fn query(f: impl FnOnce(&mut LogQuery)) -> LogQuery {
+    let mut q = LogQuery::default();
+    f(&mut q);
+    q
+}
+
+/// 三项价都已知的解：输入 $3/Mtok、输出 $15/Mtok、缓存读 $0.30/Mtok。
+fn prices_known() -> ResolvedPrices {
+    let p = |v: f64| ResolvedPrice {
+        usd_per_mtok: Some(v),
+        source: provider::PriceSource::Manual,
+    };
+    ResolvedPrices {
+        input: p(3.0),
+        output: p(15.0),
+        cache_read: p(0.30),
+        cache_write: ResolvedPrice {
+            usd_per_mtok: None,
+            source: provider::PriceSource::Unknown,
+        },
+    }
+}
+
+fn prices_unknown() -> ResolvedPrices {
+    let u = || ResolvedPrice {
+        usd_per_mtok: None,
+        source: provider::PriceSource::Unknown,
+    };
+    ResolvedPrices {
+        input: u(),
+        output: u(),
+        cache_read: u(),
+        cache_write: u(),
+    }
+}
+
+fn row(upstream: &str, model: &str, ts: i64) -> RequestLog {
+    RequestLog {
+        ts,
+        virtual_model: "claude-haiku".into(),
+        client: Some("claude-code".into()),
+        upstream_id: upstream.into(),
+        real_model: model.into(),
+        wire: "anthropic".into(),
+        status: 200,
+        input_tokens: Some(1000),
+        output_tokens: Some(500),
+        cache_read: None,
+        total_ms: 120,
+        first_byte_ms: 40,
+        ..Default::default()
+    }
+}
+
+/// 一笔请求的总价：输入 1000 tok × $3/Mtok = $0.003，输出 500 × $15/Mtok = $0.0075，
+/// 缓存读 2000 × $0.30/Mtok = $0.0006，合计 $0.0111（手算的独立来源，不是本函数算的）。
+#[test]
+fn cost_is_sum_of_the_three_parts_at_known_prices() {
+    let c = resolve_cost(&prices_known(), Some(1000), Some(500), Some(2000)).unwrap();
+    assert!((c - 0.0111).abs() < 1e-12, "实际 {c}");
+
+    // 没有缓存读 → 只有前两项
+    let c = resolve_cost(&prices_known(), Some(1000), Some(500), None).unwrap();
+    assert!((c - 0.0105).abs() < 1e-12, "实际 {c}");
+}
+
+/// 缓存读缺价 → **退输入价**（票 33 第 4 节）；缓存写本期不计（不在这条路径上）。
+#[test]
+fn cache_read_falls_back_to_input_price_when_it_has_none() {
+    let mut p = prices_known();
+    p.cache_read.usd_per_mtok = None;
+    let c = resolve_cost(&p, Some(0), Some(0), Some(2000)).unwrap();
+    // 2000 × $3/Mtok = $0.006
+    assert!((c - 0.006).abs() < 1e-12, "实际 {c}");
+}
+
+/// 口径两条（票 33 第 1、3 节）：缺价 → 整个 `cost_usd` 留空、不计入总额；
+/// 上游没回 usage（token 全空）→ 同样留空，不拿本地估算反算。
+#[test]
+fn unknown_price_or_unknown_tokens_yield_no_cost() {
+    assert_eq!(
+        resolve_cost(&prices_unknown(), Some(1000), Some(500), None),
+        None,
+        "一分钱都算不出来时不该编一个 0"
+    );
+    assert_eq!(
+        resolve_cost(&prices_known(), None, None, None),
+        None,
+        "token 未知就不算成本"
+    );
+    // 只缺输出价：这一笔也整条不计（不半算）
+    let mut p = prices_known();
+    p.output.usd_per_mtok = None;
+    assert_eq!(resolve_cost(&p, Some(1000), Some(500), None), None);
+}
+
+/// 到点自关：窗口拨短，过了就是关。
+#[test]
+fn body_window_closes_by_itself() {
+    let w = BodyLogWindow::new();
+    assert!(!w.on(), "默认关");
+    assert_eq!(w.seconds_remaining(), None);
+
+    w.set(60);
+    assert!(w.on());
+    assert!(w
+        .seconds_remaining()
+        .map(|s| s <= 60 && s > 58)
+        .unwrap_or(false));
+
+    w.set(0);
+    assert!(!w.on(), "0 = 立即关");
+}
+
+/// 日边界是**本机本地时区自然日**（票 33 第 5 节 / spec §9）：今天的起点 = 本地 00:00。
+#[test]
+fn day_boundaries_use_local_civil_days() {
+    // 独立来源：1970-01-01 是第 0 天，2000-02-29 是第 11016 天（951782400 / 86400）。
+    assert_eq!(days_from_civil(1970, 1, 1), 0);
+    assert_eq!(days_from_civil(2000, 2, 29), 11_016);
+
+    // 本地 00:00 的 UTC 秒：对 1e9 这个瞬间（2001-09-09T01:46:40Z）取本地日界，
+    // 结果必须落在本地日界上：把日界加回偏移再取商，应为整天。
+    let off = local_offset_secs();
+    let start = local_day_start(1_000_000_000, off);
+    assert_eq!(
+        (start + off).rem_euclid(86_400),
+        0,
+        "日界必须落在本地 00:00"
+    );
+    assert!(start <= 1_000_000_000 && 1_000_000_000 - start < 86_400);
+}
+
+/// 冻结：落库那一刻按当时价算好；之后改手工价或刷新快照，**历史行不动**（票 33 第 3 节）。
+#[tokio::test]
+async fn cost_is_frozen_at_write_time_and_not_recomputed() {
+    let root = tmp_root("freeze");
+    let store = Store::open(&root).unwrap();
+    provider::save_upstream(&store, &upstream("u1"))
+        .await
+        .unwrap();
+    provider::save_manual_model(&store, "u1", "real-model", &[])
+        .await
+        .unwrap();
+    provider::set_manual_prices(
+        &store,
+        "u1",
+        "real-model",
+        &Prices {
+            input: Some(3.0),
+            output: Some(15.0),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut r = row("u1", "real-model", 1_000_000_000);
+    r.cache_read = None;
+    log(&store, &r).await.unwrap();
+    let before = list(&store, &LogQuery::default()).await.unwrap();
+    let cost_before = before[0]["cost_usd"].as_f64().unwrap();
+    assert!((cost_before - 0.0105).abs() < 1e-12, "实际 {cost_before}");
+
+    // 改手工价（涨 10 倍）+ 换快照，历史行必须一动不动。
+    provider::set_manual_prices(
+        &store,
+        "u1",
+        "real-model",
+        &Prices {
+            input: Some(30.0),
+            output: Some(150.0),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    provider::import_catalog_snapshot(
+        &store,
+        r#"{"u1":{"models":{"real-model":{"name":"x","cost":{"input":99,"output":99}}}}}"#,
+    )
+    .await
+    .unwrap();
+
+    let after = list(&store, &LogQuery::default()).await.unwrap();
+    assert_eq!(
+        after[0]["cost_usd"].as_f64().unwrap(),
+        cost_before,
+        "改价 / 刷新快照不许追古"
+    );
+
+    // 同一条上游的同一条模型，下一次请求按新价（说明价是「当时」读的，不是启动时缓存的）。
+    log(&store, &row("u1", "real-model", 1_000_000_100))
+        .await
+        .unwrap();
+    let rows = list(&store, &LogQuery::default()).await.unwrap();
+    let fresh = rows[0]["cost_usd"].as_f64().unwrap();
+    assert!(
+        (fresh - 0.105).abs() < 1e-12,
+        "新价下应为 $0.105，实际 {fresh}"
+    );
+}
+
+/// 快照兜底：手工没填的项回退 models.dev 快照（票 33 第 1 节）。
+#[tokio::test]
+async fn snapshot_fills_prices_that_manual_leaves_empty() {
+    let root = tmp_root("snapshot");
+    let store = Store::open(&root).unwrap();
+    provider::save_upstream(&store, &upstream("u1"))
+        .await
+        .unwrap();
+    provider::save_manual_model(&store, "u1", "real-model", &[])
+        .await
+        .unwrap();
+    provider::import_catalog_snapshot(
+        &store,
+        r#"{"u1":{"models":{"real-model":{"name":"x","cost":{"input":3,"output":15}}}}}"#,
+    )
+    .await
+    .unwrap();
+
+    let mut r = row("u1", "real-model", 1_000_000_000);
+    r.cache_read = None;
+    log(&store, &r).await.unwrap();
+    let rows = list(&store, &LogQuery::default()).await.unwrap();
+    let c = rows[0]["cost_usd"].as_f64().unwrap();
+    assert!((c - 0.0105).abs() < 1e-12, "实际 {c}");
+}
+
+/// 每一行都有自己的请求 ID（日志页按它搜、详情页按它取），且不重复。
+#[tokio::test]
+async fn every_row_gets_a_unique_request_id() {
+    let root = tmp_root("request-id");
+    let store = Store::open(&root).unwrap();
+    for i in 0..5 {
+        log(&store, &row("u1", "m", 1_000_000_000 + i))
+            .await
+            .unwrap();
+    }
+    let rows = list(&store, &LogQuery::default()).await.unwrap();
+    let ids: Vec<String> = rows
+        .iter()
+        .map(|r| r["request_id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids.len(), 5);
+    let mut uniq = ids.clone();
+    uniq.sort();
+    uniq.dedup();
+    assert_eq!(uniq.len(), 5, "请求 ID 不该重复：{ids:?}");
+    assert!(ids.iter().all(|i| i.starts_with("req-")), "{ids:?}");
+}
+
+/// 保留期：8 天前的行清掉，7 天内的留着；body 跟着行一起走（外键级联）。
+#[tokio::test]
+async fn purge_drops_rows_past_retention_and_keeps_recent_ones() {
+    let root = tmp_root("purge");
+    let store = Store::open(&root).unwrap();
+    let now = unix_now();
+    let old = now - 8 * 86_400;
+    let recent = now - 6 * 86_400;
+
+    let mut with_body = row("u1", "m", old);
+    with_body.body = Some("{\"secret\":\"body\"}".into());
+    log(&store, &with_body).await.unwrap();
+    log(&store, &row("u1", "m", recent)).await.unwrap();
+    assert_eq!(list(&store, &LogQuery::default()).await.unwrap().len(), 2);
+
+    let deleted = purge(&store).await.unwrap();
+    assert_eq!(deleted, 1, "只该清掉那 1 条 8 天前的行");
+
+    let rows = list(&store, &LogQuery::default()).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["ts"].as_i64().unwrap(), recent, "7 天内的还在");
+
+    // body 行也不该留下（`request_bodies` 随 `requests` 级联删）。
+    let left: i64 = store
+        .read(|c| Ok(c.query_row("SELECT COUNT(*) FROM request_bodies", [], |r| r.get(0))?))
+        .await
+        .unwrap();
+    assert_eq!(left, 0, "清掉的行不该留着 body");
+}
+
+/// 保留期读 `settings.log_retention_days`（设置页那一项，spec §9），改了就按新的清。
+#[tokio::test]
+async fn retention_days_come_from_settings() {
+    let root = tmp_root("retention-setting");
+    let store = Store::open(&root).unwrap();
+    assert_eq!(
+        retention_days(&store).await.unwrap(),
+        7,
+        "库里的初值是 7 天"
+    );
+
+    store
+        .write(|c| {
+            c.execute(
+                "UPDATE settings SET value='30' WHERE key=?1",
+                rusqlite::params![settings_keys::LOG_RETENTION_DAYS],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(retention_days(&store).await.unwrap(), 30);
+}
+
+/// 筛选与搜索：四个维度各自可用、模型名与请求 ID 可搜、**不搜 body**、时间倒序、可分页。
+#[tokio::test]
+async fn query_filters_search_and_order_by_time_desc() {
+    let root = tmp_root("query");
+    let store = Store::open(&root).unwrap();
+
+    let mut a = row("u1", "real-a", 1_000_000_000);
+    a.virtual_model = "claude-haiku".into();
+    a.client = Some("claude-code".into());
+    a.status = 200;
+    let mut b = row("u2", "real-b", 1_000_000_100);
+    b.virtual_model = "claude-opus".into();
+    b.client = Some("codex".into());
+    b.status = 502;
+    b.error = Some("上游 502".into());
+    let mut c = row("u1", "real-a", 1_000_000_200);
+    c.virtual_model = "claude-sonnet".into();
+    c.client = Some("claude-code".into());
+    c.status = 429;
+    c.body = Some("{\"marker\":\"body-only-marker\"}".into());
+    for r in [&a, &b, &c] {
+        log(&store, r).await.unwrap();
+    }
+
+    let ids: Vec<i64> = list(&store, &LogQuery::default())
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r["ts"].as_i64().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![1_000_000_200, 1_000_000_100, 1_000_000_000],
+        "时间倒序"
+    );
+
+    let n = |v: Vec<Value>| v.len();
+
+    assert_eq!(
+        n(list(&store, &query(|q| q.client = Some("codex".into())))
+            .await
+            .unwrap()),
+        1
+    );
+    assert_eq!(
+        n(list(&store, &query(|q| q.upstream = Some("u1".into())))
+            .await
+            .unwrap()),
+        2
+    );
+    assert_eq!(
+        n(list(
+            &store,
+            &query(|q| q.virtual_model = Some("claude-opus".into()))
+        )
+        .await
+        .unwrap()),
+        1
+    );
+    assert_eq!(
+        n(list(&store, &query(|q| q.status = Some("ok".into())))
+            .await
+            .unwrap()),
+        1
+    );
+    assert_eq!(
+        n(list(&store, &query(|q| q.status = Some("4xx".into())))
+            .await
+            .unwrap()),
+        1
+    );
+    assert_eq!(
+        n(list(&store, &query(|q| q.status = Some("5xx".into())))
+            .await
+            .unwrap()),
+        1
+    );
+    assert_eq!(
+        n(list(&store, &query(|q| q.status = Some("error".into())))
+            .await
+            .unwrap()),
+        2
+    );
+    assert_eq!(
+        n(list(&store, &query(|q| q.q = Some("real-a".into())))
+            .await
+            .unwrap()),
+        2
+    );
+    assert_eq!(
+        n(list(&store, &query(|q| q.q = Some("claude-sonnet".into())))
+            .await
+            .unwrap()),
+        1
+    );
+    assert_eq!(
+        n(
+            list(&store, &query(|q| q.q = Some("body-only-marker".into())))
+                .await
+                .unwrap()
+        ),
+        0,
+        "搜索不搜 body"
+    );
+
+    // 请求 ID 可搜
+    let want = list(&store, &LogQuery::default()).await.unwrap()[0]["request_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        n(list(&store, &query(|q| q.q = Some(want))).await.unwrap()),
+        1
+    );
+
+    // 分页：取 2 条，用最后一行的 id 当游标再取剩下 1 条
+    let page1 = list(&store, &query(|q| q.limit = Some(2))).await.unwrap();
+    assert_eq!(page1.len(), 2);
+    let cursor = page1[1]["id"].as_i64().unwrap();
+    let page2 = list(
+        &store,
+        &query(|q| {
+            q.limit = Some(2);
+            q.cursor = Some(cursor);
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(page2.len(), 1, "游标该把翻过的行挡在外面");
+    assert_eq!(page2[0]["ts"].as_i64().unwrap(), 1_000_000_000);
+}
+
+/// 筛选下拉的候选值来自**库里真出现过的值**，不是写死的清单。
+#[tokio::test]
+async fn filter_candidates_come_from_stored_rows() {
+    let root = tmp_root("filters");
+    let store = Store::open(&root).unwrap();
+    log(&store, &row("u1", "m", 1_000_000_000)).await.unwrap();
+    let mut b = row("u2", "m", 1_000_000_100);
+    b.client = Some("codex".into());
+    b.virtual_model = "claude-opus".into();
+    log(&store, &b).await.unwrap();
+
+    let f = filters(&store).await.unwrap();
+    assert_eq!(f["upstreams"], json!(["u1", "u2"]));
+    assert_eq!(f["clients"], json!(["claude-code", "codex"]));
+    assert_eq!(f["virtual_models"], json!(["claude-haiku", "claude-opus"]));
+    assert_eq!(f["statuses"], json!(["ok", "4xx", "5xx", "error"]));
+}
+
+/// 用量汇总（票 53 只做概览要的**今日 + 近 7 天** × 虚拟模型 / 上游两维）：
+/// 总额只算算得出价的那些，无价与 token 未知**各自另计**（票 33 第 1 节）。
+#[tokio::test]
+async fn usage_summary_counts_unpriced_and_unknown_tokens_separately() {
+    let root = tmp_root("usage");
+    let store = Store::open(&root).unwrap();
+    provider::save_upstream(&store, &upstream("u1"))
+        .await
+        .unwrap();
+    provider::save_manual_model(&store, "u1", "priced", &[])
+        .await
+        .unwrap();
+    provider::set_manual_prices(
+        &store,
+        "u1",
+        "priced",
+        &Prices {
+            input: Some(3.0),
+            output: Some(15.0),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let now = unix_now();
+    // ① 今天、有价：$0.0105
+    let mut a = row("u1", "priced", now - 60);
+    a.cache_read = None;
+    log(&store, &a).await.unwrap();
+    // ② 今天、无价（目录里没有 → 未知价），token 有
+    let mut b = row("u1", "unpriced", now - 120);
+    b.cache_read = None;
+    b.virtual_model = "claude-opus".into();
+    log(&store, &b).await.unwrap();
+    // ③ 今天、有价但上游没回 usage → token 未知，成本不计
+    let mut c = row("u1", "priced", now - 180);
+    c.input_tokens = None;
+    c.output_tokens = None;
+    c.cache_read = None;
+    c.virtual_model = "claude-opus".into();
+    log(&store, &c).await.unwrap();
+    // ④ 3 天前、有价：$0.0105（只进近 7 天，不进今日）
+    let mut d = row("u1", "priced", now - 3 * 86_400);
+    d.cache_read = None;
+    log(&store, &d).await.unwrap();
+    // ⑤ 9 天前：两个范围都不该有它
+    let mut e = row("u1", "priced", now - 9 * 86_400);
+    e.cache_read = None;
+    log(&store, &e).await.unwrap();
+
+    let today = usage_summary(&store, "today", "virtual_model")
+        .await
+        .unwrap();
+    assert_eq!(today["totals"]["requests"], 3, "{today}");
+    assert_eq!(today["totals"]["no_price"], 1);
+    assert_eq!(today["totals"]["token_unknown"], 1);
+    let c7 = today["totals"]["cost_usd"].as_f64().unwrap();
+    assert!(
+        (c7 - 0.0105).abs() < 1e-12,
+        "今日只该算那一条有价的：{today}"
+    );
+
+    let rows = today["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "两个虚拟模型各一行：{today}");
+    let haiku = rows.iter().find(|r| r["key"] == "claude-haiku").unwrap();
+    assert_eq!(haiku["requests"], 1);
+    assert!((haiku["cost_usd"].as_f64().unwrap() - 0.0105).abs() < 1e-12);
+    let opus = rows.iter().find(|r| r["key"] == "claude-opus").unwrap();
+    assert_eq!(opus["requests"], 2);
+    assert_eq!(opus["cost_usd"], Value::Null, "整行无价 → 不显示 0");
+
+    let week = usage_summary(&store, "7d", "upstream").await.unwrap();
+    assert_eq!(week["totals"]["requests"], 4, "{week}");
+    let w = week["totals"]["cost_usd"].as_f64().unwrap();
+    assert!((w - 0.021).abs() < 1e-12, "近 7 天两条有价的：{week}");
+    assert_eq!(week["rows"].as_array().unwrap().len(), 1, "只有一条上游");
+    assert_eq!(week["rows"][0]["key"], "u1");
+
+    // 范围 / 维度取值域之外的，报错而不是悄悄给一份错的。
+    assert!(usage_summary(&store, "30d", "virtual_model").await.is_err());
+    assert!(usage_summary(&store, "today", "pizza").await.is_err());
+}
+
+fn upstream(id: &str) -> provider::Upstream {
+    provider::Upstream::new(id, id, "http://127.0.0.1:1")
+}
