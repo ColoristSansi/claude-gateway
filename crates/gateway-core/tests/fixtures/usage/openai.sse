@@ -1,0 +1,9 @@
+data: {"id":"chatcmpl-mock-usage","object":"chat.completion.chunk","created":0,"model":"mock-upstream","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-mock-usage","object":"chat.completion.chunk","created":0,"model":"mock-upstream","choices":[{"index":0,"delta":{"content":"这一轮的 system 与 tools 命中了缓存。"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-mock-usage","object":"chat.completion.chunk","created":0,"model":"mock-upstream","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"id":"chatcmpl-mock-usage","object":"chat.completion.chunk","created":0,"model":"mock-upstream","choices":[],"usage":{"prompt_tokens":100,"completion_tokens":12,"total_tokens":112,"prompt_tokens_details":{"cached_tokens":80}}}
+
+data: [DONE]

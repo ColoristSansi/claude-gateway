@@ -1,0 +1,12 @@
+event: message_start
+data: {"message":{"content":[],"id":"msg_gw_a","model":"mock-openai-abort","role":"assistant","stop_reason":null,"stop_sequence":null,"type":"message","usage":{"input_tokens":0,"output_tokens":0}},"type":"message_start"}
+
+event: content_block_start
+data: {"content_block":{"text":"","type":"text"},"index":0,"type":"content_block_start"}
+
+event: content_block_delta
+data: {"delta":{"text":"说到一半就断了","type":"text_delta"},"index":0,"type":"content_block_delta"}
+
+event: error
+data: {"error":{"message":"上游在终态事件前断流（无 message_stop / 无 [DONE]）","type":"upstream_abort"},"type":"error"}
+

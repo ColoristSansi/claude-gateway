@@ -2,3 +2,6 @@
 [workspace]
 resolver = "2"
 members = ["crates/gateway-core", "src-tauri"]
+# 冻结的一次性原型（ADR-0007）：不进本 workspace，但它自己要能 `cargo run` 复现那条链路。
+# 排除写在这里，而不是给 prototype/Cargo.toml 加 [workspace]——原型是只读参照物。
+exclude = [".scratch/model-gateway/prototype"]

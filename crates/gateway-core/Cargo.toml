@@ -28,3 +28,26 @@ windows-sys = { version = "0.61", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_SystemInformation",
 ] }
+
+# 测试专用开关（票 41）：开它才编 mock 上游与回放 harness 两个 bin，以及回放集成测试。
+# 产品构建（`cargo build -p gateway-core -p claude-gateway`）不带它——产物里既没有 mock 的
+# 路由字符串（`/__chunks`、`/api/echo`），网关运行态里也没有 mock 那两格状态。
+[features]
+mock = []
+
+# 测试专用 bin：mock 上游（回放 fixtures）与回放用的网关 harness，二者**分进程**跑。
+[[bin]]
+name = "mock-upstream"
+path = "src/bin/mock-upstream.rs"
+required-features = ["mock"]
+
+[[bin]]
+name = "gateway-harness"
+path = "src/bin/gateway-harness.rs"
+required-features = ["mock"]
+
+# 回放集成测试（12 格）：要 `--features mock` 才有两个 bin 可拉起来。
+[[test]]
+name = "replay"
+path = "tests/replay.rs"
+required-features = ["mock"]

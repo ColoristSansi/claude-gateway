@@ -1,0 +1,32 @@
+{
+  "scenario": "text",
+  "outbound_wire": "openai",
+  "upstream": "mock",
+  "model": "mock-text",
+  "origin": "authored",
+  "recorded_at": "2026-10-15T00:00:00Z",
+  "request": {
+    "model": "mock-openai-text",
+    "max_tokens": 256,
+    "stream": true,
+    "messages": [
+      {
+        "role": "user",
+        "content": "你好"
+      }
+    ]
+  },
+  "expect": {
+    "status": 200,
+    "last_event": "message_stop"
+  },
+  "quirks": [
+    "ClientUserAgent",
+    "SessionIdHeader"
+  ],
+  "masks": [
+    "message.id"
+  ],
+  "chunks": [],
+  "changed_why": ""
+}

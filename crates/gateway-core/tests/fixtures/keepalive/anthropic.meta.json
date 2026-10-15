@@ -1,0 +1,47 @@
+{
+  "scenario": "keepalive",
+  "outbound_wire": "anthropic",
+  "upstream": "api.commandcode.ai",
+  "model": "claude-sonnet-5-5",
+  "origin": "recorded",
+  "recorded_at": "2026-10-14T18:34:35Z",
+  "request": {
+    "model": "mock-anthropic-keepalive",
+    "max_tokens": 1024,
+    "stream": true,
+    "messages": [
+      {
+        "role": "user",
+        "content": "请写一篇约 800 字的中文散文，主题是秋天的雨。"
+      }
+    ]
+  },
+  "request_sent": {
+    "url": "https://api.commandcode.ai/provider/v1/messages",
+    "headers": [
+      "content-type: application/json",
+      "<凭据头已省略>"
+    ],
+    "body": {
+      "model": "claude-sonnet-5-5",
+      "max_tokens": 1024,
+      "stream": true,
+      "messages": [
+        {
+          "role": "user",
+          "content": "请写一篇约 800 字的中文散文，主题是秋天的雨。"
+        }
+      ]
+    }
+  },
+  "expect": {
+    "status": 200,
+    "last_event": "message_stop"
+  },
+  "quirks": [],
+  "masks": [
+    "message.id"
+  ],
+  "chunks": [],
+  "changed_why": "元数据适配，SSE 字节未改：录制时客户端模型名是 x，回放改走 mock 路由 mock-anthropic-keepalive（scenario 也从 keepalive2-cc 改为 keepalive）。这份真录字节里有一个上游发的 event: ping 帧（约 40KB / 888 行），2026-10-15 真录两次（普通与长生成）都没录到 `: keep-alive` 注释帧。"
+}
