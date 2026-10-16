@@ -171,7 +171,7 @@ Blocked by: 61, 62
 - `git grep -n '127.0.0.1:8791' -- src-tauri/tauri.conf.json` → **空**
 - **已安装的 exe**（`%LOCALAPPDATA%\Claude Gateway\claude-gateway.exe`）里 `ColoristSansi` 出现 **1 次**、`127.0.0.1:8791` 出现 **0 次**
 
-**没改判据、没顺手开新票**：这条按「卡要求人眼看的项、当前界面无此面」如实记下，后续（界面加一行 vs 改卡措辞）由用户定。
+**没改判据、没顺手开新票**：这条按「卡要求人眼看的项、当前界面无此面」如实记下。**后续（2026-10-17，用户当场决定）**：改现场卡的措辞——`accept-live.md` §1 第 ③ 条已改成「机器侧核实端点三处（`tauri.conf.json` 的 `plugins.updater.endpoints` / 已安装 exe 含该字面量且不含 `127.0.0.1:8791` / `GET /api/update/status` 的 `endpoints[0]`）」，卡头也记了修订日期与原因。**界面仍不加这一行**：后端 `/api/update/status` 本来就回 `endpoints`，是前端从没读它；要恢复「界面看得见」按卡里那句开新票，前端约 6 行、后端零改动。
 
 ### 2. 三个客户端各「真问一句」（卡 §2）
 
@@ -250,4 +250,10 @@ Blocked by: 61, 62
 - **存放位置不写进本票、不写进仓库**，由用户自己记在密码管理器里。介质是 exFAT（**无 ACL**），保护只靠物理保管；已当场提醒「`updater.key.password.txt` 与私钥同盘 = 谁拿到盘谁就能签名」，可选加固是把口令另存进密码管理器。
 - 本机源目录保持原位未动（`pack.ps1 -Sign` 要给 `-PrivateKeyPath`，CI Secrets 的值也来自它）。
 - 未做功能验证（用副本私钥真签一个包）：源与副本 SHA256 逐字节相同，副本可签的前提就是源可签，故未重跑；签名链路本轮未改一行。
+
+### 7. 后续（2026-10-17）：现场卡 §1 ③ 改判据 + 两处过时注释
+
+- **现场卡 §1 第 ③ 条已修订**：`cg-notes\accept-live.md` 由「界面显示更新端点」改成「机器侧核实端点三处」（`tauri.conf.json` 的 `plugins.updater.endpoints` / 已安装 exe 含该字面量且不含 `127.0.0.1:8791` / `GET /api/update/status` 的 `endpoints[0]`），卡头记了修订日期与原因。**界面仍不加这一行**——后端 `/api/update/status` 本来就回 `endpoints`（`src-tauri/src/updater.rs:52` 的注释写明是「给界面显示」用），是**前端从没读它**；要恢复「界面看得见」按卡里那句开新票，前端约 6 行、后端零改动。
+- **两处过时注释改掉**（票 65 落地后没同步，**纯注释、无行为变化**）：`crates/gateway-core/src/egress/mod.rs:18-19` 原写「上游 Responses wire 未做」、`crates/gateway-core/src/lib.rs:30` 表格里同一句。事实是 `responses.rs:318 encode_request` / `:965 ResponsesDecoder` 已被 `egress/upstream.rs` 的四个调用点在用。
+- **门禁**（**全新 `CARGO_TARGET_DIR` = `cg-target\round3`**）：`pwsh -File .\check.ps1 -Quick -Replay` → `全部通过。` **exit 0，358 条通过 / 15 条 `#[ignore]`**（与 START-HERE 记的数字一致），含前端 `tsc --noEmit && vite build`、回放 23 格；日志 `cg-notes\accept3-check.log`。
 
