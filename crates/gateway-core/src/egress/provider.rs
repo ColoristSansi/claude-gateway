@@ -209,9 +209,11 @@ impl Quirk {
             "ModelsListNeedsCredential" | "modelsListNeedsCredential" => {
                 Some(Quirk::ModelsListNeedsCredential)
             }
-            "TemperatureMax2" => Some(Quirk::TemperatureMax2),
-            "EmptyThinkingSignature" => Some(Quirk::EmptyThinkingSignature),
-            "SilentTruncate" => Some(Quirk::SilentTruncate),
+            "TemperatureMax2" | "temperatureMax2" => Some(Quirk::TemperatureMax2),
+            "EmptyThinkingSignature" | "emptyThinkingSignature" => {
+                Some(Quirk::EmptyThinkingSignature)
+            }
+            "SilentTruncate" | "silentTruncate" => Some(Quirk::SilentTruncate),
             _ => None,
         }
     }
@@ -2003,6 +2005,33 @@ mod tests {
                 "{path} 标了不存在的 quirk {tag}"
             );
         }
+    }
+
+    /// 票 67：七个值的大小写两写都要认。camelCase 是从 `Quirk::all()` 现派生的，
+    /// 所以下次加 quirk 忘了写 camelCase 分支，这条也会红。
+    #[test]
+    fn every_quirk_parses_in_pascal_and_camel_case() {
+        for q in Quirk::all() {
+            let pascal = q.name();
+            let camel = format!("{}{}", pascal[..1].to_ascii_lowercase(), &pascal[1..]);
+            for name in [pascal, camel.as_str()] {
+                assert_eq!(
+                    Quirk::parse(name, "").as_ref().map(Quirk::name),
+                    Some(pascal),
+                    "`{name}` 应当解析成 {pascal}"
+                );
+            }
+        }
+        // spec §6:211 的示例 JSON 逐字（新增的三个值曾经只认 PascalCase）。
+        for name in [
+            "temperatureMax2",
+            "emptyThinkingSignature",
+            "silentTruncate",
+        ] {
+            assert!(Quirk::parse(name, "").is_some(), "`{name}` 解析不出来");
+        }
+        // 认不出就是认不出，别让 parse 变成「什么都收」。
+        assert_eq!(Quirk::parse("temperaturemax2", ""), None);
     }
 
     /// 标签指着的 fixture 必须真有字节：抽掉一份 `.sse`，守卫就得红（票 30 第 12 条的反向验证）。

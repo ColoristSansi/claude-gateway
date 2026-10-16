@@ -588,9 +588,14 @@ export const api = {
       wires: string[];
     }>('/api/providers'),
   upstreams: () => req<{ upstreams: UpstreamView[] }>('/api/upstreams'),
-  createUpstream: (body: Record<string, unknown>) => req<{ upstream: UpstreamView }>('/api/upstreams', json(body)),
+  // ignoredQuirks：票 67 起回执会说出「认不出、被丢掉」的 quirk 名（原来静默丢）。
+  createUpstream: (body: Record<string, unknown>) =>
+    req<{ upstream: UpstreamView; ignoredQuirks?: string[] }>('/api/upstreams', json(body)),
   updateUpstream: (id: string, body: Record<string, unknown>) =>
-    req<{ upstream: UpstreamView }>(`/api/upstreams/${encodeURIComponent(id)}`, put(body)),
+    req<{ upstream: UpstreamView; ignoredQuirks?: string[] }>(
+      `/api/upstreams/${encodeURIComponent(id)}`,
+      put(body),
+    ),
   deleteUpstream: (id: string, force = false) =>
     req<{ deleted: boolean; bindingsRemoved: number }>(
       `/api/upstreams/${encodeURIComponent(id)}${force ? '?force=true' : ''}`,

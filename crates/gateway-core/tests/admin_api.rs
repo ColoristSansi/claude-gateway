@@ -650,6 +650,65 @@ async fn referenced_upstream_delete_needs_force_and_diagnostics_stay_masked() {
 }
 
 #[tokio::test]
+async fn quirk_names_parse_in_camel_case_and_unknown_ones_are_reported() {
+    let h = Harness::start("quirk-camel").await;
+    let mock = mock_upstream().await;
+
+    // 照 spec §6:211 的示例写法（全 camelCase），末尾混一个不存在的名字。
+    let (status, body) = h
+        .post(
+            "/api/upstreams",
+            json!({
+                "id": "quirk",
+                "name": "quirk",
+                "baseUrl": mock,
+                "quirks": [
+                    "noModelsEndpoint", "temperatureMax2", "emptyThinkingSignature",
+                    "silentTruncate", "thisQuirkDoesNotExist"
+                ],
+            }),
+        )
+        .await;
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(
+        body["upstream"]["quirks"],
+        json!([
+            "NoModelsEndpoint",
+            "TemperatureMax2",
+            "EmptyThinkingSignature",
+            "SilentTruncate"
+        ]),
+        "camelCase 认不全就会静默少几条：{body}"
+    );
+    assert_eq!(
+        body["ignoredQuirks"],
+        json!(["thisQuirkDoesNotExist"]),
+        "被丢掉的名字必须说出来（票 67 第 3 条）：{body}"
+    );
+
+    // 改上游走同一条解析路径，回执同样要说出来。
+    let (status, body) = h
+        .put(
+            "/api/upstreams/quirk",
+            json!({"quirks": ["noModelsEndpoint", "anotherBogusQuirk"]}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["upstream"]["quirks"],
+        json!(["NoModelsEndpoint"]),
+        "{body}"
+    );
+    assert_eq!(
+        body["ignoredQuirks"],
+        json!(["anotherBogusQuirk"]),
+        "{body}"
+    );
+
+    h.stop().await;
+}
+
+#[tokio::test]
 async fn providers_presets_and_upstream_view_columns() {
     let h = Harness::start("providers").await;
     let mock = mock_upstream().await;

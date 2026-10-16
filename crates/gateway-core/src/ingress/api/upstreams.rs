@@ -128,7 +128,7 @@ async fn create_upstream(
     Json(body): Json<Value>,
 ) -> Result<(StatusCode, Json<Value>), ApiFailure> {
     let admin = admin(&state)?;
-    let up = upstream_from_body(&body, None)?;
+    let (up, ignored_quirks) = upstream_from_body(&body, None)?;
     if up.id.trim().is_empty() {
         return Err(bad_request(
             "上游 id 不能为空",
@@ -157,7 +157,11 @@ async fn create_upstream(
     let view = view(&admin.store, &up).await?;
     Ok((
         StatusCode::CREATED,
-        ok_json(json!({"upstream": view, "credentialsSaved": saved})),
+        ok_json(json!({
+            "upstream": view,
+            "credentialsSaved": saved,
+            "ignoredQuirks": ignored_quirks,
+        })),
     ))
 }
 
@@ -172,7 +176,7 @@ async fn update_upstream(
         .await
         .map_err(ApiFailure::from)?
         .ok_or_else(|| not_found(&id))?;
-    let mut up = upstream_from_body(&body, Some(existing))?;
+    let (mut up, ignored_quirks) = upstream_from_body(&body, Some(existing))?;
     up.id = id.clone();
     provider::save_upstream(&admin.store, &up)
         .await
@@ -180,9 +184,11 @@ async fn update_upstream(
     admin.reload_forwarding().await.map_err(ApiFailure::from)?;
     let saved = save_credentials(&admin.store, &id, &body).await?;
     let view = view(&admin.store, &up).await?;
-    Ok(ok_json(
-        json!({"upstream": view, "credentialsSaved": saved}),
-    ))
+    Ok(ok_json(json!({
+        "upstream": view,
+        "credentialsSaved": saved,
+        "ignoredQuirks": ignored_quirks,
+    })))
 }
 
 /// 删上游：仍被引用时 409 + 引用处；`?force=true`（用户在弹窗里确认过）才连绑定一起删。
@@ -589,7 +595,12 @@ async fn save_credentials(
 }
 
 /// 请求体 → 上游表。`base` 给了就是编辑（未提到的字段保持原值），否则从预填表或空表起步。
-fn upstream_from_body(body: &Value, base: Option<Upstream>) -> Result<Upstream, ApiFailure> {
+/// 第二个返回值是解析不出、被丢掉的名字（原样回给调用方，见票 67）。
+fn upstream_from_body(
+    body: &Value,
+    base: Option<Upstream>,
+) -> Result<(Upstream, Vec<String>), ApiFailure> {
+    let mut ignored_quirks = Vec::new();
     let preset = body.get("presetId").and_then(Value::as_str).and_then(|id| {
         provider::provider_presets()
             .into_iter()
@@ -640,14 +651,23 @@ fn upstream_from_body(body: &Value, base: Option<Upstream>) -> Result<Upstream, 
         }
     }
     if let Some(list) = body.get("quirks").and_then(Value::as_array) {
-        up.quirks = list
-            .iter()
-            .filter_map(Value::as_str)
-            .filter_map(|q| {
-                let (name, arg) = q.split_once(':').unwrap_or((q, ""));
-                Quirk::parse(name, arg)
-            })
-            .collect();
+        // 票 67：认不出的名字**说出来**（回执里的 `ignoredQuirks`）。原来是静默丢，
+        // 所以「camelCase 只认一半」这个 bug 藏了很久。
+        let mut quirks = Vec::new();
+        for item in list {
+            let raw = item.as_str().unwrap_or_default();
+            let (name, arg) = raw.split_once(':').unwrap_or((raw, ""));
+            match Quirk::parse(name, arg) {
+                Some(q) => quirks.push(q),
+                // 字符串按名字原样回；不是字符串（数字之类的脏元素）也照实说一句。
+                None => ignored_quirks.push(
+                    item.as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| item.to_string()),
+                ),
+            }
+        }
+        up.quirks = quirks;
     }
     if let Some(list) = body.get("headerPassthrough").and_then(Value::as_array) {
         up.header_passthrough = list
@@ -662,7 +682,7 @@ fn upstream_from_body(body: &Value, base: Option<Upstream>) -> Result<Upstream, 
             "向导第②步要求填上游地址；选供应商可以预填，也可以直接手填",
         ));
     }
-    Ok(up)
+    Ok((up, ignored_quirks))
 }
 
 fn parse_wires(body: &Value) -> Result<Vec<Wire>, ApiFailure> {
