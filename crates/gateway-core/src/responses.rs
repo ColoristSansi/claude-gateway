@@ -302,6 +302,150 @@ pub(crate) fn push_block(msgs: &mut Vec<IrMessage>, role: &str, b: IrBlock) {
     });
 }
 
+// ---------- 请求：IR -> 上游 OpenAI Responses JSON（票 65 的出站半边） ----------
+
+/// IR → 上游 `/responses` 的请求体（spec §4.2 / §6）。
+///
+/// 与 [`decode_request`] **方向相反**：那是 Codex 打进来的形状，这是发给上游的形状。
+/// 系统提示走**顶层 `instructions`**（上游 Responses 没有 system 消息角色）；
+/// 客户端那半边的 `input[].role:"developer"`（票 32 实测的 Codex 形状）不是这里的事。
+///
+/// 有损项（IR 表达得了、Responses 没有对应字段，**不编不猜**）：`stop`（上游没有 stop 参数）、
+/// `thinking`（拿不到可验证的 `encrypted_content`，伪造加密推理只会骗自己）、
+/// `IrBlock::Unknown`（形状不认识就不猜）。结构化输出**不在这里**：由
+/// [`crate::egress::structured::apply`] 按票 57 的三层形状落 `text.format`
+/// （`{name, schema, strict}`，`name` 常量 `"response"`），所以这里一个字都不写 `text`。
+pub fn encode_request(ir: &IrRequest, stream: bool) -> Value {
+    let instructions: String = ir
+        .system
+        .iter()
+        .filter_map(|b| b.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let mut input: Vec<Value> = Vec::new();
+    for m in &ir.messages {
+        let role = if m.role == "assistant" {
+            "assistant"
+        } else {
+            "user"
+        };
+        let mut parts: Vec<Value> = Vec::new();
+        for b in &m.blocks {
+            match b {
+                IrBlock::Text { text, .. } => parts.push(text_part(role, text)),
+                IrBlock::Image { source, .. } => parts.push(json!({
+                    "type":"input_image",
+                    "image_url": image_url(source),
+                })),
+                // 工具调用与结果在 Responses 里是**独立 item**，不能塞进 message 的 content：
+                // 先收尾当前 message，再按原顺序追加，配对键一路都是 `call_id`。
+                IrBlock::ToolUse {
+                    id,
+                    name,
+                    input: args,
+                } => {
+                    flush_message(&mut parts, role, &mut input);
+                    input.push(json!({
+                        "type":"function_call",
+                        "call_id":id,
+                        "name":name,
+                        // Responses 的 `arguments` 是**字符串**（与 Chat 同形，不是对象）。
+                        "arguments":args.to_string(),
+                    }));
+                }
+                IrBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } => {
+                    flush_message(&mut parts, role, &mut input);
+                    let mut out = crate::openai::tool_result_text(content);
+                    if is_error == &Some(true) {
+                        out = format!("[tool_error] {out}");
+                    }
+                    input.push(json!({
+                        "type":"function_call_output",
+                        "call_id":tool_use_id,
+                        "output":out,
+                    }));
+                }
+                IrBlock::Thinking { .. } | IrBlock::Unknown(_) => {}
+            }
+        }
+        flush_message(&mut parts, role, &mut input);
+    }
+
+    let mut body = json!({
+        "model": ir.model,
+        "input": input,
+        "max_output_tokens": ir.max_tokens,
+        "stream": stream,
+        // 续轮只做输入回放（spec §4.2：不实现 `previous_response_id`），所以别让上游留这份会话。
+        "store": false,
+    });
+    if !instructions.is_empty() {
+        body["instructions"] = json!(instructions);
+    }
+    if !ir.tools.is_empty() {
+        body["tools"] = json!(ir
+            .tools
+            .iter()
+            .map(|t| {
+                json!({"type":"function",
+                    "name": t.get("name").cloned().unwrap_or(Value::Null),
+                    "description": t.get("description").cloned().unwrap_or(json!("")),
+                    // IR 存的是 Anthropic 形状的 `input_schema`，Responses 叫 `parameters`。
+                    "parameters": t.get("input_schema").cloned().unwrap_or(json!({"type":"object"}))
+                })
+            })
+            .collect::<Vec<_>>());
+    }
+    if let Some(tc) = &ir.tool_choice {
+        body["tool_choice"] = match tc.get("type").and_then(|t| t.as_str()).unwrap_or("auto") {
+            "any" => json!("required"),
+            "tool" => {
+                json!({"type":"function","name":tc.get("name").cloned().unwrap_or(Value::Null)})
+            }
+            "none" => json!("none"),
+            _ => json!("auto"),
+        };
+    }
+    if let Some(t) = ir.temperature {
+        body["temperature"] = json!(t);
+    }
+    if let Some(t) = ir.top_p {
+        body["top_p"] = json!(t);
+    }
+    body
+}
+
+/// 一端文本零件：assistant 轮是 `output_text`，其余是 `input_text`。
+fn text_part(role: &str, text: &str) -> Value {
+    let ty = if role == "assistant" {
+        "output_text"
+    } else {
+        "input_text"
+    };
+    json!({"type": ty, "text": text})
+}
+
+/// 把攒下的零件收成一个 message item（没有零件就不发这一轮）。
+fn flush_message(parts: &mut Vec<Value>, role: &str, input: &mut Vec<Value>) {
+    if parts.is_empty() {
+        return;
+    }
+    input.push(json!({"role": role, "content": Value::Array(std::mem::take(parts))}));
+}
+
+/// IR 的 image source → Responses 的 `image_url`：base64 → `data:` URL，`url` 形状直接带过去。
+fn image_url(source: &Value) -> String {
+    match source.get("url").and_then(Value::as_str) {
+        Some(u) => u.to_string(),
+        None => crate::openai::data_url(source),
+    }
+}
+
 // ---------- 共用的响应对象与 output item 形状 ----------
 
 fn created_at() -> i64 {
@@ -807,9 +951,276 @@ impl ResponsesAssembler {
     }
 }
 
+// ---------- 流：上游 Responses SSE -> IR 事件（票 65 的出站半边） ----------
+
+/// 上游 `/responses` 的 SSE → IR 事件。
+///
+/// 上游的 `output_index` 只是它自己的序号：IR 的块序号由本解码器**顺序分配**
+/// （与 [`crate::openai::OpenAiDecoder`] 同一套做法），客户端面才拿得到连续的 0,1,2…
+///
+/// shortcut: `response.output_text.done` / `response.content_part.done` 这类「整段回执」帧
+/// **只当收尾用、不取里面的正文** —— 真流式上游的正文都在 `.delta` 帧里；碰到只发 `.done`
+/// 不发 `.delta` 的上游再补「没收到 delta 才取 done 正文」。
+#[derive(Default)]
+pub struct ResponsesDecoder {
+    next_index: u32,
+    /// 上游 `output_index` → IR 块序号。
+    items: Vec<(u64, u32)>,
+    open: Option<(u32, BlockKind)>,
+    /// 这一发里出现过工具调用：终态的 stop_reason 要报 `tool_use`（客户端靠它决定走工具）。
+    saw_tool_use: bool,
+    id: Option<String>,
+    started: bool,
+}
+
+impl ResponsesDecoder {
+    fn close_open(&mut self, out: &mut Vec<IrEvent>) {
+        if let Some((idx, _)) = self.open.take() {
+            out.push(IrEvent::BlockStop { index: idx });
+        }
+    }
+
+    /// 开流只报一次（`response.created` 与任何更早到达的帧都可能触发它）。
+    fn start(&mut self, id: Option<String>, out: &mut Vec<IrEvent>) {
+        if self.started {
+            return;
+        }
+        self.started = true;
+        self.id = id.or(self.id.take());
+        out.push(IrEvent::Start {
+            id: self.id.clone(),
+            input_tokens: None,
+        });
+    }
+
+    /// 上游给的 `output_index` → 顺序分配的 IR 块序号。
+    fn index_of(&mut self, up_index: u64) -> u32 {
+        if let Some((_, i)) = self.items.iter().find(|(o, _)| *o == up_index) {
+            return *i;
+        }
+        let idx = self.next_index;
+        self.next_index += 1;
+        self.items.push((up_index, idx));
+        idx
+    }
+
+    fn open_block(
+        &mut self,
+        up_index: u64,
+        kind: BlockKind,
+        id: Option<String>,
+        name: Option<String>,
+        out: &mut Vec<IrEvent>,
+    ) -> u32 {
+        self.start(None, out);
+        self.close_open(out);
+        let idx = self.index_of(up_index);
+        if kind == BlockKind::ToolUse {
+            self.saw_tool_use = true;
+        }
+        self.open = Some((idx, kind));
+        out.push(IrEvent::BlockStart {
+            index: idx,
+            kind,
+            id,
+            name,
+        });
+        idx
+    }
+
+    /// 已经开着同类块就用它；否则开一个（上游漏发 `output_item.added` 时的兜底）。
+    fn ensure(&mut self, up_index: u64, kind: BlockKind, out: &mut Vec<IrEvent>) -> u32 {
+        if let Some((idx, k)) = self.open {
+            if k == kind {
+                return idx;
+            }
+        }
+        self.open_block(up_index, kind, None, None, out)
+    }
+
+    pub fn decode(&mut self, f: &sse::Frame) -> Vec<IrEvent> {
+        let mut out = Vec::new();
+        if f.data.trim() == "[DONE]" {
+            self.close_open(&mut out);
+            out.push(IrEvent::Eos);
+            return out;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(&f.data) else {
+            return out;
+        };
+        let ty = v.get("type").and_then(Value::as_str).unwrap_or("");
+        // 上游把错误也发成帧：形状是 `{"type":"error","error":{…}}`（有的只在事件名上标 error）。
+        if ty == "error" || f.event.as_deref() == Some("error") {
+            out.push(ir_error(v.get("error").unwrap_or(&Value::Null)));
+            return out;
+        }
+
+        // 每帧都可能带 `output_index`，缺了就按 0 兜底。
+        let up_index = v.get("output_index").and_then(Value::as_u64).unwrap_or(0);
+        match ty {
+            "response.created" | "response.in_progress" => {
+                self.start(response_id(&v), &mut out);
+            }
+            "response.output_item.added" => {
+                let item = v.get("item").cloned().unwrap_or(json!({}));
+                match item.get("type").and_then(Value::as_str).unwrap_or("") {
+                    "message" => {
+                        self.open_block(
+                            up_index,
+                            BlockKind::Text,
+                            item.get("id").and_then(Value::as_str).map(str::to_string),
+                            None,
+                            &mut out,
+                        );
+                    }
+                    // 推理项**不在这里开块**：真录帧（commandcode `/responses`）的 reasoning 项
+                    // 只有 `encrypted_content`、`summary` 是空的，先开块就等于给客户端一个
+                    // 空 thinking 块（没有 signature，回放时还可能被上游拒）。有 summary 正文时
+                    // 由下面那条 `.delta` 懒开块，没有就整块不出现。
+                    "reasoning" => {}
+                    // 配对键是 `call_id`（`function_call_output` 回的就是它）。
+                    "function_call" | "custom_tool_call" => {
+                        let id = item
+                            .get("call_id")
+                            .or_else(|| item.get("id"))
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string);
+                        self.open_block(
+                            up_index,
+                            BlockKind::ToolUse,
+                            id,
+                            item.get("name").and_then(Value::as_str).map(str::to_string),
+                            &mut out,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            "response.output_item.done" => self.close_open(&mut out),
+            "response.output_text.delta" => {
+                let idx = self.ensure(up_index, BlockKind::Text, &mut out);
+                if let Some(d) = v.get("delta").and_then(Value::as_str) {
+                    if !d.is_empty() {
+                        out.push(IrEvent::TextDelta {
+                            index: idx,
+                            text: d.to_string(),
+                        });
+                    }
+                }
+            }
+            // 推理内容：汇总（`summary_text`）与原文（`reasoning_text`）都吃，都进 thinking 块。
+            "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                let idx = self.ensure(up_index, BlockKind::Thinking, &mut out);
+                if let Some(d) = v.get("delta").and_then(Value::as_str) {
+                    if !d.is_empty() {
+                        out.push(IrEvent::ThinkingDelta {
+                            index: idx,
+                            text: d.to_string(),
+                        });
+                    }
+                }
+            }
+            "response.function_call_arguments.delta" | "response.custom_tool_call_input.delta" => {
+                let idx = self.ensure(up_index, BlockKind::ToolUse, &mut out);
+                if let Some(d) = v.get("delta").and_then(Value::as_str) {
+                    if !d.is_empty() {
+                        out.push(IrEvent::ToolInputDelta {
+                            index: idx,
+                            partial_json: d.to_string(),
+                        });
+                    }
+                }
+            }
+            "response.completed" => {
+                let resp = v.get("response").cloned().unwrap_or(json!({}));
+                self.start(
+                    resp.get("id").and_then(Value::as_str).map(str::to_string),
+                    &mut out,
+                );
+                push_usage(&resp, &mut out);
+                self.close_open(&mut out);
+                out.push(IrEvent::Stop {
+                    reason: if self.saw_tool_use {
+                        "tool_use"
+                    } else {
+                        "end_turn"
+                    }
+                    .into(),
+                });
+                out.push(IrEvent::Eos);
+            }
+            // 撞上限（`incomplete_details.reason = "max_output_tokens"`）：照样是完整的一发，
+            // 只是 stop_reason 要报 `max_tokens`，让客户端知道是截断而不是答完。
+            "response.incomplete" => {
+                let resp = v.get("response").cloned().unwrap_or(json!({}));
+                self.start(
+                    resp.get("id").and_then(Value::as_str).map(str::to_string),
+                    &mut out,
+                );
+                push_usage(&resp, &mut out);
+                self.close_open(&mut out);
+                out.push(IrEvent::Stop {
+                    reason: "max_tokens".into(),
+                });
+                out.push(IrEvent::Eos);
+            }
+            "response.failed" => {
+                out.push(ir_error(
+                    v.pointer("/response/error").unwrap_or(&Value::Null),
+                ));
+            }
+            // 其余（`content_part.added` / `.done` / 各种 `.done` 回执）不改 IR 状态。
+            _ => {}
+        }
+        out
+    }
+}
+
+fn response_id(v: &Value) -> Option<String> {
+    v.pointer("/response/id")
+        .or_else(|| v.get("id"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// Responses 的 usage → IR（`input_tokens_details.cached_tokens` 就是缓存读；
+/// 上游词表里**没有**缓存写这一项，不编 0）。
+fn push_usage(resp: &Value, out: &mut Vec<IrEvent>) {
+    let Some(u) = resp.get("usage").filter(|u| u.is_object()) else {
+        return;
+    };
+    out.push(IrEvent::Usage {
+        input_tokens: u.get("input_tokens").and_then(Value::as_u64),
+        output_tokens: u.get("output_tokens").and_then(Value::as_u64),
+        cache_read_input_tokens: u
+            .pointer("/input_tokens_details/cached_tokens")
+            .and_then(Value::as_u64),
+        cache_creation_input_tokens: None,
+    });
+}
+
+/// 上游错误体 → IR 的错误事件（`code` 缺省时退 `type`，再缺省退 `api_error`）。
+fn ir_error(e: &Value) -> IrEvent {
+    IrEvent::Error {
+        kind: e
+            .get("code")
+            .or_else(|| e.get("type"))
+            .and_then(Value::as_str)
+            .unwrap_or("api_error")
+            .to_string(),
+        message: e
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("上游返回 error 帧")
+            .to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::ResponseFormat;
 
     /// 真的 Codex 请求形状（票 25 实测 + 票 32 复录）的缩样：instructions + 回放输入 +
     /// function 工具 + 自由格式工具 + 推理档位。
@@ -1045,5 +1456,310 @@ mod tests {
             text: "半句".into(),
         });
         assert!(!a.ended());
+    }
+
+    // ───────────── 票 65：出站方向（IR → 上游 `/responses`、上游 SSE → IR） ─────────────
+
+    /// 一件 Anthropic 入站的请求（**独立来源**：Anthropic 公开形状）解成 IR，喂给出站编码。
+    fn anthropic_ir_with_tools() -> IrRequest {
+        crate::anthropic::decode_request(&json!({
+            "model":"mock-text",
+            "max_tokens":77,
+            "temperature":0.25,
+            "top_p":0.9,
+            "stop_sequences":["X"],
+            "system":"你是助手",
+            "messages":[
+                {"role":"user","content":[
+                    {"type":"text","text":"看图"},
+                    {"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA"}}
+                ]},
+                {"role":"assistant","content":[
+                    {"type":"thinking","thinking":"想一下","signature":"sig"},
+                    {"type":"tool_use","id":"toolu_1","name":"f","input":{"a":1}}
+                ]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok","is_error":true}]}
+            ],
+            "tools":[{"name":"f","description":"d","input_schema":{"type":"object"}}],
+            "tool_choice":{"type":"tool","name":"f"}
+        }))
+        .unwrap()
+    }
+
+    /// IR → 上游 Responses 请求体：**系统提示走顶层 `instructions`**（不是 Codex 入站那套
+    /// `input[].role:"developer"`）、工具调用与结果成对、图片编成 `input_image` 的 data URL。
+    /// 逐字断言（对象比较不看键序，但多一个键就算不一致）——顺带钉住「有损项不出站」：
+    /// `stop` / `thinking` 在 Responses 面上没有对应字段。
+    #[test]
+    fn encodes_ir_into_an_upstream_responses_request() {
+        let ir0 = anthropic_ir_with_tools();
+        let body = encode_request(&ir0, true);
+        assert_eq!(
+            body,
+            json!({
+                "model":"mock-text",
+                "instructions":"你是助手",
+                "input":[
+                    {"role":"user","content":[
+                        {"type":"input_text","text":"看图"},
+                        {"type":"input_image","image_url":"data:image/png;base64,AA"}
+                    ]},
+                    {"type":"function_call","call_id":"toolu_1","name":"f","arguments":"{\"a\":1}"},
+                    {"type":"function_call_output","call_id":"toolu_1","output":"[tool_error] ok"}
+                ],
+                "tools":[{"type":"function","name":"f","description":"d","parameters":{"type":"object"}}],
+                "tool_choice":{"type":"function","name":"f"},
+                "max_output_tokens":77,
+                "temperature":0.25,
+                "top_p":0.9,
+                "stream":true,
+                "store":false
+            })
+        );
+    }
+
+    /// `stream:false` 时出站**仍然**是流式（票 26 决定 3：非流式只是把流缓到终态再组装）。
+    #[test]
+    fn outbound_responses_request_keeps_the_stream_flag_it_is_given() {
+        let mut ir = anthropic_ir_with_tools();
+        ir.messages.truncate(1);
+        assert_eq!(encode_request(&ir, false)["stream"], false);
+    }
+
+    /// 票 57 的三层 `text.format` 与出站编码**拼在一起**逐字一条：`text` 是
+    /// `{format:{type,name,schema,strict}}`（`name` 常量 `"response"`，`strict` 只透传显式值），
+    /// 且出站编码自己**不写** `text`（免得把结构化输出字段吃掉）。
+    #[test]
+    fn text_format_keeps_the_three_layer_shape_verbatim() {
+        use crate::egress::provider::{StructuredOutput, Wire};
+        let mut ir = anthropic_ir_with_tools();
+        ir.format = Some(ResponseFormat::JsonSchema {
+            schema: json!({
+                "type":"object",
+                "properties":{"a":{"type":"string"}},
+                "required":["a"]
+            }),
+            name: None,
+            strict: Some(true),
+        });
+        let mut body = encode_request(&ir, true);
+        assert!(body.get("text").is_none(), "编码器自己不该写 text：{body}");
+        crate::egress::structured::apply(
+            &mut body,
+            ir.format.as_ref(),
+            Wire::OpenAiResponses,
+            StructuredOutput::Native,
+            Some(Wire::OpenAiResponses),
+        )
+        .unwrap();
+        assert_eq!(
+            body["text"],
+            json!({"format":{
+                "type":"json_schema",
+                "name":"response",
+                "schema":{"type":"object","properties":{"a":{"type":"string"}},"required":["a"]},
+                "strict":true
+            }})
+        );
+    }
+
+    /// 事件 → 一行紧凑文本（断言用；比一堆 `matches!` 好读，也能看清**顺序**）。
+    fn render(ev: &IrEvent) -> String {
+        match ev {
+            IrEvent::Start { id, input_tokens } => format!("start:{id:?}:{input_tokens:?}"),
+            IrEvent::BlockStart {
+                index,
+                kind,
+                id,
+                name,
+            } => format!("block_start:{index}:{kind:?}:{id:?}:{name:?}"),
+            IrEvent::TextDelta { index, text } => format!("text:{index}:{text}"),
+            IrEvent::ThinkingDelta { index, text } => format!("thinking:{index}:{text}"),
+            IrEvent::SignatureDelta { index, signature } => {
+                format!("signature:{index}:{signature}")
+            }
+            IrEvent::ToolInputDelta {
+                index,
+                partial_json,
+            } => format!("tool_input:{index}:{partial_json}"),
+            IrEvent::BlockStop { index } => format!("block_stop:{index}"),
+            IrEvent::Ping => "ping".into(),
+            IrEvent::Usage {
+                input_tokens,
+                output_tokens,
+                cache_read_input_tokens,
+                cache_creation_input_tokens,
+            } => format!(
+                "usage:{input_tokens:?}:{output_tokens:?}:{cache_read_input_tokens:?}:{cache_creation_input_tokens:?}"
+            ),
+            IrEvent::Stop { reason } => format!("stop:{reason}"),
+            IrEvent::Error { kind, message } => format!("error:{kind}:{message}"),
+            IrEvent::Eos => "eos".into(),
+        }
+    }
+
+    /// 上游帧用 `sse::frame` 生成（与线上同一套分隔符），再逐帧过解码器。
+    fn decode_all(events: &[(&str, Value)]) -> Vec<String> {
+        let mut parser = sse::SseParser::default();
+        let mut frames = Vec::new();
+        for (name, data) in events {
+            frames.extend(parser.push(sse::frame(name, &data.to_string()).as_bytes()));
+        }
+        frames.extend(parser.finish());
+        let mut dec = ResponsesDecoder::default();
+        let mut out = Vec::new();
+        for f in &frames {
+            out.extend(dec.decode(f).iter().map(render));
+        }
+        out
+    }
+
+    /// 上游 Responses 帧 → IR：`output_item.added` 开块、`output_text.delta` 逐片、
+    /// `output_item.done` 收块、`response.completed` 给 usage 与终态。
+    #[test]
+    fn decodes_upstream_responses_text_frames_into_ir_events() {
+        let got = decode_all(&[
+            (
+                "response.created",
+                json!({"type":"response.created","response":{"id":"resp_up_1","status":"in_progress","output":[]}}),
+            ),
+            (
+                "response.output_item.added",
+                json!({"type":"response.output_item.added","output_index":0,
+                       "item":{"type":"message","id":"msg_up_1","role":"assistant","status":"in_progress","content":[]}}),
+            ),
+            (
+                "response.output_text.delta",
+                json!({"type":"response.output_text.delta","output_index":0,"item_id":"msg_up_1",
+                       "content_index":0,"delta":"你好"}),
+            ),
+            (
+                "response.output_text.delta",
+                json!({"type":"response.output_text.delta","output_index":0,"item_id":"msg_up_1",
+                       "content_index":0,"delta":"，世界"}),
+            ),
+            (
+                "response.output_item.done",
+                json!({"type":"response.output_item.done","output_index":0,
+                       "item":{"type":"message","id":"msg_up_1","status":"completed",
+                               "content":[{"type":"output_text","text":"你好，世界","annotations":[]}]}}),
+            ),
+            (
+                "response.completed",
+                json!({"type":"response.completed","response":{"id":"resp_up_1","status":"completed",
+                       "usage":{"input_tokens":11,"input_tokens_details":{"cached_tokens":3},
+                                "output_tokens":2,"output_tokens_details":{"reasoning_tokens":0},
+                                "total_tokens":13}}}),
+            ),
+        ]);
+        assert_eq!(
+            got,
+            vec![
+                "start:Some(\"resp_up_1\"):None",
+                "block_start:0:Text:Some(\"msg_up_1\"):None",
+                "text:0:你好",
+                "text:0:，世界",
+                "block_stop:0",
+                "usage:Some(11):Some(2):Some(3):None",
+                "stop:end_turn",
+                "eos",
+            ]
+        );
+    }
+
+    /// 推理项 + `function_call`：块序号由本层顺序分配（上游的 `output_index` 只是它自己的），
+    /// 配对键取 `call_id`，终态 stop_reason 报 `tool_use`。
+    ///
+    /// 推理块**懒开**：`output_item.added` 那一下不开块（真上游的 reasoning 项 summary 常是空的），
+    /// 等 `response.reasoning_summary_text.delta` 来正文时才开 —— 所以这里块 id 是 `None`。
+    #[test]
+    fn decodes_upstream_reasoning_and_tool_call_items() {
+        let got = decode_all(&[
+            (
+                "response.output_item.added",
+                json!({"type":"response.output_item.added","output_index":0,
+                       "item":{"type":"reasoning","id":"rs_up_1","summary":[]}}),
+            ),
+            (
+                "response.reasoning_summary_text.delta",
+                json!({"type":"response.reasoning_summary_text.delta","output_index":0,
+                       "item_id":"rs_up_1","summary_index":0,"delta":"想一下"}),
+            ),
+            (
+                "response.output_item.done",
+                json!({"type":"response.output_item.done","output_index":0,
+                       "item":{"type":"reasoning","id":"rs_up_1","summary":[]}}),
+            ),
+            (
+                "response.output_item.added",
+                json!({"type":"response.output_item.added","output_index":1,
+                       "item":{"type":"function_call","id":"fc_up_1","call_id":"call_up_1",
+                               "name":"get_weather","arguments":"","status":"in_progress"}}),
+            ),
+            (
+                "response.function_call_arguments.delta",
+                json!({"type":"response.function_call_arguments.delta","output_index":1,
+                       "item_id":"fc_up_1","delta":"{\"city\""}),
+            ),
+            (
+                "response.function_call_arguments.delta",
+                json!({"type":"response.function_call_arguments.delta","output_index":1,
+                       "item_id":"fc_up_1","delta":":\"上海\"}"}),
+            ),
+            (
+                "response.output_item.done",
+                json!({"type":"response.output_item.done","output_index":1,
+                       "item":{"type":"function_call","id":"fc_up_1","call_id":"call_up_1",
+                               "name":"get_weather","arguments":"{\"city\":\"上海\"}","status":"completed"}}),
+            ),
+            (
+                "response.completed",
+                json!({"type":"response.completed","response":{"id":"resp_up_2","status":"completed",
+                       "usage":{"input_tokens":5,"output_tokens":9}}}),
+            ),
+        ]);
+        assert_eq!(
+            got,
+            vec![
+                "start:None:None",
+                "block_start:0:Thinking:None:None",
+                "thinking:0:想一下",
+                "block_stop:0",
+                "block_start:1:ToolUse:Some(\"call_up_1\"):Some(\"get_weather\")",
+                "tool_input:1:{\"city\"",
+                "tool_input:1::\"上海\"}",
+                "block_stop:1",
+                "usage:Some(5):Some(9):None:None",
+                "stop:tool_use",
+                "eos",
+            ]
+        );
+    }
+
+    /// 上游在流里报错（`response.failed`）与 `response.incomplete`（撞上限）各自的终态。
+    #[test]
+    fn upstream_error_and_incomplete_frames_map_to_ir() {
+        let failed = decode_all(&[(
+            "response.failed",
+            json!({"type":"response.failed","response":{"id":"resp_1","status":"failed",
+                   "error":{"code":"server_error","message":"上游炸了"}}}),
+        )]);
+        assert_eq!(failed, vec!["error:server_error:上游炸了"]);
+
+        let incomplete = decode_all(&[(
+            "response.incomplete",
+            json!({"type":"response.incomplete","response":{"id":"resp_1","status":"incomplete",
+                   "incomplete_details":{"reason":"max_output_tokens"},
+                   "usage":{"input_tokens":4,"output_tokens":16}}}),
+        )]);
+        assert_eq!(
+            incomplete,
+            vec![
+                "start:Some(\"resp_1\"):None",
+                "usage:Some(4):Some(16):None:None",
+                "stop:max_tokens",
+                "eos"
+            ]
+        );
     }
 }

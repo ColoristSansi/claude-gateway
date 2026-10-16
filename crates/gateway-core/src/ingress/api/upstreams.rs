@@ -65,12 +65,6 @@ async fn list_providers(State(state): State<ApiState>) -> Result<Json<Value>, Ap
         "presets": presets,
         "snapshot": snapshot,
         "wires": Wire::ALL.iter().map(|w| w.as_str()).collect::<Vec<_>>(),
-        // 未实现的 wire：向导里的 wire 下拉 / 徽章据此标「本版未实现」（与 `/api/bindings` 同一口径）。
-        "unimplementedWires": Wire::ALL
-            .iter()
-            .filter(|w| !w.implemented())
-            .map(|w| w.as_str())
-            .collect::<Vec<_>>(),
         "quirks": Quirk::all().iter().map(Quirk::name).collect::<Vec<_>>(),
     })))
 }

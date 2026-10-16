@@ -922,6 +922,194 @@ async fn ticket57_structured_output_probe_on_live_upstreams() {
     );
 }
 
+// ───────────── 票 65 验收 2：真打上游的 Responses 出站（流式 + 非流式） ─────────────
+
+/// 上游 **Responses 出站**的真上游验收（**联网**，默认不跑）：从 commandcode 的 `/models` 里
+/// 挑一条**声明了 `/responses`** 的模型（票 49 的反查把 `supported_endpoints` 映成 wire），
+/// 走产品侧那条 HTTP 路由（客户端面 = **Anthropic**）真打流式 + 非流式各一发。
+///
+/// 请求体与帧序列从 obs 库（body 开关）读回来打印：`request_bodies.request_body` 是
+/// **发给上游的逐字请求体**，`response_body` 是上游回的原始 SSE 帧。
+/// **绝不打印密钥与 baseUrl**（只打模型 id / 帧数 / 词表 / usage）。
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "打真上游：cargo test -p gateway-core --test upstream_live -- --ignored --nocapture"]
+async fn ticket65_responses_outbound_streams_and_buffers_against_a_live_upstream() {
+    use gateway_core::binding::{default_profiles, Binding, BindingTable, Profile};
+    use gateway_core::ingress::proxy::{Gateway, BODY_LOG_WINDOW};
+    use gateway_core::obs::{self, LogQuery};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    let env = EnvFile::load();
+    let base = env.get("COMMANDCODE_BASE_URL");
+    let key = env.get("COMMANDCODE_API_KEY");
+    let root = tmp_root("t65-responses");
+    let store = Store::open(&root).expect("开库");
+    let http = reqwest::Client::new();
+
+    let up = live_upstream("commandcode", &base);
+    save_upstream(&store, &up).await.unwrap();
+    store
+        .put_credential("commandcode", "default", &key)
+        .await
+        .unwrap();
+
+    // 目录按真清单反查 wire（票 49 的口径），再挑一条声明了 `openai-responses` 的。
+    let outcome = pull_models(&http, &up, MODELS_PATH, Some(&key)).await;
+    assert!(matches!(outcome, PullOutcome::Fetched(_)), "{outcome:?}");
+    apply_pull(&store, &up, outcome, 1_760_000_500)
+        .await
+        .unwrap();
+    let models = list_models(&store, "commandcode").await.unwrap();
+    let declares = models
+        .iter()
+        .filter(|m| m.supported_wires.contains(&Wire::OpenAiResponses))
+        .count();
+    let picked = models
+        .iter()
+        .find(|m| m.model_id == "gpt-6-luna" && m.supported_wires.contains(&Wire::OpenAiResponses))
+        .or_else(|| {
+            models
+                .iter()
+                .find(|m| m.supported_wires.contains(&Wire::OpenAiResponses))
+        })
+        .expect("真清单里该有声明 openai-responses 的模型")
+        .model_id
+        .clone();
+    println!(
+        "\n===== 票 65：真上游 Responses 出站（commandcode / {picked} / openai-responses）====="
+    );
+    println!(
+        "（清单 {} 条，其中声明 /responses 的 {declares} 条）",
+        models.len()
+    );
+
+    let mut upstreams = HashMap::new();
+    upstreams.insert("commandcode".to_string(), up);
+    let table = BindingTable::new(
+        vec![Binding::new(
+            Profile::Global,
+            "live-responses",
+            "commandcode",
+            &picked,
+            Wire::OpenAiResponses,
+        )],
+        default_profiles(),
+    );
+    let app = Arc::new(Gateway::new(store.clone(), upstreams, table));
+    app.set_body_log(BODY_LOG_WINDOW.as_secs());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = gateway_core::ingress::proxy::router().with_state(app);
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    let ask = |stream: bool| {
+        serde_json::json!({
+            "model": "live-responses",
+            "max_tokens": 512,
+            "stream": stream,
+            "system": "你是简洁的助手。",
+            "messages": [{"role":"user","content":"只回四个字：收到收到"}],
+        })
+    };
+    let post = |stream: bool| {
+        let http = http.clone();
+        async move {
+            http.post(format!("http://{addr}/v1/messages"))
+                .json(&ask(stream))
+                .send()
+                .await
+                .expect("POST /v1/messages 失败")
+        }
+    };
+
+    // ① 流式：客户端面（Anthropic）的帧要打到最后。
+    let r = post(true).await;
+    let status = r.status().as_u16();
+    let stream_text = r.text().await.unwrap_or_default();
+    assert_eq!(status, 200, "真上游流式这一发必须 200：{stream_text}");
+    let events: Vec<&str> = stream_text
+        .lines()
+        .filter_map(|l| l.strip_prefix("event: "))
+        .collect();
+    assert_eq!(
+        events.last().copied(),
+        Some("message_stop"),
+        "要打到 message_stop：{stream_text}"
+    );
+    let answer: String = stream_text
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter_map(|d| serde_json::from_str::<serde_json::Value>(d).ok())
+        .filter_map(|v| {
+            v.pointer("/delta/text")
+                .and_then(|t| t.as_str())
+                .map(str::to_string)
+        })
+        .collect();
+    println!("\n[流式] 客户端面帧序列：{}", events.join(" → "));
+    println!("[流式] 正文：{answer:?}");
+
+    // ② 非流式：同一条流缓到终态再组装成一条完整 message。
+    let r = post(false).await;
+    let status = r.status().as_u16();
+    let body_text = r.text().await.unwrap_or_default();
+    assert_eq!(status, 200, "真上游非流式这一发必须 200：{body_text}");
+    let v: serde_json::Value = serde_json::from_str(&body_text).expect("非流式体是 JSON");
+    println!(
+        "[非流式] content={:?} stop_reason={} usage={}",
+        v["content"][0]["text"], v["stop_reason"], v["usage"]
+    );
+    assert!(
+        !v["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty(),
+        "非流式该有正文：{body_text}"
+    );
+    assert!(
+        v["usage"]["input_tokens"].as_u64().unwrap_or(0) > 0,
+        "usage 要从上游终态帧里解出来：{body_text}"
+    );
+
+    // ③ 落库的请求体与上游原始帧（body 开关那一份）。
+    let rows = obs::list(&store, &LogQuery::default()).await.unwrap();
+    assert!(rows.len() >= 2, "两发都该落库：{rows:?}");
+    for row in rows.iter().take(2) {
+        assert_eq!(row["wire"], "openai-responses", "{row}");
+        assert_eq!(row["status"], 200, "{row}");
+        let id = row["id"].as_i64().unwrap_or(0).to_string();
+        let detail = obs::log_detail(&store, &id)
+            .await
+            .unwrap()
+            .unwrap_or_default();
+        let sent = detail["bodies"]["request"].as_str().unwrap_or_default();
+        let raw = detail["bodies"]["response"].as_str().unwrap_or_default();
+        println!(
+            "\n[日志行 {}] 发给上游的请求体（非流式那发也一样是 stream:true）：",
+            row["id"]
+        );
+        println!("{}", &sent[..sent.len().min(900)]);
+        let vocab: Vec<&str> = raw
+            .lines()
+            .filter_map(|l| l.strip_prefix("event: "))
+            .collect();
+        println!("[上游帧词表] {}", vocab.join(" → "));
+        assert!(
+            sent.contains("\"max_output_tokens\""),
+            "请求体该是 Responses 形状：{sent}"
+        );
+        assert!(raw.contains("response.completed"), "上游该发到终态：{raw}");
+    }
+
+    assert!(
+        !dir_contains_bytes(&root, key.as_bytes()),
+        "库文件里不该出现明文密钥"
+    );
+}
+
 // ───────────── 票 64 验收 3（可选）：真上游的一条 Chat 入站 ─────────────
 
 /// `POST /v1/chat/completions` 打一条**真上游**：解 Chat 请求 → IR → 出站 Chat wire →

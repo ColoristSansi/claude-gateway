@@ -1,0 +1,21 @@
+event: response.created
+data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_up_2","object":"response","created_at":1760000001,"status":"in_progress","model":"mock-text","output":[]}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"type":"function_call","id":"fc_up_1","call_id":"call_up_1","name":"get_weather","arguments":"","status":"in_progress"}}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","sequence_number":2,"item_id":"fc_up_1","output_index":0,"delta":"{\"city\""}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","sequence_number":3,"item_id":"fc_up_1","output_index":0,"delta":":\"上海\"}"}
+
+event: response.function_call_arguments.done
+data: {"type":"response.function_call_arguments.done","sequence_number":4,"item_id":"fc_up_1","output_index":0,"arguments":"{\"city\":\"上海\"}"}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","sequence_number":5,"output_index":0,"item":{"type":"function_call","id":"fc_up_1","call_id":"call_up_1","name":"get_weather","arguments":"{\"city\":\"上海\"}","status":"completed"}}
+
+event: response.completed
+data: {"type":"response.completed","sequence_number":6,"response":{"id":"resp_up_2","object":"response","created_at":1760000001,"status":"completed","model":"mock-text","output":[{"type":"function_call","id":"fc_up_1","call_id":"call_up_1","name":"get_weather","arguments":"{\"city\":\"上海\"}","status":"completed"}],"usage":{"input_tokens":9,"input_tokens_details":{"cached_tokens":0},"output_tokens":7,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":16}}}
+

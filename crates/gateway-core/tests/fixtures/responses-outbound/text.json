@@ -1,0 +1,10 @@
+{
+  "id": "resp_up_1",
+  "type": "message",
+  "role": "assistant",
+  "model": "claude-haiku",
+  "content": [{ "type": "text", "text": "你好，世界" }],
+  "stop_reason": "end_turn",
+  "stop_sequence": null,
+  "usage": { "input_tokens": 11, "output_tokens": 2, "cache_read_input_tokens": 3 }
+}

@@ -6,6 +6,9 @@
 //! ② 日志落点从原型「每行单开连接直接写 sqlite」换成票 42 的 [`Store`] + [`obs`]
 //!    （ADR-0007 第 6 条那笔债不搬）；
 //! ③ 转发链、错误信封、ping 保活、探针 deadline 一字未改。
+//!
+//! 票 65 把第三条出站 wire（`openai-responses`）接上：编解码在 `crate::responses`
+//! （ADR-0007 第 2 条：三个编解码文件各自含入站与出站，不硬拆两半），这里只按 wire 选边。
 
 use std::{sync::Arc, time::Duration, time::Instant};
 
@@ -25,7 +28,7 @@ use crate::ingress::proxy::Gateway;
 use crate::ir::{IrEvent, IrRequest};
 use crate::obs::{self, RequestLog};
 use crate::openai::{self, OpenAiDecoder};
-use crate::responses::{ResponsesAssembler, ResponsesEncoder};
+use crate::responses::{self, ResponsesAssembler, ResponsesDecoder, ResponsesEncoder};
 use crate::sse::{self, SseParser};
 use crate::store::Store;
 
@@ -81,6 +84,8 @@ impl Inbound {
 enum Decoder {
     A(AnthropicDecoder),
     O(OpenAiDecoder),
+    /// 票 65：上游 `/responses` 的 SSE（`response.*` 事件名 + `data:` 帧）。
+    R(ResponsesDecoder),
 }
 
 impl Decoder {
@@ -88,6 +93,7 @@ impl Decoder {
         match self {
             Decoder::A(d) => d.decode(f),
             Decoder::O(d) => d.decode(f),
+            Decoder::R(d) => d.decode(f),
         }
     }
 }
@@ -249,23 +255,18 @@ pub(crate) fn request(
     rb
 }
 
-/// 上游 Responses 面（`/responses`）的出站编解码**本版未实现**：早报清楚，别静默当 Chat 打。
+/// 上游**没有这条 wire 的路径模板**（`pathTemplates` 缺这一面）：早报清楚，别静默当别的面打。
 ///
-/// 文案与里程碑脱钩（评审「低」第 3 条：M3 已收口，再写「M3 起接」是过期信息）。
-fn wire_not_implemented(wire: Wire, inbound: Inbound, up_id: &str) -> Response {
-    let implemented: Vec<&str> = Wire::ALL
-        .iter()
-        .filter(|w| w.implemented())
-        .map(|w| w.as_str())
-        .collect();
+/// 票 65 之前这里还兼着「Responses 出站本版未实现」那条早拒；现在三条 wire 全接上了，
+/// 这个函数只剩「路径没配」这一种情形（本来对 Anthropic / Chat 缺路径也该是这个文案）。
+fn no_path(wire: Wire, inbound: Inbound, up_id: &str) -> Response {
     error_response_for(
         inbound,
         StatusCode::BAD_GATEWAY,
         "api_error",
         &format!(
-            "上游 {up_id} 的 {} 面本版未实现（Responses 出站还没接）；请先把该模型绑到已实现的 wire 上：{}。",
-            wire.as_str(),
-            implemented.join(" / ")
+            "上游 {up_id} 没有 {} 面的路径模板（pathTemplates 缺这一项），编不出要打的 URL。",
+            wire.as_str()
         ),
     )
 }
@@ -322,12 +323,12 @@ pub async fn forward_buffered(
     inbound: Inbound,
 ) -> Response {
     let Some(url) = up.url(wire) else {
-        return wire_not_implemented(wire, inbound, &up.id);
+        return no_path(wire, inbound, &up.id);
     };
     let mut body = match wire {
         Wire::Anthropic => anthropic::encode_request(&req, true),
         Wire::OpenAiChat => openai::encode_request(&req, true),
-        Wire::OpenAiResponses => return wire_not_implemented(wire, inbound, &up.id),
+        Wire::OpenAiResponses => responses::encode_request(&req, true),
     };
     // 票 57：结构化输出的两条请求期 400（表达不了 / 能力位 ignore）在这里落地：body 就在这一步
     // 组装，所以判据也只能在这里——关键是它排在**发出任何字节之前**。
@@ -404,7 +405,7 @@ pub async fn forward_buffered(
     let mut dec = match wire {
         Wire::Anthropic => Decoder::A(AnthropicDecoder),
         Wire::OpenAiChat => Decoder::O(OpenAiDecoder::default()),
-        Wire::OpenAiResponses => return wire_not_implemented(wire, inbound, &up.id),
+        Wire::OpenAiResponses => Decoder::R(ResponsesDecoder::default()),
     };
     let mut parser = SseParser::default();
     let mut asm = ClientAssembler::new(inbound, req.freeform_tools.clone());
@@ -542,12 +543,12 @@ pub async fn forward(
     inbound: Inbound,
 ) -> Response {
     let Some(url) = up.url(wire) else {
-        return wire_not_implemented(wire, inbound, &up.id);
+        return no_path(wire, inbound, &up.id);
     };
     let mut body = match wire {
         Wire::Anthropic => anthropic::encode_request(&req, true),
         Wire::OpenAiChat => openai::encode_request(&req, true),
-        Wire::OpenAiResponses => return wire_not_implemented(wire, inbound, &up.id),
+        Wire::OpenAiResponses => responses::encode_request(&req, true),
     };
     // 票 57：与 `forward_buffered` 同一套判据（两条出口共用，免得某条忘了拦）。
     if let Err(rej) = structured::apply(
@@ -624,7 +625,7 @@ pub async fn forward(
     let dec = match wire {
         Wire::Anthropic => Decoder::A(AnthropicDecoder),
         Wire::OpenAiChat => Decoder::O(OpenAiDecoder::default()),
-        Wire::OpenAiResponses => return wire_not_implemented(wire, inbound, &up.id),
+        Wire::OpenAiResponses => Decoder::R(ResponsesDecoder::default()),
     };
     let recording = app.body_log_on();
     let pump = Pump {
