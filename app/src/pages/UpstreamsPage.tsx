@@ -9,11 +9,12 @@ import { api, type ProviderPreset, type PullReport, type UpstreamModelView, type
 import { ErrorBlock, formatTime, Pill } from '../components';
 import type { ShellCtx } from '../App';
 
-const WIRES = ['anthropic', 'openai-chat', 'openai-responses'];
-
 export function UpstreamsPage({ ctx }: { ctx: ShellCtx }) {
   const [list, setList] = useState<UpstreamView[]>([]);
   const [presets, setPresets] = useState<ProviderPreset[]>([]);
+  /** 协议候选来自后端（`/api/providers`）：未实现的那个单独列出来标「本版未实现」并禁选。 */
+  const [wires, setWires] = useState<string[]>([]);
+  const [unimplemented, setUnimplemented] = useState<string[]>([]);
   const [error, setError] = useState<unknown>(null);
   const [wizard, setWizard] = useState<Wizard | null>(null);
   const [expanded, setExpanded] = useState<string | null>(null);
@@ -23,6 +24,8 @@ export function UpstreamsPage({ ctx }: { ctx: ShellCtx }) {
       const [u, p] = await Promise.all([api.upstreams(), api.providers()]);
       setList(u.upstreams);
       setPresets(p.presets);
+      setWires(p.wires);
+      setUnimplemented(p.unimplementedWires);
       setError(null);
     } catch (e) {
       setError(e);
@@ -149,6 +152,8 @@ export function UpstreamsPage({ ctx }: { ctx: ShellCtx }) {
       {wizard && (
         <Wizard
           presets={presets}
+          wires={wires}
+          unimplemented={unimplemented}
           onClose={() => setWizard(null)}
           onSaved={async () => {
             setWizard(null);
@@ -229,11 +234,16 @@ function newWizard(): Wizard {
 
 function Wizard({
   presets,
+  wires,
+  unimplemented,
   onClose,
   onSaved,
   confirm,
 }: {
   presets: ProviderPreset[];
+  /** 协议候选（`/api/providers` 的 `wires`）与其中未实现的那几个（标出来 + 禁选）。 */
+  wires: string[];
+  unimplemented: string[];
   onClose: () => void;
   onSaved: () => Promise<void>;
   confirm: ShellCtx['confirm'];
@@ -413,9 +423,9 @@ function Wizard({
             {w.showSecondKey && (
               <div className="row">
                 <select value={w.secondWire} onChange={(e) => set({ secondWire: e.target.value })}>
-                  {WIRES.map((wire) => (
-                    <option key={wire} value={wire}>
-                      {wire}
+                  {wires.map((wire) => (
+                    <option key={wire} value={wire} disabled={unimplemented.includes(wire)}>
+                      {unimplemented.includes(wire) ? `${wire}（本版未实现，不可选）` : wire}
                     </option>
                   ))}
                 </select>
@@ -500,7 +510,7 @@ function Wizard({
                       ) : (
                         m.supportedWires.map((wire) => (
                           <span className="wire-badge" key={wire}>
-                            {wire}
+                            {unimplemented.includes(wire) ? `${wire}（本版未实现）` : wire}
                           </span>
                         ))
                       )}

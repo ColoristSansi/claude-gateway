@@ -96,7 +96,41 @@ async fn list_bindings(
         "slots": slots,
         "virtualModels": virtuals,
         "wires": Wire::ALL.iter().map(|w| w.as_str()).collect::<Vec<_>>(),
+        // 未实现的 wire 仍然列在 `wires` 里（藏起来不如标出来），界面据此标注 / 禁选。
+        "unimplementedWires": unimplemented_wires(),
     })))
+}
+
+/// 本版没实现出站编解码的 wire（界面标注用；保存时也按它拒收）。
+fn unimplemented_wires() -> Vec<&'static str> {
+    Wire::ALL
+        .iter()
+        .filter(|w| !w.implemented())
+        .map(|w| w.as_str())
+        .collect()
+}
+
+/// 未实现的 wire 早拒：存下去这条绑定只会稳定 502（`egress/upstream.rs` 的 Responses 面还没接）。
+fn reject_unimplemented(wire: Wire) -> ApiFailure {
+    let implemented: Vec<&str> = Wire::ALL
+        .iter()
+        .filter(|w| w.implemented())
+        .map(|w| w.as_str())
+        .collect();
+    ApiFailure::new(
+        StatusCode::BAD_REQUEST,
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "{} 本版未实现：存下去这条绑定只会得到 502（上游 Responses 出站还没接）",
+                wire.as_str()
+            ),
+            format!(
+                "改用已实现的 {}；上游声明了 /responses 路径不代表网关能转发它",
+                implemented.join(" / ")
+            ),
+        ),
+    )
 }
 
 fn binding_json(b: &Binding) -> Value {
@@ -124,6 +158,9 @@ async fn save_binding(
     let real_model = str_field(&body, "realModel")?;
     let wire = Wire::parse(body.get("wire").and_then(Value::as_str).unwrap_or(""))
         .ok_or_else(|| bad("wire 只能是 anthropic / openai-chat / openai-responses"))?;
+    if !wire.implemented() {
+        return Err(reject_unimplemented(wire));
+    }
     let b = Binding::new(profile, &slot, &upstream_id, &real_model, wire);
     let choice = binding::save(&admin.store, &b)
         .await
@@ -235,6 +272,9 @@ async fn save_virtual_model(
     let real_model = str_field(&body, "realModel")?;
     let wire = Wire::parse(body.get("wire").and_then(Value::as_str).unwrap_or(""))
         .ok_or_else(|| bad("wire 只能是 anthropic / openai-chat / openai-responses"))?;
+    if !wire.implemented() {
+        return Err(reject_unimplemented(wire));
+    }
     let b = Binding::new(profile, &name, &upstream_id, &real_model, wire);
     let choice = binding::save(&admin.store, &b)
         .await

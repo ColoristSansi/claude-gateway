@@ -378,6 +378,25 @@ async fn every_row_gets_a_unique_request_id() {
     assert!(ids.iter().all(|i| i.starts_with("req-")), "{ids:?}");
 }
 
+/// 清理表必须能被停掉（评审「中」第 5 条）：从前它是无取消句柄的 `tokio::spawn` 死循环，
+/// 每次 `start_gateway` 再起一个、`stop_gateway` 不停它 → N 个常驻循环清同一个库。
+#[tokio::test]
+async fn the_purge_sweeper_stops_when_told_to() {
+    let root = tmp_root("purge-sweeper");
+    let store = Store::open(&root).unwrap();
+
+    let sweeper = spawn_purge_sweeper(store);
+    let probe = sweeper.abort_handle();
+    assert!(!probe.is_finished(), "刚起的清理循环不该已经结束");
+
+    sweeper.stop().await;
+
+    assert!(
+        probe.is_finished(),
+        "收到关停之后清理循环必须结束（否则每次重启多一个常驻循环）"
+    );
+}
+
 /// 保留期：8 天前的行清掉，7 天内的留着；body 跟着行一起走（外键级联）。
 #[tokio::test]
 async fn purge_drops_rows_past_retention_and_keeps_recent_ones() {

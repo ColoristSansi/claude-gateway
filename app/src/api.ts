@@ -201,6 +201,8 @@ export type BindingsView = {
   slots: { slot: string; binding: BindingView | null; global: BindingView | null; overridden: boolean }[];
   virtualModels: BindingView[];
   wires: string[];
+  /** 本版未实现的 wire（下拉里标出来并禁选；后端保存时也拒收）。 */
+  unimplementedWires: string[];
 };
 
 export type UsageRow = {
@@ -582,9 +584,13 @@ export const api = {
 
   // ── 上游页 ──
   providers: () =>
-    req<{ presets: ProviderPreset[]; snapshot: { id: string; modelCount: number }[]; wires: string[] }>(
-      '/api/providers',
-    ),
+    req<{
+      presets: ProviderPreset[];
+      snapshot: { id: string; modelCount: number }[];
+      wires: string[];
+      /** 本版未实现的 wire（向导里的下拉 / 徽章标出来，绑定时后端也会拒收）。 */
+      unimplementedWires: string[];
+    }>('/api/providers'),
   upstreams: () => req<{ upstreams: UpstreamView[] }>('/api/upstreams'),
   createUpstream: (body: Record<string, unknown>) => req<{ upstream: UpstreamView }>('/api/upstreams', json(body)),
   updateUpstream: (id: string, body: Record<string, unknown>) =>

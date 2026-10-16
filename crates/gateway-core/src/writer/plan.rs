@@ -53,6 +53,15 @@ pub enum OwnedOp {
         equals: Json,
         value: Option<Json>,
     },
+    /// 还原：写回**首写快照里这个键的旧值**；首写时没有这个键（或文件当时还不存在）就摘掉。
+    ///
+    /// 与 [`OwnedOp::Remove`] 的区别：`Remove` 是「把网关写下的值摘掉」，这个是「把用户原来的值
+    /// 还回去」——接管键会覆盖用户原有取值（Desktop 的 `inferenceCredentialKind`，SSO 的
+    /// `interactive`）时必须用它，否则用户的选择静默丢失（票 46:69 的风险②）。
+    ///
+    /// 旧值不在计划里、而在引擎的**首写快照**里（`client_config_state.backup_path` 指的原文件），
+    /// 所以引擎在还原前把它展开成具体的 `Set` / `Remove` 再落盘（[`crate::writer::Writer::restore`]）。
+    RestoreFirstWrite { path: Vec<String> },
 }
 
 impl OwnedOp {
@@ -64,7 +73,8 @@ impl OwnedOp {
             | OwnedOp::RemoveIfEmpty { path }
             | OwnedOp::SetElement { path, .. }
             | OwnedOp::RemoveElement { path, .. }
-            | OwnedOp::ReplaceIfEquals { path, .. } => path,
+            | OwnedOp::ReplaceIfEquals { path, .. }
+            | OwnedOp::RestoreFirstWrite { path } => path,
         }
     }
 
@@ -102,6 +112,8 @@ impl OwnedOp {
                 "?{base}#if={}",
                 serde_json::to_string(equals).unwrap_or_default()
             ),
+            // 还原侧的标签不参与任何比对（比对只看 `write_ops` 的清单），只要稳定可读。
+            OwnedOp::RestoreFirstWrite { .. } => format!("-!{base}"),
         }
     }
 }

@@ -263,3 +263,119 @@ async fn slot_binding_save_reads_back_survives_a_restart_and_rejects_an_undeclar
 
     h.stop().await;
 }
+
+/// 未实现的 wire（`openai-responses`）**界面要标出来、保存要拒收**（评审的阻断③）：
+/// 后端从前用 `Wire::ALL` 全量回、预设里 5 个声明了 `/responses`、下拉可选 →
+/// 用户能存下一个永远 502 的绑定（自检会红，但不该让人先踩进去）。
+#[tokio::test]
+async fn an_unimplemented_wire_is_marked_and_cannot_be_saved() {
+    let h = H::boot(tmp("unimplemented-wire"), "起网关").await;
+
+    // 界面拿到的候选里，未实现的仍然列出来（好解释为什么不能选），但要在单独的字段里标出来。
+    let (s, body) = h.get("/api/bindings?client=global").await;
+    assert_eq!(s, 200, "{body}");
+    assert_eq!(
+        body["unimplementedWires"],
+        json!(["openai-responses"]),
+        "界面下拉据此标注 / 禁选：{body}"
+    );
+    assert!(
+        body["wires"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w == "openai-responses"),
+        "候选里照旧列全量（标出来比藏起来诚实）：{body}"
+    );
+
+    // 上游 + 一条只声明 `openai-responses` 的手工模型：7 个内置预设里 5 个就是这个样子。
+    let (s, body) = h
+        .send(
+            "POST",
+            "/api/upstreams",
+            json!({
+                "id": "resp",
+                "name": "resp",
+                "baseUrl": "http://127.0.0.1:1",
+                "paths": {"anthropic": "/messages", "openai-responses": "/responses"},
+                "credentials": [{"wire": "default", "key": "sk-test-DO-NOT-LEAK"}],
+            }),
+        )
+        .await;
+    assert_eq!(s, 201, "{body}");
+    let (s, body) = h
+        .send(
+            "POST",
+            "/api/upstreams/resp/models",
+            json!({"modelId": "gpt-5-responses", "wires": ["openai-responses"]}),
+        )
+        .await;
+    assert_eq!(s, 200, "{body}");
+
+    // 槽位绑定：拒收 + 说清「本版未实现」与怎么绕开。
+    let (s, body) = h
+        .put_binding(
+            "claude-sonnet",
+            "resp",
+            "gpt-5-responses",
+            "openai-responses",
+        )
+        .await;
+    assert_eq!(s, 400, "未实现的 wire 必须 400：{body}");
+    let err = &body["error"];
+    assert!(
+        err["what"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("本版未实现"),
+        "要说清这条路本版走不通：{body}"
+    );
+    assert!(
+        err["likelyCause"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("anthropic"),
+        "要指出改用哪些已实现的 wire：{body}"
+    );
+
+    // 普通虚拟模型是另一条保存路径，同样拒收。
+    let (s, body) = h
+        .send(
+            "POST",
+            "/api/virtual-models?client=global",
+            json!({"name": "v1", "upstreamId": "resp", "realModel": "gpt-5-responses", "wire": "openai-responses"}),
+        )
+        .await;
+    assert_eq!(s, 400, "{body}");
+
+    // 两条路都没落库。
+    let (s, body) = h.get("/api/bindings?client=global").await;
+    assert_eq!(s, 200, "{body}");
+    let sonnet = body["slots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["slot"] == "claude-sonnet")
+        .unwrap();
+    assert!(sonnet["binding"].is_null(), "没存下去：{body}");
+    assert!(
+        body["virtualModels"].as_array().unwrap().is_empty(),
+        "{body}"
+    );
+
+    // 已实现的 wire 不受影响（同一个上游上照常能存）。
+    let (s, body) = h
+        .send(
+            "POST",
+            "/api/upstreams/resp/models",
+            json!({"modelId": "claude-on-anthropic", "wires": ["anthropic"]}),
+        )
+        .await;
+    assert_eq!(s, 200, "{body}");
+    let (s, body) = h
+        .put_binding("claude-sonnet", "resp", "claude-on-anthropic", "anthropic")
+        .await;
+    assert_eq!(s, 200, "anthropic 面照常：{body}");
+
+    h.stop().await;
+}
