@@ -487,11 +487,16 @@ impl AnthropicAssembler {
             match b.kind {
                 Some(BlockKind::Text) => content.push(json!({"type":"text","text":b.text})),
                 // 没有 signature 的 thinking 块不能回给客户端：下一轮官方校验会拒。
-                Some(BlockKind::Thinking) if b.signature.is_some() => content.push(json!({
-                    "type":"thinking",
-                    "thinking":b.thinking,
-                    "signature":b.signature.clone().unwrap_or_default(),
-                })),
+                // 票 66：`EmptyThinkingSignature` 执法点——空串与 `None` 一样算「没有签名」。
+                Some(BlockKind::Thinking)
+                    if b.signature.as_deref().is_some_and(|s| !s.is_empty()) =>
+                {
+                    content.push(json!({
+                        "type":"thinking",
+                        "thinking":b.thinking,
+                        "signature":b.signature.clone().unwrap_or_default(),
+                    }))
+                }
                 Some(BlockKind::ToolUse) => content.push(json!({
                     "type":"tool_use",
                     "id":b.id.clone().unwrap_or_default(),
@@ -750,10 +755,12 @@ mod tests {
     const REAL_CACHE_WRITE_ANTHROPIC: &str =
         include_str!("../tests/fixtures/cache-write/anthropic.sse");
 
+    /// 票 66：`EmptyThinkingSignature` 的执法点。判据是 spec §4.1「没有 signature 的 thinking 块
+    /// 丢弃」——`None` 与**空串**都算没有签名；真签名（`sig-1`）是护栏，不许被连带丢掉。
     #[test]
-    fn thinking_without_signature_is_dropped() {
+    fn thinking_without_signature_or_with_an_empty_one_is_dropped() {
         let mut a = AnthropicAssembler::default();
-        for (index, sig) in [(0u32, None), (1, Some("sig-1"))] {
+        for (index, sig) in [(0u32, None), (1, Some("sig-1")), (2, Some(""))] {
             a.push(IrEvent::BlockStart {
                 index,
                 kind: BlockKind::Thinking,

@@ -216,6 +216,46 @@ pub fn guard(entry: Option<&UpstreamModel>, wire: Wire) -> Result<(), EarlyRejec
     }
 }
 
+/// `TemperatureMax2` 的执法点（票 66 / spec §5:155「temperature 各家取值域不同，出站时按目标模型
+/// 夹取」）：只在**上游声明了该 quirk** 时把出站温度夹到 2——quirk 的判据落在声明式上游上，
+/// 转换代码里没有供应商名（spec §6 的硬规矩）。夹在 IR 上，三条出站 wire 共用同一处。
+fn clamp_temperature(req: &mut IrRequest, up: &Upstream) {
+    if up.has_quirk(&Quirk::TemperatureMax2) {
+        req.temperature = req.temperature.map(|t| t.min(2.0));
+    }
+}
+
+/// 记录还没关的 content block：`SilentTruncate` 的上游在块中途静默截断时，网关要按它们
+/// 补 `content_block_stop`（spec §5 第 3 条硬规则：最后一个块不关就等于内容丢失）。
+#[derive(Default)]
+struct OpenBlocks(Vec<u32>);
+
+impl OpenBlocks {
+    fn observe(&mut self, ev: &IrEvent) {
+        match ev {
+            IrEvent::BlockStart { index, .. } => {
+                if !self.0.contains(index) {
+                    self.0.push(*index);
+                }
+            }
+            IrEvent::BlockStop { index } => self.0.retain(|i| i != index),
+            _ => {}
+        }
+    }
+
+    /// 补终态：先按序关掉还开着的块，再给 `Eos`——`stop_reason` 缺省由各编码器归一化成
+    /// `end_turn`，所以这里**不另造**一套收尾帧，走的还是各 encoder 现有的 Eos 路径。
+    fn close_all(&self) -> Vec<IrEvent> {
+        let mut out: Vec<IrEvent> = self
+            .0
+            .iter()
+            .map(|index| IrEvent::BlockStop { index: *index })
+            .collect();
+        out.push(IrEvent::Eos);
+        out
+    }
+}
+
 /// 出站请求的唯一组装点：认证、协议头透传、quirk 注入。流式 / 非流式 / 计数 / 自检探针
 /// 四个出口共用，免得「某条出口忘了带 anthropic-beta」这种事故。
 ///
@@ -315,7 +355,7 @@ pub async fn forward_buffered(
     wire: Wire,
     auth: AuthScheme,
     key: &str,
-    req: IrRequest,
+    mut req: IrRequest,
     client_model: String,
     // 客户端档案 id（票 51）：只进日志行，转发逻辑不看它。
     client: String,
@@ -325,6 +365,7 @@ pub async fn forward_buffered(
     let Some(url) = up.url(wire) else {
         return no_path(wire, inbound, &up.id);
     };
+    clamp_temperature(&mut req, up);
     let mut body = match wire {
         Wire::Anthropic => anthropic::encode_request(&req, true),
         Wire::OpenAiChat => openai::encode_request(&req, true),
@@ -414,6 +455,7 @@ pub async fn forward_buffered(
     let recording = app.body_log_on();
     let mut sse_raw = String::new();
     let mut frames: Vec<obs::FrameLog> = Vec::new();
+    let mut open = OpenBlocks::default();
     {
         let mut bytes = resp.bytes_stream();
         while let Some(chunk) = bytes.next().await {
@@ -428,6 +470,7 @@ pub async fn forward_buffered(
                             frames.push(frame_log(seq, t0.elapsed().as_millis() as i64, &f));
                         }
                         for ev in dec.decode(&f) {
+                            open.observe(&ev);
                             asm.push(ev);
                         }
                     }
@@ -442,8 +485,20 @@ pub async fn forward_buffered(
     if transport.is_none() {
         for f in parser.finish() {
             for ev in dec.decode(&f) {
+                open.observe(&ev);
                 asm.push(ev);
             }
+        }
+    }
+    // `SilentTruncate` 执法点（票 66）：上游干净收流却没给终态 → 自己补一个，别报 502
+    // （§5 第 3 条；§4.1 的 502 只留给没声明该 quirk 的上游与真有传输错误的场合）。
+    if transport.is_none()
+        && asm.error().is_none()
+        && !asm.ended()
+        && up.has_quirk(&Quirk::SilentTruncate)
+    {
+        for ev in open.close_all() {
+            asm.push(ev);
         }
     }
 
@@ -535,7 +590,7 @@ pub async fn forward(
     wire: Wire,
     auth: AuthScheme,
     key: &str,
-    req: IrRequest,
+    mut req: IrRequest,
     client_model: String,
     // 客户端档案 id（票 51）：只进日志行，转发逻辑不看它。
     client: String,
@@ -545,6 +600,7 @@ pub async fn forward(
     let Some(url) = up.url(wire) else {
         return no_path(wire, inbound, &up.id);
     };
+    clamp_temperature(&mut req, up);
     let mut body = match wire {
         Wire::Anthropic => anthropic::encode_request(&req, true),
         Wire::OpenAiChat => openai::encode_request(&req, true),
@@ -636,6 +692,9 @@ pub async fn forward(
         done: false,
         logged: false,
         terminated: false,
+        // `SilentTruncate` 执法点（票 66）：只有声明了该 quirk 的上游才在静默截断处补终态。
+        synthesize_terminal: up.has_quirk(&Quirk::SilentTruncate),
+        open: OpenBlocks::default(),
         t0,
         first_byte_ms: None,
         ping: app.ping,
@@ -723,6 +782,10 @@ struct Pump {
     logged: bool,
     /// 是否已经给客户端发过终态（正常 message_stop 或 error）。
     terminated: bool,
+    /// `SilentTruncate`（票 66）：上游静默截断时补终态而不是报错。
+    synthesize_terminal: bool,
+    /// 还开着的 content block（补终态时要逐个关掉）。
+    open: OpenBlocks,
     t0: Instant,
     first_byte_ms: Option<i64>,
     /// 上游静默超过它就发一帧 ping（票 30 第 6 条）。
@@ -758,6 +821,7 @@ impl Pump {
     fn handle(&mut self, f: &sse::Frame, out: &mut String) {
         self.record(f);
         for ev in self.dec.decode(f) {
+            self.open.observe(&ev);
             match &ev {
                 // Anthropic 的输入 token 在 `message_start` 里报（非流式那条路早就取了它，
                 // 流式这条路原先漏了）：只在 `message_delta` 重复报一次时才落库，
@@ -810,14 +874,23 @@ impl Pump {
         self.row.frames.push(frame_log(seq, at_ms, f));
     }
 
-    /// 上游断在终态之前：必须给客户端一个 error 帧，不能静默收尾。
+    /// 上游断在终态之前：声明了 `SilentTruncate` 的上游由网关**自己补一个终态**（票 66 / spec §5
+    /// 第 3 条硬规则：块要关、内容不许丢）；没声明的上游仍给客户端一个 error 帧，不能静默收尾。
     fn finish(&mut self) -> String {
         let mut out = String::new();
         for f in &self.parser.finish() {
             self.handle(f, &mut out);
         }
         if !self.terminated {
-            out.push_str(&self.fail("上游在终态事件前断流（无 message_stop / 无 [DONE]）"));
+            if self.synthesize_terminal {
+                self.terminated = true;
+                for ev in self.open.close_all() {
+                    out.push_str(&self.enc.push(ev));
+                }
+                self.write_log(false);
+            } else {
+                out.push_str(&self.fail("上游在终态事件前断流（无 message_stop / 无 [DONE]）"));
+            }
         } else {
             self.write_log(false);
         }

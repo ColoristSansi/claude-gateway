@@ -1575,3 +1575,168 @@ async fn body_recording_switch_drives_the_proxy_window() {
         fails.join("\n")
     );
 }
+
+/// ⑭ 三个 quirk 的执法点（票 66）：`TemperatureMax2` 夹出站温度、`EmptyThinkingSignature` 丢空
+/// 签名 thinking、`SilentTruncate` 在静默截断处补终态。
+///
+/// 三条的判据都落在**声明式 quirk**上：同一份 fixture 字节挂在带 quirk 与不带 quirk 两条上游上，
+/// 差别只该来自 quirk，绝不来自上游名（spec §6 不许在转换代码里写供应商名）。每条各配一个
+/// 反向护栏：不带 quirk 的上游温度原样、断流仍报 `upstream_abort`（票 30 的判据不动）、
+/// 真签名的 thinking 照常保留。
+#[tokio::test(flavor = "multi_thread")]
+async fn quirk_enforcement_points() {
+    let gw = Gateway::start().await;
+    let mut fails: Vec<String> = Vec::new();
+    let body = |model: &str| {
+        json!({"model": model, "max_tokens": 256, "temperature": 3.0, "stream": true,
+               "messages":[{"role":"user","content":"温度夹取"}]})
+    };
+
+    // ① temperatureMax2：声明了 quirk 的上游，出站 temperature 夹到 2（quirk 的名字就是上限）。
+    let (status, _) = gw.post_messages(&body("mock-anthropic-tempmax2")).await;
+    check(
+        &mut fails,
+        status == 200,
+        format!("带 TemperatureMax2 的上游: HTTP {status}"),
+    );
+    let clamped = last_echo(&gw).await["body"]["temperature"].clone();
+    check(
+        &mut fails,
+        clamped == json!(2.0),
+        format!("带 quirk 的上游出站 temperature 应夹到 2，实际 {clamped}"),
+    );
+
+    // 护栏：没声明该 quirk 的上游原样透传（同一个真实模型、同一份 fixture 字节）。
+    let (status, _) = gw.post_messages(&body("mock-anthropic-tempnone")).await;
+    check(
+        &mut fails,
+        status == 200,
+        format!("不带 TemperatureMax2 的上游: HTTP {status}"),
+    );
+    let passthrough = last_echo(&gw).await["body"]["temperature"].clone();
+    check(
+        &mut fails,
+        passthrough == json!(3.0),
+        format!("不带 quirk 的上游出站 temperature 应原样 3.0，实际 {passthrough}"),
+    );
+
+    // ② silentTruncate：上游在内容块中途干净结束、没有终态帧 → 网关自己补一个终态。
+    let trunced = json!({"model":"mock-anthropic-trunced","max_tokens":256,"stream":true,
+                         "messages":[{"role":"user","content":"说到一半就断"}]});
+    let (status, bytes) = gw.post_messages(&trunced).await;
+    check(
+        &mut fails,
+        status == 200,
+        format!("补终态那发: HTTP {status}"),
+    );
+    let got = golden::parse(&bytes);
+    let names = event_names(&got);
+    check(
+        &mut fails,
+        names.last().map(String::as_str) == Some("message_stop"),
+        format!(
+            "静默截断必须补到 message_stop 收尾，实际末帧 {:?}（{names:?}）",
+            names.last()
+        ),
+    );
+    check(
+        &mut fails,
+        !names.iter().any(|n| n == "error"),
+        format!("补了终态就不该再发 error 帧：{names:?}"),
+    );
+    check(
+        &mut fails,
+        frames_of(&got, "content_block_stop")
+            .iter()
+            .any(|d| d["index"] == 0),
+        "断掉的那个块必须被关掉（content_block_stop index 0）".to_string(),
+    );
+    check(
+        &mut fails,
+        joined_text(&got) == "说到一半就断了",
+        format!("补终态不许把半截内容丢掉，实际 {:?}", joined_text(&got)),
+    );
+
+    // 护栏：没声明 quirk 的上游断流仍按票 30 报 upstream_abort（默认行为不动）。
+    let (status, bytes) = gw
+        .post_messages(
+            &json!({"model":"mock-anthropic-trunced-plain","max_tokens":256,
+                               "stream":true,
+                               "messages":[{"role":"user","content":"说到一半就断"}]}),
+        )
+        .await;
+    check(
+        &mut fails,
+        status == 200,
+        format!("不带 SilentTruncate 的上游: HTTP {status}"),
+    );
+    let plain = golden::parse(&bytes);
+    let plain_names = event_names(&plain);
+    check(
+        &mut fails,
+        plain_names.last().map(String::as_str) == Some("error")
+            && frames_of(&plain, "error")[0]["error"]["type"] == "upstream_abort",
+        format!("没声明 quirk 的断流仍须报 upstream_abort，实际 {plain_names:?}"),
+    );
+    check(
+        &mut fails,
+        !plain_names.iter().any(|n| n == "message_stop"),
+        format!("没声明 quirk 的断流不该出现 message_stop：{plain_names:?}"),
+    );
+
+    // ③ emptyThinkingSignature：非流式组装时，`signature` 为空串的 thinking 块必须丢掉。
+    let (status, v) = gw
+        .post_json(
+            "/v1/messages",
+            &json!({"model":"mock-anthropic-emptysig","max_tokens":256,"stream":false,
+                    "messages":[{"role":"user","content":"空签名"}]}),
+        )
+        .await;
+    check(
+        &mut fails,
+        status == 200,
+        format!("空签名那发: HTTP {status}"),
+    );
+    let content = v["content"].as_array().cloned().unwrap_or_default();
+    check(
+        &mut fails,
+        !content.iter().any(|b| b["type"] == "thinking"),
+        format!("空串签名的 thinking 块必须丢掉，实际 {content:?}"),
+    );
+    check(
+        &mut fails,
+        content
+            .iter()
+            .any(|b| b["type"] == "text" && b["text"] == "正文照旧。"),
+        format!("同一条流的文本块不许被连带丢掉：{content:?}"),
+    );
+
+    // 护栏：真签名的 thinking 照常保留（thinking fixture 的非流式组装）。
+    let (status, v) = gw
+        .post_json(
+            "/v1/messages",
+            &json!({"model":"mock-anthropic-thinking","max_tokens":256,"stream":false,
+                    "messages":[{"role":"user","content":"你好"}]}),
+        )
+        .await;
+    check(
+        &mut fails,
+        status == 200,
+        format!("真签名那发: HTTP {status}"),
+    );
+    let content = v["content"].as_array().cloned().unwrap_or_default();
+    check(
+        &mut fails,
+        content
+            .iter()
+            .any(|b| b["type"] == "thinking" && b["signature"] == "bW9jay1zaWc="),
+        format!("真签名的 thinking 必须原样保留：{content:?}"),
+    );
+
+    assert!(
+        fails.is_empty(),
+        "三个 quirk 的执法点 {} 处不合格：\n{}",
+        fails.len(),
+        fails.join("\n")
+    );
+}

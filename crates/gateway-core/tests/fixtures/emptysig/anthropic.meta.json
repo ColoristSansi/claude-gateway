@@ -1,0 +1,31 @@
+{
+  "scenario": "emptysig",
+  "outbound_wire": "anthropic",
+  "upstream": "mock",
+  "model": "mock-emptysig",
+  "origin": "authored",
+  "recorded_at": "2026-10-16T00:00:00Z",
+  "request": {
+    "model": "mock-anthropic-emptysig",
+    "max_tokens": 256,
+    "stream": false,
+    "messages": [
+      {
+        "role": "user",
+        "content": "空签名"
+      }
+    ]
+  },
+  "expect": {
+    "status": 200,
+    "last_event": "message_stop"
+  },
+  "quirks": [
+    "EmptyThinkingSignature"
+  ],
+  "masks": [
+    "message.id"
+  ],
+  "chunks": [],
+  "changed_why": "票 66：上游帧里带一个 signature 为空串的 thinking 块。非流式组装时该块必须丢掉（spec §4.1），同一条流里的真文本块照旧保留。"
+}

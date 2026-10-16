@@ -108,6 +108,15 @@ async fn main() -> anyhow::Result<()> {
     keys.insert("mock".into(), "mock".into());
     upstreams.insert("mock".into(), mock);
 
+    // 票 66：同一个 mock 进程的第二条上游，只为「按 quirk 执法」造出**带 quirk / 不带 quirk**
+    // 两种上游形态——quirk 的判据只能落在声明式上游上，转换代码里不许出现供应商名。
+    let mut mockq = Upstream::new("mockq", "mockq", format!("http://127.0.0.1:{mock_port}"));
+    mockq.set_path(Wire::Anthropic, "/anthropic/v1/messages");
+    mockq.set_path(Wire::OpenAiChat, "/openai/v1/chat/completions");
+    mockq.quirks = vec![Quirk::TemperatureMax2, Quirk::SilentTruncate];
+    keys.insert("mockq".into(), "mock".into());
+    upstreams.insert("mockq".into(), mockq);
+
     // 真实上游 1：opencode。UA 与会话头由 quirk 声明，网关侧自动处理。
     if let (Some(base), Some(key)) = (env.get("OPENCODE_BASE_URL"), env.get("OPENCODE_API_KEY")) {
         let mut up = Upstream::new("opencode", "opencode", base);
@@ -243,6 +252,46 @@ async fn main() -> anyhow::Result<()> {
             );
         }
     }
+    // 票 66 的三条 quirk 执法用例：同一份 fixture 字节挂在**带 quirk 与不带 quirk**两条上游上，
+    // 差别只该来自 quirk（夹温度 / 补终态），不该来自上游名。
+    for (name, up, real, wire) in [
+        // temperatureMax2：带 quirk 的上游夹到 2，不带 quirk 的原样。
+        (
+            "mock-anthropic-tempmax2",
+            "mockq",
+            "mock-tempmax2",
+            Wire::Anthropic,
+        ),
+        (
+            "mock-anthropic-tempnone",
+            "mock",
+            "mock-tempmax2",
+            Wire::Anthropic,
+        ),
+        // silentTruncate：带 quirk 的上游由网关补终态；不带 quirk 的仍报 upstream_abort（票 30 判据）。
+        (
+            "mock-anthropic-trunced",
+            "mockq",
+            "mock-trunced",
+            Wire::Anthropic,
+        ),
+        (
+            "mock-anthropic-trunced-plain",
+            "mock",
+            "mock-trunced",
+            Wire::Anthropic,
+        ),
+        // emptyThinkingSignature：转换面的事实，上游是不是它无关。
+        (
+            "mock-anthropic-emptysig",
+            "mock",
+            "mock-emptysig",
+            Wire::Anthropic,
+        ),
+    ] {
+        s.bind(Profile::Global, name, up, real, wire);
+    }
+
     for code in ERROR_CODES {
         for (wire, prefix) in [(Wire::Anthropic, "anthropic"), (Wire::OpenAiChat, "openai")] {
             s.bind(

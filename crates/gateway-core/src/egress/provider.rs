@@ -1882,7 +1882,9 @@ fn now_unix() -> i64 {
 mod tests {
     //! quirk 的两向守卫（票 19 §6，票 41 随产品侧 fixtures 搬入）：枚举值 ⇄ fixture 标签。
     //! 票 49 删掉 `ClaudeModelsOnAnthropicOnly`（ADR-0004 第 5 条），它的豁免条目一并删；
-    //! spec §6 新给的四个值还没有转换代码执法点，先在豁免表里写明理由。
+    //! 票 66 把 spec §6 最后三个值（`TemperatureMax2` / `EmptyThinkingSignature` / `SilentTruncate`）
+    //! 做实，它们的标签现在由 `tests/fixtures/{tempmax2,emptysig,trunced}/anthropic.meta.json` 顶着，
+    //! 豁免表里只剩两条「上游级事实、执法点不在转换面」的（见 `quirk-exempt.json`）。
 
     use super::*;
     use std::path::{Path, PathBuf};
