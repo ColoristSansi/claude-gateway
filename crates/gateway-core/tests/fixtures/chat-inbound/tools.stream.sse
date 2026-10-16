@@ -1,0 +1,13 @@
+data: {"id":"<masked>","object":"chat.completion.chunk","created":"<masked>","model":"chat-model","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"id":"<masked>","object":"chat.completion.chunk","created":"<masked>","model":"chat-model","choices":[{"index":0,"delta":{"content":"我查一下。"},"finish_reason":null}]}
+
+data: {"id":"<masked>","object":"chat.completion.chunk","created":"<masked>","model":"chat-model","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_mock_1","type":"function","function":{"name":"get_weather","arguments":""}}]},"finish_reason":null}]}
+
+data: {"id":"<masked>","object":"chat.completion.chunk","created":"<masked>","model":"chat-model","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":"}}]},"finish_reason":null}]}
+
+data: {"id":"<masked>","object":"chat.completion.chunk","created":"<masked>","model":"chat-model","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"上海\"}"}}]},"finish_reason":null}]}
+
+data: {"id":"<masked>","object":"chat.completion.chunk","created":"<masked>","model":"chat-model","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":40,"completion_tokens":25,"total_tokens":65}}
+
+data: [DONE]

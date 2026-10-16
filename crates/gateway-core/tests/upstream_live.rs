@@ -921,3 +921,136 @@ async fn ticket57_structured_output_probe_on_live_upstreams() {
         "库文件里不该出现明文密钥"
     );
 }
+
+// ───────────── 票 64 验收 3（可选）：真上游的一条 Chat 入站 ─────────────
+
+/// `POST /v1/chat/completions` 打一条**真上游**：解 Chat 请求 → IR → 出站 Chat wire →
+/// 把上游帧编回 Chat SSE。走的是产品侧那条 HTTP 路由（`proxy::router()`，本进程里挂起来）。
+///
+/// 硬断言只有形状：HTTP 200、`data:` 帧、末帧 `[DONE]`、有正文、usage 报得出来，
+/// 且**没有**「`choices: []` + usage」的单独 usage chunk（DeepSeek 的怪癖，spec §4.3）。
+/// **绝不打印密钥与 baseUrl**：报告里只有模型 id、帧数、正文字数与 usage。
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "打真上游：cargo test -p gateway-core --test upstream_live -- --ignored --nocapture"]
+async fn ticket64_chat_inbound_against_a_live_upstream() {
+    use gateway_core::binding::{default_profiles, Binding, BindingTable, Profile};
+    use gateway_core::ingress::proxy::Gateway;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    let env = EnvFile::load();
+    let base_url = env.get("OPENCODE_BASE_URL");
+    let key = env.get("OPENCODE_API_KEY");
+    let root = tmp_root("t64-chat-inbound");
+    let store = Store::open(&root).expect("开库");
+
+    let up = {
+        let mut up = live_upstream("opencode", &base_url);
+        // opencode 的 Go 计划要求自称 UA + 带会话头（票 02 / 19 / 49）：不带就是 400
+        // `MissingSessionID`。这是上游的硬要求，不是入站面的问题。
+        up.quirks = vec![
+            Quirk::ClientUserAgent("claude-gateway-prototype/0.0.1".into()),
+            Quirk::SessionIdHeader("x-opencode-session".into()),
+        ];
+        up
+    };
+    save_upstream(&store, &up).await.unwrap();
+    store
+        .put_credential("opencode", "default", &key)
+        .await
+        .unwrap();
+
+    let mut upstreams = HashMap::new();
+    upstreams.insert("opencode".to_string(), up);
+    let table = BindingTable::new(
+        vec![Binding::new(
+            Profile::Global,
+            "live-chat",
+            "opencode",
+            "deepseek-v4.1-flash",
+            Wire::OpenAiChat,
+        )],
+        default_profiles(),
+    );
+    let app = Arc::new(Gateway::new(store.clone(), upstreams, table));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = gateway_core::ingress::proxy::router().with_state(app);
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "live-chat",
+            "stream": true,
+            "max_tokens": 128,
+            "messages": [{"role":"user","content":"只回四个字：收到收到"}],
+        }))
+        .send()
+        .await
+        .expect("POST /v1/chat/completions 失败");
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap_or_default();
+
+    assert_eq!(status, 200, "真上游这一发必须 200：{text}");
+    let frames: Vec<serde_json::Value> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter(|d| *d != "[DONE]")
+        .filter_map(|d| serde_json::from_str(d).ok())
+        .collect();
+    assert!(
+        text.trim_end().ends_with("data: [DONE]"),
+        "Chat 流必须以 [DONE] 收尾：{text}"
+    );
+
+    let body: String = frames
+        .iter()
+        .filter_map(|f| f["choices"][0]["delta"]["content"].as_str())
+        .collect();
+    // deepseek-v4.1-flash 是推理模型：正文之前先发 `reasoning_content`（我们原样转发，
+    // 与出站解码器读的是同一个键）。两者任一不为空就说明帧编对了。
+    let reasoning: String = frames
+        .iter()
+        .filter_map(|f| f["choices"][0]["delta"]["reasoning_content"].as_str())
+        .collect();
+    let finish: Vec<&str> = frames
+        .iter()
+        .filter_map(|f| f["choices"][0]["finish_reason"].as_str())
+        .collect();
+    let usage = frames
+        .iter()
+        .find_map(|f| f.get("usage").cloned())
+        .unwrap_or(serde_json::Value::Null);
+
+    println!(
+        "\n===== 票 64：真上游（opencode / deepseek-v4.1-flash / chat wire）的 Chat 入站 ====="
+    );
+    println!(
+        "帧数 {}（正文 {} 字 / 推理 {} 字）；finish_reason={:?}；usage={usage}",
+        frames.len(),
+        body.chars().count(),
+        reasoning.chars().count(),
+        finish
+    );
+
+    assert!(
+        !body.is_empty() || !reasoning.is_empty(),
+        "真上游这一发该有 delta 载荷：{text}"
+    );
+    assert!(!finish.is_empty(), "要有 finish_reason：{text}");
+    assert!(usage["prompt_tokens"].as_u64().unwrap_or(0) > 0, "{text}");
+    assert!(
+        !frames.iter().any(|f| f["choices"]
+            .as_array()
+            .map(|c| c.is_empty())
+            .unwrap_or(false)),
+        "没有单独的 usage chunk（DeepSeek 怪癖）：{text}"
+    );
+    assert!(
+        !dir_contains_bytes(&root, key.as_bytes()),
+        "库文件里不该出现明文密钥"
+    );
+}

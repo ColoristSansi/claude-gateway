@@ -1,0 +1,24 @@
+{
+  "id": "<masked>",
+  "object": "chat.completion",
+  "created": "<masked>",
+  "model": "chat-model",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "你好，这是 mock 上游的纯文本回放。"
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 12,
+    "completion_tokens": 18,
+    "total_tokens": 30,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}
