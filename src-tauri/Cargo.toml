@@ -1,6 +1,6 @@
 [package]
 name = "claude-gateway"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Claude Gateway 桌面外壳（Tauri 2）：管理 API + 托盘，唯一的 bin（ADR-0007）"
 
