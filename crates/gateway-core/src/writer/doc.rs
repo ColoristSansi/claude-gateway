@@ -168,6 +168,9 @@ impl Doc {
                 self.element(path, field, matches).is_none()
             }
             OwnedOp::ReplaceIfEquals { equals, .. } => self.get(path).as_ref() != Some(equals),
+            // 「写回首写快照里的旧值」的判据要看快照，引擎在还原前先把它展开成 `Set` / `Remove`
+            // （见 `Writer::restore`）；这里一律回 `false`，保证它不会让还原被「全都满足」跳过。
+            OwnedOp::RestoreFirstWrite { .. } => false,
         }
     }
 
@@ -306,6 +309,11 @@ impl Doc {
                     None => self.apply(&OwnedOp::Remove { path: path.clone() }),
                 }
             }
+            // 旧值在首写快照里、不在这条动作里：引擎还原前必须先展开（见 `Writer::restore`）。
+            OwnedOp::RestoreFirstWrite { path } => bail!(
+                "还原动作「写回首写快照里的旧值」要先由引擎展开成 Set / Remove（键 {}）",
+                path.join(".")
+            ),
         }
     }
 

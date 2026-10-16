@@ -276,8 +276,67 @@ async fn restore_is_idempotent_and_keeps_user_keys() {
     assert_eq!(bytes(&mine), after_first);
 }
 
-// ── 4. 网关新建且只剩网关内容的文件：整份删 ──────────────────────────────────
+/// 第 6 个接管键 `inferenceCredentialKind`：还原必须写回**用户原来的值**。
+///
+/// 评审「高」第 4 条 / 票 46:69 自认：从前这条走摘键 → 用户原有的 `interactive`（SSO）静默丢失，
+/// 只有整份回滚能救。现在按首写快照里的旧值还回去。
+#[tokio::test]
+async fn restore_puts_back_the_users_own_credential_kind() {
+    let e = env("credential-kind-restore");
+    let (_, _, mine) = pristine_1p(&e, false);
+    write(
+        &mine,
+        &crlf("{\n  \"inferenceCredentialKind\": \"interactive\",\n  \"custom\": 1\n}\n"),
+    );
 
+    switch_to_3p(&e.writer, &cfg()).await.unwrap();
+    assert_eq!(
+        json(&read(&mine))["inferenceCredentialKind"],
+        Json::String("static".into()),
+        "3P 期间以网关为准"
+    );
+
+    switch_to_1p(&e.writer, &cfg()).await.unwrap();
+
+    let back = json(&read(&mine));
+    assert_eq!(
+        back["inferenceCredentialKind"],
+        Json::String("interactive".into()),
+        "还原要写回用户原来的凭据模式：{back}"
+    );
+    assert_eq!(back["custom"], Json::from(1), "别的键一个字节不动：{back}");
+    assert_eq!(
+        back.get("inferenceProvider"),
+        None,
+        "其余接管键照旧摘掉：{back}"
+    );
+}
+
+/// 首写时**没有**这个键 → 还原后仍然没有（不许凭空造一个 `null` / 空串）。
+#[tokio::test]
+async fn restore_leaves_the_credential_kind_absent_when_the_user_never_had_one() {
+    let e = env("credential-kind-absent");
+    let (_, _, mine) = pristine_1p(&e, false);
+    write(&mine, &crlf("{\n  \"custom\": 1\n}\n"));
+
+    switch_to_3p(&e.writer, &cfg()).await.unwrap();
+    assert_eq!(
+        json(&read(&mine))["inferenceCredentialKind"],
+        Json::String("static".into())
+    );
+
+    switch_to_1p(&e.writer, &cfg()).await.unwrap();
+
+    let back = json(&read(&mine));
+    assert_eq!(
+        back.get("inferenceCredentialKind"),
+        None,
+        "首写时没有这个键，还原后也不该有：{back}"
+    );
+    assert_eq!(back["custom"], Json::from(1), "{back}");
+}
+
+// ── 4. 网关新建且只剩网关内容的文件：整份删 ──────────────────────────────────
 #[tokio::test]
 async fn restore_deletes_the_files_the_gateway_created() {
     let e = env("restore-delete");

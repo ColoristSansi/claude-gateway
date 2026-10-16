@@ -18,7 +18,9 @@
 //!
 //! - [`switch_to_3p`]：写 profile → 再写 `_meta.json`（先被引用者、后指针，§8.4 第 6 条）。
 //! - [`switch_to_1p`]：**摘键**，不还原备份（§8 规则 5）——`inferenceProvider` 一摘即回标准模式，
-//!   而 1P/3P 的 userData 与登录态本来就隔离（§8.1 第 3 条）。
+//!   而 1P/3P 的 userData 与登录态本来就隔离（§8.1 第 3 条）。唯一的例外是
+//!   `inferenceCredentialKind`：它会覆盖用户原有的凭据模式，还原时按首写快照**写回旧值**
+//!   （[`OwnedOp::RestoreFirstWrite`]，票 46:69 的风险②）。
 //! - [`rollback`]：显式第二选项，按首写快照整份回滚；「文件被外部改过就拒绝」由引擎判。
 //!
 //! # 根是参数
@@ -57,8 +59,8 @@ pub const AUTH_SCHEME_BEARER: &str = "bearer";
 /// 依据：装机版 app.asar 的凭据层只有 `inferenceCredentialKind` 取交互式（`interactive`）时才抛
 /// `signInRequiredMessage`（`research/client-login-state.md`），而 §8.3 的「3P 不需要官方登录态、
 /// key 允许占位」正是靠静态路径成立；票 15 的端到端验收也是在写了这个键的配置上跑通的。
-/// 风险：若用户在配置里本来写着别的值（例如 SSO 的 `interactive`），接管会按「接管键以网关为准」
-/// 覆盖它，还原时是**摘掉**而不是写回旧值——首写快照仍在，用户要回到原状可以走[`rollback`]。
+/// 它会覆盖用户原有的取值（例如 SSO 的 `interactive`），所以**还原时写回首写快照里的旧值**
+/// （[`OwnedOp::RestoreFirstWrite`]）——评审「高」第 4 条修的就是这条：从前摘键 = 静默丢掉用户的选择。
 pub const CREDENTIAL_KIND_STATIC: &str = "static";
 
 /// 四个家族槽位名（spec §7）：网关侧的路由名，也是写进 `inferenceModels` 的完整模型 ID。
@@ -308,8 +310,15 @@ fn profile_write_ops(cfg: &DesktopConfig) -> Vec<OwnedOp> {
 fn profile_restore_ops() -> Vec<OwnedOp> {
     GATEWAY_KEYS
         .iter()
-        .map(|key| OwnedOp::Remove {
-            path: vec![(*key).to_string()],
+        .map(|key| {
+            let path = vec![(*key).to_string()];
+            if *key == "inferenceCredentialKind" {
+                // 这个键会覆盖用户原有的凭据模式（SSO 的 `interactive`）：还原要写回旧值，
+                // 摘键等于静默丢掉用户的选择（票 46:69 的风险②）。
+                OwnedOp::RestoreFirstWrite { path }
+            } else {
+                OwnedOp::Remove { path }
+            }
         })
         .collect()
 }
@@ -326,7 +335,8 @@ pub struct MetaRestore {
     pub drop_entries_when_empty: bool,
 }
 
-/// profile 的接管键清单（写 + 还原两面）。
+/// profile 的接管键清单（写 + 还原两面）。还原对 `inferenceCredentialKind` 写回首写快照里的旧值，
+/// 其余接管键摘掉。
 pub fn profile_spec(cfg: &DesktopConfig) -> FileSpec {
     FileSpec::new(
         CLIENT,

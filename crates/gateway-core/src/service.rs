@@ -85,6 +85,9 @@ pub struct Gateway {
     addr: SocketAddr,
     shutdown: Option<oneshot::Sender<()>>,
     task: JoinHandle<()>,
+    /// 保留期清理循环（票 53）：**挂在这里**，[`Gateway::stop`] 一并停——否则换端口 / 手动重启
+    /// 每起一次就多一个常驻循环清同一个库（评审「中」第 5 条）。
+    sweeper: Option<crate::obs::PurgeSweeper>,
 }
 
 impl Gateway {
@@ -101,13 +104,16 @@ impl Gateway {
         self.state.snapshot()
     }
 
-    /// 优雅停止：关监听、等 serve 任务收尾，之后 `/api/status` 不再可达。
+    /// 优雅停止：关监听、等 serve 任务收尾，**并把清理循环一并停掉**，之后 `/api/status` 不再可达。
     /// 返回停止后的快照（`running == false`），省得再留一个可观测句柄。
     pub async fn stop(mut self) -> GatewayStatus {
         if let Some(tx) = self.shutdown.take() {
             let _ = tx.send(());
         }
         let _ = self.task.await;
+        if let Some(sweeper) = self.sweeper.take() {
+            sweeper.stop().await;
+        }
         self.state.mark_stopped();
         self.state.snapshot()
     }
@@ -153,10 +159,11 @@ pub async fn start(cfg: GatewayConfig) -> Result<Gateway, StartError> {
     }
     let state = Arc::new(api_state);
     // 票 53：保留期清理表跟着网关起——启动立刻扫一次（把上次退出后攒下的老行清掉），之后每小时一次。
-    // 只在转发面挂了的时候起（没有库就没有日志可清）。
-    if let Some(gateway) = &cfg.forwarding {
-        crate::obs::spawn_purge_sweeper(gateway.store.clone());
-    }
+    // 只在转发面挂了的时候起（没有库就没有日志可清）；句柄挂进 `Gateway`，停网关时一并停。
+    let sweeper = cfg
+        .forwarding
+        .as_ref()
+        .map(|gateway| crate::obs::spawn_purge_sweeper(gateway.store.clone()));
     let app = crate::ingress::router((*state).clone(), cfg.forwarding);
     let (tx, rx) = oneshot::channel();
 
@@ -176,5 +183,51 @@ pub async fn start(cfg: GatewayConfig) -> Result<Gateway, StartError> {
         addr,
         shutdown: Some(tx),
         task,
+        sweeper,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::binding::BindingTable;
+    use crate::ingress::proxy;
+    use crate::store::Store;
+    use std::collections::HashMap;
+
+    /// 转发面挂了就必须挂上清理表，且**停网关时一并停掉**：否则换端口 / 手动重启每起一次就多一个
+    /// 常驻循环清同一个库（评审「中」第 5 条）。
+    #[tokio::test]
+    async fn stop_takes_the_purge_sweeper_with_it() {
+        let root = std::env::temp_dir().join(format!("cg-review-sweeper-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::open(&root).expect("开库");
+        let forwarding = Arc::new(proxy::Gateway::new(
+            store,
+            HashMap::new(),
+            BindingTable::default(),
+        ));
+        let gateway = start(GatewayConfig {
+            port: 0,
+            db_path: root.join("gateway.db"),
+            version: "0.1.0-test".into(),
+            forwarding: Some(forwarding),
+            maintenance: None,
+            updater: None,
+            admin: None,
+        })
+        .await
+        .expect("起网关");
+
+        let sweeper = gateway.sweeper.as_ref().expect("转发面挂了就必须挂清理表");
+        let probe = sweeper.abort_handle();
+        assert!(!probe.is_finished(), "刚起的清理循环不该已经结束");
+
+        gateway.stop().await;
+
+        assert!(
+            probe.is_finished(),
+            "stop 必须把清理循环也停掉（否则重启一次多一个常驻循环）"
+        );
+    }
 }

@@ -29,9 +29,10 @@ use super::backup::{self, Backup};
 use super::doc::{json_eq, Doc};
 use super::log;
 use super::plan::{
-    ConflictMode, FileOutcome, FileSpec, RollbackOutcome, WritePlan, WriteReport, WriteRoots,
+    ConflictMode, FileOutcome, FileSpec, OwnedOp, RollbackOutcome, WritePlan, WriteReport,
+    WriteRoots,
 };
-use super::state::{self, Snapshot};
+use super::state::{self, Record, Snapshot};
 
 /// 一条接管键的「当前值 vs 期望值」（客户端页对照表的左列）。
 #[derive(Debug, Clone, Serialize)]
@@ -392,14 +393,16 @@ impl Writer {
             return Ok(FileOutcome::Unchanged);
         };
         let mut doc = Doc::parse(spec.format, Some(&bytes))?;
-        if spec.restore_ops.iter().all(|op| doc.satisfies(op)) {
+        let rec = state::load(&self.store, &spec.client, &rel).await?;
+        // 「写回首写快照里的旧值」的还原动作先展开成具体的 Set / Remove：判据与落盘都看展开后的清单。
+        let restore_ops = resolve_restore_ops(rec.as_ref(), spec)?;
+        if restore_ops.iter().all(|op| doc.satisfies(op)) {
             return Ok(FileOutcome::Unchanged);
         }
-        let rec = state::load(&self.store, &spec.client, &rel).await?;
         let keep = rec.as_ref().and_then(|r| r.backup_path.clone());
         let bk = self.backup_for(spec, Some(&bytes), keep.as_deref())?;
 
-        for op in &spec.restore_ops {
+        for op in &restore_ops {
             doc.apply(op)
                 .with_context(|| format!("摘键还原失败（{}）", op.label()))?;
         }
@@ -630,6 +633,49 @@ fn snapshot_of(doc: &Doc, spec: &FileSpec) -> Snapshot {
         labels: spec.labels(),
         values: spec.write_ops.iter().map(|op| doc.slot(op)).collect(),
     }
+}
+
+/// 把还原清单里的 [`OwnedOp::RestoreFirstWrite`] 展开成具体的 `Set` / `Remove`：
+/// 旧值来自**首写快照**（`client_config_state.backup_path` 指的那份首写前的原文件）。
+fn resolve_restore_ops(rec: Option<&Record>, spec: &FileSpec) -> Result<Vec<OwnedOp>> {
+    let mut out = Vec::with_capacity(spec.restore_ops.len());
+    for op in &spec.restore_ops {
+        let OwnedOp::RestoreFirstWrite { path } = op else {
+            out.push(op.clone());
+            continue;
+        };
+        out.push(match first_write_slot(rec, spec, path)? {
+            Some(value) => OwnedOp::Set {
+                path: path.clone(),
+                value,
+            },
+            None => OwnedOp::Remove { path: path.clone() },
+        });
+    }
+    Ok(out)
+}
+
+/// 首写快照里这个键的原值；`None` = 首写时没有这个键（含「文件当时还不存在」= 网关新建）。
+///
+/// 快照被用户清掉时也回 `None`（退回摘键，与从前的行为一致），不把整次还原卡死。
+fn first_write_slot(
+    rec: Option<&Record>,
+    spec: &FileSpec,
+    path: &[String],
+) -> Result<Option<Json>> {
+    let Some(rec) = rec else { return Ok(None) };
+    if !rec.existed_at_first_write {
+        return Ok(None);
+    }
+    let Some(snapshot) = rec.backup_path.as_ref() else {
+        return Ok(None);
+    };
+    let Ok(bytes) = fs::read(snapshot) else {
+        return Ok(None);
+    };
+    let doc = Doc::parse(spec.format, Some(&bytes))
+        .with_context(|| format!("读首写快照里的旧值失败：{}", snapshot.display()))?;
+    Ok(doc.get(path))
 }
 
 /// 已改动的文件清单（多文件中途失败时报给用户）。

@@ -89,7 +89,26 @@ impl Wire {
             _ => None,
         }
     }
+
+    /// 出站编解码**本版做了没有**。`openai-responses` 还没接：`egress/upstream.rs` 恒回 502，
+    /// 所以界面要标出来、绑定保存要拒收——别让用户存下一个必然 502 的绑定。
+    /// 接上 Responses 出站时只改这里（全仓的标注 / 拒收都从它来）。
+    pub fn implemented(self) -> bool {
+        !matches!(self, Wire::OpenAiResponses)
+    }
+
+    /// 未实现的 wire 在界面上的标注；实现了的不标。
+    pub fn unimplemented_note(self) -> Option<&'static str> {
+        if self.implemented() {
+            None
+        } else {
+            Some(UNIMPLEMENTED_WIRE_NOTE)
+        }
+    }
 }
+
+/// 未实现的 wire 的界面标注（[`Wire::unimplemented_note`]）。
+pub const UNIMPLEMENTED_WIRE_NOTE: &str = "本版未实现";
 
 /// 认证方式（原型两个值，逐字保留）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1486,6 +1505,23 @@ pub async fn import_catalog_snapshot(store: &Store, json_text: &str) -> Result<u
 /// 用随包快照灌一次（首启 / 库被清后）。**不在 `Store::open` 里自动跑**：那是外壳的启动序列。
 pub async fn import_bundled_snapshot(store: &Store) -> Result<usize> {
     import_catalog_snapshot(store, BUNDLED_MODELS_DEV_SNAPSHOT).await
+}
+
+/// 「表为空才灌」：`model_catalog` 空才导随包快照（首启 / 库被清后），非空 → 一条不动、`Ok(0)`。
+///
+/// 用户手动刷新过（或库是上一版留下的）时以库里那份为准：随包快照只是**兜底**，不许覆盖。
+/// 外壳的两条启动路径都用它（票 49 的漏：`import_bundled_snapshot` 曾经零调用点）。
+pub async fn import_bundled_snapshot_if_empty(store: &Store) -> Result<usize> {
+    let empty = store
+        .read(|c| {
+            let n: i64 = c.query_row("SELECT COUNT(*) FROM model_catalog", [], |r| r.get(0))?;
+            Ok(n == 0)
+        })
+        .await?;
+    if !empty {
+        return Ok(0);
+    }
+    import_bundled_snapshot(store).await
 }
 
 /// 快照刷新结果。

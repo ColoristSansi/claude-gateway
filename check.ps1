@@ -1,7 +1,7 @@
 # 回归门禁的单一入口（票 19 §7、票 29 第 6 条；票 39 从原型搬进正牌骨架）。
 #
-#   pwsh -File .\check.ps1            # 全跑：fmt + clippy + 单元测试 + 回放集成测试
-#   pwsh -File .\check.ps1 -Quick     # 秒级：fmt + clippy + 单元测试
+#   pwsh -File .\check.ps1            # 全跑：fmt + clippy + 单元测试 + 前端构建 + 回放集成测试
+#   pwsh -File .\check.ps1 -Quick     # 秒级：fmt + clippy + 单元测试 + 前端构建
 #   pwsh -File .\check.ps1 -Replay    # 回放集成测试（测试自己起网关与 mock 两个进程）
 #   pwsh -File .\check.ps1 -Live      # 打真实上游的 #[ignore] 手动测试（读 .scratch/model-gateway/prototype-upstream.env）
 #   pwsh -File .\check.ps1 -Smoke     # 打印客户端冒烟清单，逐项等人签字
@@ -30,6 +30,21 @@ if ($Quick) {
   $steps.Add(@{ name = 'unit   (cargo test --workspace)'; run = { cargo test --workspace } })
   # 测试专用件（mock 上游 bin + 回放 harness + 回放测试）只在 mock 特性下才编，所以单独 lint 一遍。
   $steps.Add(@{ name = 'clippy (mock 特性：两个测试 bin + 回放测试)'; run = { cargo clippy -p gateway-core --features mock --all-targets -- -D warnings } })
+  # 前端（4430 行 TSX）的类型检查 + 构建：`app/package.json` 的 build = `tsc --noEmit && vite build`。
+  # 从前它只在 `pack.ps1`（tag / 打包）里跑，票 60b 的整页白屏就是这类漏网；离线可跑（依赖装过即可）。
+  $steps.Add(@{ name = 'web    (pnpm --dir app build: tsc --noEmit + vite build)'; run = {
+      if (-not (Get-Command pnpm -ErrorAction SilentlyContinue)) {
+        Write-Host 'pnpm 不在 PATH 上：门禁要求前端类型检查（CI 会装）。装法：npm i -g pnpm，然后 pnpm --dir app install' -ForegroundColor Red
+        $global:LASTEXITCODE = 1
+        return
+      }
+      if (-not (Test-Path (Join-Path $PSScriptRoot 'app\node_modules'))) {
+        Write-Host 'app\node_modules 不在：先跑 pnpm --dir app install（CI 里排在门禁之前）' -ForegroundColor Red
+        $global:LASTEXITCODE = 1
+        return
+      }
+      pnpm --dir app build
+    } })
 }
 if ($Replay) {
   $steps.Add(@{ name = 'replay (集成：自起网关 + mock 两个进程，回放 fixtures)'; run = { cargo test -p gateway-core --features mock --test replay } })

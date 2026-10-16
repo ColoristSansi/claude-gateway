@@ -214,6 +214,30 @@ fn build_admin(
     }
 }
 
+/// 首启灌一次随包 models.dev 快照（spec §9:318「随包内置一份快照」）：**表为空才灌**，
+/// 表非空（用户手动刷过 / 上一版留下的库）一个字节不动；失败只记日志，**绝不阻断启动**。
+///
+/// 不调它的后果：空库首启 `model_catalog` 为空 → 所有价格显示「未知」、成本不计入总额。
+/// 两条启动路径（[`setup`] 与 [`start_gateway`]）都要调——换端口 / 手动重启后的新库同样要能补。
+fn seed_catalog(store: &Store, logs: &Path) {
+    let imported = tauri::async_runtime::block_on(
+        gateway_core::egress::provider::import_bundled_snapshot_if_empty(store),
+    );
+    match imported {
+        Ok(0) => {}
+        Ok(n) => {
+            let line = format!("随包 models.dev 快照已导入 {n} 条（首启价格目录就绪）");
+            println!("{line}");
+            let _ = append_log(logs, &line);
+        }
+        Err(e) => {
+            let line = format!("随包 models.dev 快照导入失败，价格会显示未知：{e}");
+            eprintln!("[外壳] {line}");
+            let _ = append_log(logs, &line);
+        }
+    }
+}
+
 /// 起网关（`setup` 与「启动网关」按钮共用一条路径）。
 async fn start_gateway(app: &AppHandle, port: u16) -> Result<(), String> {
     let data_dir = store::default_data_dir().map_err(|e| e.to_string())?;
@@ -221,6 +245,7 @@ async fn start_gateway(app: &AppHandle, port: u16) -> Result<(), String> {
     let _ = fs::create_dir_all(&logs);
     let db_path = data_dir.join(store::DB_FILE_NAME);
     let store = Store::open(&data_dir).map_err(|e| e.to_string())?;
+    seed_catalog(&store, &logs);
     let forwarding = build_forwarding(&store).await;
     // 票 62：维护面也跟着同一个库句柄（导出 / 导入 / 自启开关），与 `setup` 同一条口径。
     let maintenance = Maintenance::new(store.clone(), data_dir.clone());
@@ -307,6 +332,11 @@ pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
         .as_ref()
         .and_then(port_from_store)
         .unwrap_or_else(|| load_port(&data_dir));
+
+    // 首启价格目录：库开好之后、装配转发面之前灌一次（票 49 自认的漏，见 `seed_catalog`）。
+    if let Some(store) = store.as_ref() {
+        seed_catalog(store, &logs);
+    }
 
     // 转发面 `/v1/*`：装配路径**从库里读**（票 51）——空库下三张表都是空的，
     // 未知模型按入站协议回 `not_found_error` 信封，而不是 axum 的裸 404，所以空库也照样挂上。
@@ -695,6 +725,78 @@ mod tests {
         append_log(&logs, "第二行").expect("写日志");
         let text = fs::read_to_string(logs.join("gateway.log")).expect("读日志");
         assert!(text.contains("第一行") && text.contains("第二行"), "{text}");
+    }
+
+    /// 库里 `model_catalog` 的条数。
+    fn catalog_rows(store: &Store) -> i64 {
+        tauri::async_runtime::block_on(store.read(|c| {
+            Ok(c.query_row("SELECT COUNT(*) FROM model_catalog", [], |r| {
+                r.get::<_, i64>(0)
+            })?)
+        }))
+        .expect("读目录条数")
+    }
+
+    /// 首启（空库）之后价格目录必须非空；表非空时随包快照一个字节都不许动。
+    /// 评审 §三-2：`import_bundled_snapshot` 全仓零调用点 → 所有价格显示「未知」、成本不计入总额，
+    /// 而门禁抓不到（没有任何测试会失败）。这条就是那个网。
+    #[test]
+    fn first_start_seeds_the_bundled_price_catalog_once() {
+        let dir = scratch("catalog-seed");
+        let logs = logs_dir(&dir);
+        let store = Store::open(&dir).expect("开库");
+        assert_eq!(catalog_rows(&store), 0, "空库起点");
+
+        seed_catalog(&store, &logs);
+
+        let seeded = catalog_rows(&store);
+        assert!(
+            seeded > 0,
+            "首启后价格目录必须非空（否则所有价格显示未知、成本不计入总额）"
+        );
+
+        // 用户手里的快照为准：塞一个哨兵行，再调一次，哨兵必须还在（没被 DELETE+INSERT 洗掉）。
+        tauri::async_runtime::block_on(store.write(|c| {
+            c.execute(
+                "UPDATE model_catalog SET name='__sentinel__' \
+                 WHERE rowid=(SELECT MIN(rowid) FROM model_catalog)",
+                [],
+            )?;
+            Ok(())
+        }))
+        .expect("插哨兵");
+        seed_catalog(&store, &logs);
+        let sentinel: i64 = tauri::async_runtime::block_on(store.read(|c| {
+            Ok(c.query_row(
+                "SELECT COUNT(*) FROM model_catalog WHERE name='__sentinel__'",
+                [],
+                |r| r.get(0),
+            )?)
+        }))
+        .expect("读哨兵");
+        assert_eq!(sentinel, 1, "表非空就不许灌随包快照");
+        assert_eq!(catalog_rows(&store), seeded, "条数不变");
+    }
+
+    /// 启动序列真的调了它吗：这里没有运行期接缝（Tauri 外壳起不来、`setup` 拉不起窗口），
+    /// 只能钉源码 —— `include_str!` 读的就是本文件，只数 `#[cfg(test)]` 之前的**产品代码**。
+    /// `setup` 与「启动网关」按钮的 `start_gateway` 两条路径都要调（换端口 / 手动重启同样要能补上快照）。
+    #[test]
+    fn both_startup_paths_seed_the_catalog() {
+        let src = include_str!("shell.rs");
+        let prod = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("本文件里必有测试块");
+        assert!(
+            prod.contains("import_bundled_snapshot_if_empty"),
+            "外壳必须调随包快照的导入：只有调用点存在，这条测试才不是空网"
+        );
+        assert_eq!(
+            prod.matches("seed_catalog(").count(),
+            3,
+            "定义 1 处 + 两条启动路径各 1 处（setup / start_gateway）"
+        );
     }
 
     #[test]

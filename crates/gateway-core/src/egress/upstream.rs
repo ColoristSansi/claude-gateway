@@ -232,15 +232,23 @@ pub(crate) fn request(
     rb
 }
 
-/// 上游 Responses 面（`/responses`）的出站编解码还没做（M3）：早报清楚，别静默当 Chat 打。
+/// 上游 Responses 面（`/responses`）的出站编解码**本版未实现**：早报清楚，别静默当 Chat 打。
+///
+/// 文案与里程碑脱钩（评审「低」第 3 条：M3 已收口，再写「M3 起接」是过期信息）。
 fn wire_not_implemented(wire: Wire, inbound: Inbound, up_id: &str) -> Response {
+    let implemented: Vec<&str> = Wire::ALL
+        .iter()
+        .filter(|w| w.implemented())
+        .map(|w| w.as_str())
+        .collect();
     error_response_for(
         inbound,
         StatusCode::BAD_GATEWAY,
         "api_error",
         &format!(
-            "上游 {up_id} 的 {} 面尚未实现（M3 起接）；请先把该模型绑到已实现的 wire 上。",
-            wire.as_str()
+            "上游 {up_id} 的 {} 面本版未实现（Responses 出站还没接）；请先把该模型绑到已实现的 wire 上：{}。",
+            wire.as_str(),
+            implemented.join(" / ")
         ),
     )
 }

@@ -436,20 +436,52 @@ pub async fn purge(store: &Store) -> Result<usize> {
         .await
 }
 
-/// 起清理表：**立刻跑一次**（把上次退出后攒下的老行清掉），之后每小时一次。
+/// 清理表的句柄：挂在 [`crate::service::Gateway`] 上，网关停的时候一并 [`PurgeSweeper::stop`]。
 ///
-/// 它只做一件事、出错只报一行，所以不占网关的关停路径：网关停了它跟着 runtime 走。
-pub fn spawn_purge_sweeper(store: Store) {
-    tokio::spawn(async move {
+/// 从前这里是裸 `tokio::spawn` 的死循环：每次 `start_gateway`（换端口 / 手动重启）再起一个、
+/// `stop_gateway` 不停它 → N 个常驻循环清同一个库（评审「中」第 5 条）。
+pub struct PurgeSweeper {
+    handle: tokio::task::JoinHandle<()>,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl PurgeSweeper {
+    /// 一个与循环同生共死的观察 / 取消点（`stop` 之后问它 `is_finished()` 必然是 `true`）。
+    pub fn abort_handle(&self) -> tokio::task::AbortHandle {
+        self.handle.abort_handle()
+    }
+
+    /// 停掉这个清理循环并等它收尾（幂等：句柄只能被消费一次）。
+    pub async fn stop(self) {
+        let PurgeSweeper { handle, shutdown } = self;
+        if let Some(tx) = shutdown {
+            let _ = tx.send(());
+        }
+        let _ = handle.await;
+    }
+}
+
+/// 起清理表：**立刻跑一次**（把上次退出后攒下的老行清掉），之后每小时一次；
+/// 停不停由 [`PurgeSweeper`] 说了算（网关 `stop()` 时一并停）。
+pub fn spawn_purge_sweeper(store: Store) -> PurgeSweeper {
+    let (tx, mut shutdown) = tokio::sync::oneshot::channel();
+    let handle = tokio::spawn(async move {
         loop {
             match purge(&store).await {
                 Ok(n) if n > 0 => println!("[obs] 清掉 {n} 条超过保留期的请求日志"),
                 Ok(_) => {}
                 Err(e) => eprintln!("[warn] 日志清理失败：{e}"),
             }
-            tokio::time::sleep(PURGE_INTERVAL).await;
+            tokio::select! {
+                _ = &mut shutdown => break,
+                _ = tokio::time::sleep(PURGE_INTERVAL) => {}
+            }
         }
     });
+    PurgeSweeper {
+        handle,
+        shutdown: Some(tx),
+    }
 }
 
 // ───────────────────────── 用量汇总（概览与用量页共用一份） ─────────────────────────
