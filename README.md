@@ -15,8 +15,11 @@
 
 | 产物 | 装法 |
 | --- | --- |
-| `Claude Gateway_<版本>_x64-setup.exe` | per-user 安装（**不需要管理员**），装到 `%LOCALAPPDATA%\Claude Gateway\` |
+| `Claude.Gateway_<版本>_x64-setup.exe` | per-user 安装（**不需要管理员**），装到 `%LOCALAPPDATA%\Claude Gateway\` |
 | `Claude-Gateway_<版本>_x64-portable.zip` | 解压即用（**不要**在压缩包里直接跑） |
+
+> Release 页面上的安装包名里是**点**（`Claude.Gateway_…`）：GitHub 会把资产名里的空格换成点。
+> 本地自己 `pack.ps1` 打出来的包名是空格（`Claude Gateway_…`），两者是同一个文件。
 
 数据目录 `%APPDATA%\com.claudegateway.desktop\`（`gateway.db` / `backups\` / `logs\` / `updates\`），
 安装版与免安装版**共用**它。

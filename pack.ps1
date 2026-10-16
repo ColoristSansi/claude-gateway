@@ -101,7 +101,15 @@ if ($Sign) {
   $signature = (Get-Content $sigFile -Raw).Trim()
 
   if (-not $BaseUrl) { throw '签名时必须给 -BaseUrl（latest.json 里的下载地址前缀）' }
-  $url = "$($BaseUrl.TrimEnd('/'))/$([uri]::EscapeDataString($setup.Name))"
+  # GitHub 会把 Release 资产名里除 [A-Za-z0-9._-] 以外的字符换成点（实测：`Claude Gateway_0.2.0_x64-setup.exe`
+  # → `Claude.Gateway_0.2.0_x64-setup.exe`），清单里的地址必须跟着换，否则资产 404。本地源按磁盘上的
+  # 原名取文件，所以只对 github.com 的地址做这个替换。
+  $assetName = if ($BaseUrl -match '^https://github\.com/') {
+    [regex]::Replace($setup.Name, '[^A-Za-z0-9._-]', '.')
+  } else {
+    $setup.Name
+  }
+  $url = "$($BaseUrl.TrimEnd('/'))/$([uri]::EscapeDataString($assetName))"
   $platforms = [ordered]@{}
   # 装机版（bundle_type = nsis）先查带安装器名的那一个，再退到不带的那一个：两份都写。
   foreach ($key in @('windows-x86_64-nsis', 'windows-x86_64')) {

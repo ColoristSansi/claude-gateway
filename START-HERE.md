@@ -73,6 +73,7 @@
 11. **门禁别用共享 `CARGO_TARGET_DIR`**：会跑到别的 worktree 编出的测试二进制，少报测试数（实测 70 vs 92）＝**假绿**。一票一 target，收口用全新目录复验。
 12. **`.gitignore` 别写裸 `dist/`**：它会把 `crates/gateway-core/src/dist/` 这类源码目录整个吞掉，`git add -A` 静默跳过（票 62 就这么丢过一个模块，`pub mod dist;` 直接编译失败）。文件里已留警示注释。
 13. **卸载会触发票 62 的默认客户端还原**（把三个客户端切回官方、删掉网关建的 `.codex\claudegateway-model-catalog.json`）；卸载确认页 **「Delete app data」默认未勾**、询问框**默认「是（还原）」**。
+14. **GitHub 会把 Release 资产名里除 `[A-Za-z0-9._-]` 以外的字符换成点**（实测：`Claude Gateway_0.2.0_x64-setup.exe` → `Claude.Gateway_0.2.0_x64-setup.exe`；随手传的 `space test.txt` → `space.test.txt`）。票 61 原文那句「资产名里的空格 GitHub 会写成 `%20`，对得上」**是错的**：写 `%20` 的清单会让 updater 404。`pack.ps1` 现在只在 `-BaseUrl` 是 `https://github.com/...` 时做这个替换（本地源仍按磁盘原名取文件）。
 
 ## 材料都在哪
 
