@@ -13,6 +13,15 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # 门禁的 web 步与 tauri 的 beforeBuildCommand 都要 app/node_modules。
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.10.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: 装前端依赖
+        run: pnpm --dir app install --frozen-lockfile
       - name: check.ps1 -Quick -Replay
         shell: pwsh
         run: ./check.ps1 -Quick -Replay
@@ -37,6 +46,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
+      - name: 装前端依赖
+        run: pnpm --dir app install --frozen-lockfile
       # pack.ps1 用 cargo tauri build；runner 上没有 cargo-tauri，现装（与本地 2.12.2 对齐）。
       - name: 装 tauri-cli
         run: cargo install tauri-cli --version 2.12.2 --locked
