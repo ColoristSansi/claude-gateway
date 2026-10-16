@@ -1,6 +1,6 @@
 # 从这里开始
 
-> 本地模型网关（Claude Gateway）· 交接单 · 2026-10-16 更新（收尾第二轮收工版）
+> 本地模型网关（Claude Gateway）· 交接单 · 2026-10-16 更新（收尾第三轮收工版）
 > 设计文档：[.scratch/model-gateway/spec.md](.scratch/model-gateway/spec.md) ｜ 决策：[docs/adr/0001..0007](docs/adr/) ｜ 历史与定案：[.scratch/model-gateway/map.md](.scratch/model-gateway/map.md)
 > 仓库已公开：<https://github.com/ColoristSansi/claude-gateway>（`main` + tag `v0.2.0` + Release）
 > 本文件只给「从哪句话接上」和「哪些坑别再踩」。
@@ -8,7 +8,7 @@
 ## 30 秒回到现场
 
 - **要做什么**：本机跑一个网关（Tauri 2 + Rust + React），把第三方模型聚合成「本地模型目录」，让 Claude Desktop（3P 模式）、Claude Code、Codex 三个客户端都用上第三方模型。
-- **走到哪了**：**收尾第二轮已收工（2026-10-16）**。`integration/model-gateway` 上 **29 张 `Type: task` 票据全部 `resolved`** —— 原计划 §12 的 25 张（M1 = 39–44、M2 = 45–55、M3 = 56–60、M4 = 61–63）**加收口后评审揪出缺口补的 3 张**（64 OpenAI Chat 入站、65 上游 Responses 出站、66 三个 quirk 的执法点），**加收尾第二轮修的 [票 67](.scratch/model-gateway/issues/67-task-quirk-name-camelcase-parse.md)（quirk 名 camelCase 只认一半）**。相对 `main`（只有票 39 的建仓提交）**129 次提交**、354 个受跟踪文件。
+- **走到哪了**：**收尾第三轮已收工（2026-10-16）**——现场卡那三件人办项（界面检查更新 / 三客户端真问一句 / 交互式卸载走查）全过并签字，签名私钥已离线备份，**待办清空**；收尾第二轮（GitHub 半步 + 真 https 闭环 + 票 67）此前已收工。`integration/model-gateway` 上 **29 张 `Type: task` 票据全部 `resolved`** —— 原计划 §12 的 25 张（M1 = 39–44、M2 = 45–55、M3 = 56–60、M4 = 61–63）**加收口后评审揪出缺口补的 3 张**（64 OpenAI Chat 入站、65 上游 Responses 出站、66 三个 quirk 的执法点），**加收尾第二轮修的 [票 67](.scratch/model-gateway/issues/67-task-quirk-name-camelcase-parse.md)（quirk 名 camelCase 只认一半）**。相对 `main`（只有票 39 的建仓提交）**129 次提交**、354 个受跟踪文件。
 - **四段里程碑都已现场验收 + 你签字**：[44](.scratch/model-gateway/issues/44-task-m1-exit-acceptance.md)（托盘/窗口/库/端口被占）、[55](.scratch/model-gateway/issues/55-task-m2-exit-acceptance.md)（**三个真实客户端各问一句全通** + 一键还原）、[60](.scratch/model-gateway/issues/60-task-m3-exit-acceptance.md)（用量对账三条逐项零差异 + Ollama 面 + 能力位；走查时抓到的白屏 bug 当场修掉）、[63](.scratch/model-gateway/issues/63-task-m4-exit-acceptance.md)（完整卸载 → 干净装 → 应用内升一版 → 再卸载选还原）。**「可以开始拿它日常用」那条线（M2 收口）已过。**
 - **门禁**：`pwsh -File .\check.ps1 -Quick -Replay` → `全部通过。` exit 0，**358 条通过 / 15 条 `#[ignore]`**（真上游与人眼项，按票据 Answer 里的命令手动跑）；含 lib 191、**回放 23 格**、ollama 12、chat_inbound 11、responses_outbound 10、structured 19，以及**前端类型检查步**（`tsc --noEmit && vite build`）。最后一轮是在**全新 `CARGO_TARGET_DIR`（`cg-target\67`）** 上跑的，日志 `cg-notes\67-check.log`。
 - **GitHub 那半步已全部走完（2026-10-16）**：公开仓库 [`ColoristSansi/claude-gateway`](https://github.com/ColoristSansi/claude-gateway)，`main` 快进到与 tag 同一提交，tag **`v0.2.0`** 触发 CI `bundle` job 出签名产物（`check` 与 `bundle` 两个 job 都绿），[Release `v0.2.0`](https://github.com/ColoristSansi/claude-gateway/releases/tag/v0.2.0) 上传了 `Claude.Gateway_0.2.0_x64-setup.exe` + `latest.json` + 免安装 zip。**真 https 升级闭环现场跑通了**（生产配置 0.1.0 → 检查更新 → 下载安装 → 0.2.0，端口与库路径不变），本机不再依赖 `127.0.0.1:8791` 那个本地源。原文 `cg-notes\67-https-loop.log`。
@@ -17,15 +17,17 @@
 
 ## 回来直接说这一句
 
+**收尾第三轮已收工（2026-10-16）**——现场卡 `cg-notes\accept-live.md` 的三件人办项全过，签字与原文在[票 63 的 Answer](.scratch/model-gateway/issues/63-task-m4-exit-acceptance.md)。
+
+**唯一还悬着的决定**（不是待办，是想不想做）：现场卡 §1 第 ③ 条要求界面能看到「更新端点」，而设置页**没有这一项**（端点本身已核实是真仓库、无 `8791` 残留）。要处理就粘这一句：
+
 ```
-接手 Claude Gateway 收尾第三轮验收：读 START-HERE.md、cg-notes\accept-live.md（验收现场卡）与票 63 的 Answer。按卡 §6 的顺序走：先跑 §0 基线，再带我做完三件人办项——①设置页点一次「检查更新」看界面、②三个客户端各「真问一句」、③交互式卸载走查（选默认还原那条）；每步当场记「看到什么」，最后写回票 63 的 Answer。别改判据、别动 tag v0.2.0、别替我改槽位绑定。
+把设置页「关于与版本」加上「更新端点」一行（显示 tauri.conf.json 里那条 latest.json 地址），照现场卡 §1 第 ③ 条的判据走
 ```
 
-想直接开工其中一件，就说：
+想干别的活直接说需求；要再走一遍验收现场就用 `cg-notes\accept-live.md`。
 
-- 走验收：`按 cg-notes\accept-live.md 带我做验收`（§1 界面 / §2 三客户端 / §3 交互式卸载，可分次做）
-- 只做界面那下：`带我在设置页点一次检查更新（命令行那条已经验过）`
-- 备份签名私钥：`告诉我 cg-notes\keys 该怎么离线备份`
+**已办（留作记录，别重做）**：
 - ~~让三张客户端卡回「已生效」~~：**已办（2026-10-16）**，三张卡现在都是 `effective`。
 - ~~走 GitHub 那半步~~：**已办（2026-10-16）**，现场小节见 `cg-notes/m4-live.md` 第 6 节 + 本文件「走到哪了」+ 票 63 的 Answer「收尾第二轮补」。
 - ~~修 quirk 名解析缺口~~：**已办（2026-10-16）**，票 67 `resolved`，见已办第 4 条。
@@ -33,11 +35,11 @@
 
 **没有别的实现期票据了**——要开新票请先看下面的「待办」与「遗留」，别顺手改判据（spec §12.1）。
 
-## 待办（收尾第二轮之后剩下的，都要人）
+## 待办（收尾第三轮之后）——**已清空，三条都已办**
 
-1. **在界面点一次「检查更新」**（人眼复核；命令行的真 https 闭环已经验过，记录见上面已办第 2 条）：设置页「关于与版本」点一下，看到 `0.2.0` 与「已是最新版本」即可。
-2. **离线备份 `cg-notes\keys\`**（签名私钥，用户资产，丢了发不了升级；公开仓库那两个 Secret 就是它）。
-3. **三个客户端「真问一句」+ 交互式卸载走查**（选默认还原那条；M4 现场只跑过 `/S` 静默那条）。
+1. ~~**在界面点一次「检查更新」**~~ **已办（2026-10-16，收尾第三轮）**：设置页「关于与版本」点过，界面显示 `0.2.0` + 「已是最新版本」，回退指引指到 `…\com.claudegateway.desktop\updates\installers\`。**一处新事实：界面里没有「更新端点」这一项**——现场卡 §1 第 ③ 条在 UI 上没有对应面（端点本身已按机器侧核实是真仓库、无 `8791` 残留），原文见票 63 的 Answer「用户签字 · 收尾第三轮」。
+2. ~~**离线备份 `cg-notes\keys\`**~~ **已办（2026-10-16，收尾第三轮）**：三份（`updater.key` 348 B / `.password.txt` 32 B / `.pub` 152 B）整目录拷到外置介质，**副本直接读介质算 SHA256、与源逐字节相同**（私钥指纹 `C354501D…`），用户当场弹出并拔下介质。备份前核过 `updater.key.pub` 与 `tauri.conf.json:42` 的 `pubkey` 逐字相同（即出厂 app 信任的那把）。**存放位置不写在这里。** 原文见票 63 的 Answer「补记」。
+3. ~~**三个客户端「真问一句」+ 交互式卸载走查**~~ **已办（2026-10-16，收尾第三轮）**：三个客户端各真问一句全过（Claude Code `logId` 78 / Desktop 79 / Codex 81–82）；交互式卸载三处默认值与清理、还原全过（还原后五份文件与 M4 官方态逐字相同），随后按卡装回生产 `0.2.0` 并点回「已生效」。原文见票 63 的 Answer。
 
 ## 收尾第二轮已办（留作记录，别重做）
 
