@@ -60,7 +60,7 @@ pub fn router() -> Router<Arc<Gateway>> {
         .route("/api/show", post(show))
 }
 
-/// `/api/*` 兜底：没被任何具体路由匹配、且落在 `/api/` 下的路径 → 404。
+/// `/api/*` 与 `/v1/*` 的兜底：没被任何具体路由匹配、且落在这两个前缀下的路径 → 404。
 ///
 /// ⚠️ 口径差（写进票 56 的 Answer）：spec §4.4 那句「其余 `/api/*` 一律 404」**只就 Ollama 面
 /// 而言**，不是覆盖管理面。`/api/status`（票 43）、`/api/logs*`（票 53）以及原型自用的
@@ -69,15 +69,48 @@ pub fn router() -> Router<Arc<Gateway>> {
 /// 文案是本网关自己定的：真 Ollama 对未知路径回的是 gin 的纯文本 `404 page not found`，
 /// 对已实现端点（`pull` / `create` / …）根本没有「未实现」这一态可比。这里统一用本面的
 /// 错误信封，客户端解析错误时拿到的至少是结构化体。
-pub async fn api_fallback(uri: Uri) -> Response {
-    if uri.path().starts_with("/api/") {
+///
+/// 票 64：`/v1/*` 的未知路径也照此办理，只是信封按**入站家族**给（原来是空体 404）——
+/// 空体只留给真正无协议的路径。
+pub async fn api_fallback(uri: Uri, headers: HeaderMap) -> Response {
+    let path = uri.path();
+    if path.starts_with("/api/") {
         return error(
             StatusCode::NOT_FOUND,
-            &format!("{} is not implemented by this gateway", uri.path()),
+            &format!("{path} is not implemented by this gateway"),
         );
     }
-    // 其余路径保持 axum 原本的行为（空体 404），别把 `/v1/*` 的未知路径也换成 Ollama 信封。
+    if path.starts_with("/v1/") {
+        return crate::egress::upstream::error_response_for(
+            v1_family(path, &headers),
+            StatusCode::NOT_FOUND,
+            "not_found_error",
+            &format!("{path} is not implemented by this gateway"),
+        );
+    }
+    // 其余路径保持 axum 原本的行为（空体 404）。
     StatusCode::NOT_FOUND.into_response()
+}
+
+/// `/v1/*` 兜底该按哪家的信封给：路径自带家族就按路径（三条路径各自的家族是死的），
+/// 没有路径线索时按客户端标识头判——Codex 是 `/v1/*` 上唯一的 OpenAI 系客户端，
+/// 其余（Claude Desktop / Claude Code / 未知客户端）都按 Anthropic 系给。
+fn v1_family(path: &str, headers: &HeaderMap) -> Inbound {
+    if path.starts_with("/v1/messages") {
+        return Inbound::Anthropic;
+    }
+    if path.starts_with("/v1/chat/completions") {
+        return Inbound::OpenAiChat;
+    }
+    if path.starts_with("/v1/responses") {
+        return Inbound::Responses;
+    }
+    let identity = crate::ingress::proxy::client_identity(headers).to_ascii_lowercase();
+    if identity.contains("codex") {
+        Inbound::Responses
+    } else {
+        Inbound::Anthropic
+    }
 }
 
 /// Ollama 的错误信封：**单层** `{"error":"<字符串>"}`（spec §4.4；不是 OpenAI 的嵌套形状）。

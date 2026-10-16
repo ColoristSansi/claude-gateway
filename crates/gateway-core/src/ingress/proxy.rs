@@ -29,6 +29,7 @@ use crate::binding::{self, BindingTable, Profile};
 use crate::egress::provider::{self, Upstream, UpstreamModel, Wire};
 use crate::egress::upstream::{self, Inbound};
 use crate::ir;
+use crate::openai;
 use crate::responses;
 use crate::store::Store;
 
@@ -167,25 +168,35 @@ impl Gateway {
 }
 
 /// 转发面路由（`/v1/*` + 不带 `/v1` 的别名 + 票 56 的 Ollama `/api/*`）。
+///
+/// 分为 [`routes`]（路由表本体，**不带兜底**）与 [`router`]（路由表 + 本面兜底）两个入口：
+/// 票 64 把两张脸的兜底合成一个挂在合并点（`ingress::router`），那张组合表要的是**不带兜底**
+/// 的转发面，否则管理面将来加 fallback 会让 `Router::merge` 在启动时 panic。
 pub fn router() -> Router<Arc<Gateway>> {
+    routes().fallback(crate::ingress::ollama::api_fallback)
+}
+
+/// 转发面的路由表本体（**不带兜底**）：`/v1/messages`、`/v1/chat/completions`、`/v1/responses`、
+/// `/v1/models` 与它们的别名，加票 56 的 Ollama 五个端点。
+pub fn routes() -> Router<Arc<Gateway>> {
     Router::new()
         .route("/v1/messages", post(messages))
         // 票 26：Desktop 的推理探针是非流式 max_tokens:1，连接测试另走 count_tokens。
         .route("/v1/messages/count_tokens", post(count_tokens))
         // 票 32：Codex 的唯一合法出站（`wire_api = "responses"`）。
         .route("/v1/responses", post(responses))
+        // 票 64：OpenAI Chat 入站（spec §4.3）。
+        .route("/v1/chat/completions", post(chat))
         .route("/v1/models", get(list_models))
         // 票 15：`inferenceGatewayBaseUrl` 到底带不带 `/v1` 两份资料互相矛盾，
         // 别名路由让两种写法都能通。
         .route("/messages", post(messages))
         .route("/messages/count_tokens", post(count_tokens))
         .route("/responses", post(responses))
+        .route("/chat/completions", post(chat))
         .route("/models", get(list_models))
         // 票 56：Ollama 兼容面（`/api/chat` 等五个端点）。
         .merge(crate::ingress::ollama::router())
-        // `/api/*` 兜底：只吃没被任何具体路由匹配的路径，管理面（票 43 / 53）与原型自用的
-        // `/api/routes` / `/api/echo` 都是具体路由，永远优先（口径差见 `ollama::api_fallback`）。
-        .fallback(crate::ingress::ollama::api_fallback)
 }
 
 /// 入站 Anthropic Messages：Claude Desktop 3P / Claude Code 打的那个端点。
@@ -193,8 +204,12 @@ async fn messages(
     State(app): State<Arc<Gateway>>,
     uri: axum::http::Uri,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    body: axum::body::Bytes,
 ) -> Response {
+    let body = match parse_json(&body, Inbound::Anthropic) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
     proxy(app, uri, headers, body, Inbound::Anthropic).await
 }
 
@@ -203,9 +218,51 @@ async fn responses(
     State(app): State<Arc<Gateway>>,
     uri: axum::http::Uri,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    body: axum::body::Bytes,
 ) -> Response {
+    let body = match parse_json(&body, Inbound::Responses) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
     proxy(app, uri, headers, body, Inbound::Responses).await
+}
+
+/// 入站 OpenAI Chat：`POST /v1/chat/completions`（spec §4.3，票 64）。
+async fn chat(
+    State(app): State<Arc<Gateway>>,
+    uri: axum::http::Uri,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let body = match parse_json(&body, Inbound::OpenAiChat) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    proxy(app, uri, headers, body, Inbound::OpenAiChat).await
+}
+
+/// 入站体的手解（票 64）：**不用 `Json<Value>` 提取器**——它在语法错的 JSON / 缺 `content-type`
+/// 时回 axum 默认的 text/plain 400/415/422，客户端读不懂（评审「中」第一条）。
+/// 与 Ollama 面同一套做法（`ollama::parse_body`），区别只是错误信封按入站家族给。
+// `Response` 就是 128 字节，装箱换不来什么；错误路径每请求最多走一次。
+#[allow(clippy::result_large_err)]
+fn parse_json(bytes: &axum::body::Bytes, inbound: Inbound) -> Result<Value, Response> {
+    if bytes.is_empty() {
+        return Err(err_in(
+            inbound,
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "请求体为空",
+        ));
+    }
+    serde_json::from_slice(bytes).map_err(|e| {
+        err_in(
+            inbound,
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            &format!("请求体不是合法 JSON：{e}"),
+        )
+    })
 }
 
 /// 两个入站协议共用的转发链路：查路由 → 解 IR → 换真实模型 → 出站。
@@ -223,17 +280,25 @@ async fn proxy(
     let identity = client_identity(&headers);
     let profile = app.read_bindings().profile_for(&identity);
     // 票 15：记下客户端真实打的路径与协议头，用来定 base URL 语义。
-    println!(
-        "[in] {} proto={} model={name} profile={} ua={:?} ver={:?} beta={:?}",
+    // 票 64（评审「低」第二条）：UA / `anthropic-version` / `anthropic-beta` 只在 body 日志窗口
+    // 开着时才打——生产版没有控制台，每请求打这三个头是纯噪声与元数据外泄。
+    let mut line = format!(
+        "[in] {} proto={} model={name} profile={}",
         uri.path_and_query().map(|p| p.as_str()).unwrap_or(""),
         inbound.as_str(),
         profile.id(),
-        headers.get("user-agent").and_then(|v| v.to_str().ok()),
-        headers
-            .get("anthropic-version")
-            .and_then(|v| v.to_str().ok()),
-        headers.get("anthropic-beta").and_then(|v| v.to_str().ok()),
     );
+    if app.body_log_on() {
+        line.push_str(&format!(
+            " ua={:?} ver={:?} beta={:?}",
+            headers.get("user-agent").and_then(|v| v.to_str().ok()),
+            headers
+                .get("anthropic-version")
+                .and_then(|v| v.to_str().ok()),
+            headers.get("anthropic-beta").and_then(|v| v.to_str().ok()),
+        ));
+    }
+    println!("{line}");
     // body 日志开着时把入站体落盘：Codex 的真实请求形状只有它说得清（票 32）。
     dump_inbound(&app, &body);
 
@@ -255,6 +320,8 @@ async fn proxy(
     let decoded = match inbound {
         Inbound::Anthropic => anthropic::decode_request(&body),
         Inbound::Responses => responses::decode_request(&body),
+        // 票 64：`/v1/chat/completions` 的请求 → IR（出站 wire 由绑定表给，与入站解耦）。
+        Inbound::OpenAiChat => openai::decode_request(&body),
         // 只有 `/api/chat` 走 Ollama 解码器，而它不走这里（票 56 自己接的路由）。
         Inbound::Ollama => crate::ingress::ollama::decode_request(&body),
     };
@@ -407,12 +474,17 @@ pub(crate) fn dump_inbound(app: &Gateway, body: &Value) {
 
 /// `count_tokens`（票 26）：数字优先向上游要（只有 Anthropic wire 有原生端点），
 /// 任何失败降级到本地估算 —— 这个端点绝不因为上游不实现它而失败。
+/// 入站体手解（票 64 同 `messages` / `responses` / `chat`）：这是 Anthropic 面的端点。
 async fn count_tokens(
     State(app): State<Arc<Gateway>>,
     uri: axum::http::Uri,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    body: axum::body::Bytes,
 ) -> Response {
+    let body = match parse_json(&body, Inbound::Anthropic) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
     let name = virtual_model(&body);
     let identity = client_identity(&headers);
     println!(

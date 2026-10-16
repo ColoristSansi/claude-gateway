@@ -16,15 +16,17 @@
 //!   声明式供应商表。
 //! - `binding` / `obs` / `store` / `writer`：绑定层、旁路可观测、持久化、配置写入引擎。
 //!
-//! 测试专用件（mock 上游 + 回放 harness）不在产品路径上：`src/bin/*` 两个 bin 都挂
-//! `required-features = ["mock"]`，`tests/` 与 `src/replay.rs` 只有开 `mock` 特性才编。
+//! 测试专用件（mock 上游 + 回放 harness）不在产品路径上：`src/bin/*` 两个 bin 与集成测试
+//! `tests/replay.rs` 挂 `required-features = ["mock"]`；`src/replay.rs` 只被那个测试 `#[path]`
+//! 引入，产品构建看不到它。**其余集成测试不开 `mock` 特性也照跑**（`check.ps1 -Quick` 会跑
+//! 它们，`-Replay` 只多跑回放那一格）。
 //!
 //! 每个编解码文件的两侧归属（门面按同一张表 re-export）：
 //!
 //! | 文件 | 入站面（客户端，`ingress`） | 出站面（上游，`egress`） |
 //! | --- | --- | --- |
 //! | `anthropic.rs` | `decode_request`、`AnthropicEncoder`、`AnthropicAssembler` | `encode_request`、`encode_count_request`、`AnthropicDecoder` |
-//! | `openai.rs` | —（OpenAI Chat 入站未做，M3） | `encode_request`、`OpenAiDecoder` |
+//! | `openai.rs` | `decode_request`、`ChatEncoder`、`ChatAssembler`（票 64） | `encode_request`、`OpenAiDecoder` |
 //! | `responses.rs` | `decode_request`、`ResponsesEncoder`、`ResponsesAssembler` | —（上游 Responses wire 未做） |
 
 pub mod anthropic;

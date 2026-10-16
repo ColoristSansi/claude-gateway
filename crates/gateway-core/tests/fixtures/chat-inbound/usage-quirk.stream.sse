@@ -1,0 +1,9 @@
+data: {"id":"<masked>","object":"chat.completion.chunk","created":"<masked>","model":"chat-model","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"id":"<masked>","object":"chat.completion.chunk","created":"<masked>","model":"chat-model","choices":[{"index":0,"delta":{"content":"缓存"},"finish_reason":null}]}
+
+data: {"id":"<masked>","object":"chat.completion.chunk","created":"<masked>","model":"chat-model","choices":[{"index":0,"delta":{"content":"命中。"},"finish_reason":null}],"usage":{"prompt_tokens":100,"completion_tokens":12,"total_tokens":112,"prompt_tokens_details":{"cached_tokens":80}}}
+
+data: {"id":"<masked>","object":"chat.completion.chunk","created":"<masked>","model":"chat-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
