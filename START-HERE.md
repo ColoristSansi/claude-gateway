@@ -12,34 +12,29 @@
 - **四段里程碑都已现场验收 + 你签字**：[44](.scratch/model-gateway/issues/44-task-m1-exit-acceptance.md)（托盘/窗口/库/端口被占）、[55](.scratch/model-gateway/issues/55-task-m2-exit-acceptance.md)（**三个真实客户端各问一句全通** + 一键还原）、[60](.scratch/model-gateway/issues/60-task-m3-exit-acceptance.md)（用量对账三条逐项零差异 + Ollama 面 + 能力位；走查时抓到的白屏 bug 当场修掉）、[63](.scratch/model-gateway/issues/63-task-m4-exit-acceptance.md)（完整卸载 → 干净装 → 应用内升一版 → 再卸载选还原）。**「可以开始拿它日常用」那条线（M2 收口）已过。**
 - **门禁**：`pwsh -File .\check.ps1 -Quick -Replay` → `全部通过。` exit 0，**358 条通过 / 15 条 `#[ignore]`**（真上游与人眼项，按票据 Answer 里的命令手动跑）；含 lib 191、**回放 23 格**、ollama 12、chat_inbound 11、responses_outbound 10、structured 19，以及**前端类型检查步**（`tsc --noEmit && vite build`）。最后一轮是在**全新 `CARGO_TARGET_DIR`（`cg-target\67`）** 上跑的，日志 `cg-notes\67-check.log`。
 - **GitHub 那半步已全部走完（2026-10-16）**：公开仓库 [`ColoristSansi/claude-gateway`](https://github.com/ColoristSansi/claude-gateway)，`main` 快进到与 tag 同一提交，tag **`v0.2.0`** 触发 CI `bundle` job 出签名产物（`check` 与 `bundle` 两个 job 都绿），[Release `v0.2.0`](https://github.com/ColoristSansi/claude-gateway/releases/tag/v0.2.0) 上传了 `Claude.Gateway_0.2.0_x64-setup.exe` + `latest.json` + 免安装 zip。**真 https 升级闭环现场跑通了**（生产配置 0.1.0 → 检查更新 → 下载安装 → 0.2.0，端口与库路径不变），本机不再依赖 `127.0.0.1:8791` 那个本地源。原文 `cg-notes\67-https-loop.log`。
-- **本机现状（2026-10-16 收尾后更正）**：装的是**公开仓库发的生产版 `0.2.0`**（端点指 `https://github.com/ColoristSansi/claude-gateway/...`，真 https 闭环已跑过：0.1.0 → 检查更新 → 0.2.0），数据目录 `%APPDATA%\com.claudegateway.desktop\`，两个真实上游都在，四个家族槽位配好。**三个客户端现在是 `official`（不是「已生效」）**——闭环前占着 8787 的是一个 0.1.0 免安装残留进程，那段时间没接管；要用得重跑一次「一键切换」（三个客户端都要完全退出重开）：
-  ```powershell
-  $b='http://127.0.0.1:8787'
-  foreach ($id in 'claude-desktop','claude-code','codex') {
-    Invoke-RestMethod -Method Post -Uri "$b/api/clients/$id/apply" -ContentType 'application/json' -Body '{}'
-  }
-  ```
-  **更正一条旧的现场记录**：闭环前 `%LOCALAPPDATA%\Claude Gateway` **并不存在**（没有「已安装的 0.2.0 本地验收源版」），只有上述残留进程；详见[票 63 的 Answer](.scratch/model-gateway/issues/63-task-m4-exit-acceptance.md)「收尾第二轮补」。
+- **本机现状（2026-10-16 20:47 复核）**：装的是**公开仓库发的生产版 `0.2.0`**（`%LOCALAPPDATA%\Claude Gateway\claude-gateway.exe`，24408576 B，FileVersion `0.2.0`；端点指 `https://github.com/ColoristSansi/claude-gateway/...`，真 https 闭环已跑过：0.1.0 → 检查更新 → 0.2.0），数据目录 `%APPDATA%\com.claudegateway.desktop\`，两个真实上游、四个家族槽位都在，**三个客户端都是「已生效」（`effective`）**。
+  **更正两条旧现场记录**：①闭环前 `%LOCALAPPDATA%\Claude Gateway` **并不存在**（没有「已安装的 0.2.0 本地验收源版」），占着 8787 的是一个从 `target\release\bundle\zip\` 跑起来的 0.1.0 免安装残留进程；②闭环刚结束时三张卡是 `official`，一小时内已重跑「一键切换」回到 `effective`。详见[票 63 的 Answer](.scratch/model-gateway/issues/63-task-m4-exit-acceptance.md)「收尾第二轮补」。
 
 ## 回来直接说这一句
 
 ```
-接手 Claude Gateway 收尾第三轮：读 START-HERE.md 与 cg-notes 里的现场卡。收尾第二轮 ①②③④ 全部已办（公开仓库 + v0.2.0 Release + 真 https 闭环已验、票 67 已 resolved），别重做；剩下两件都要人：①重跑一次「一键切换」让三张客户端卡回「已生效」+ 在设置页点一次「检查更新」看界面、②离线备份 cg-notes\keys（丢了发不了升级）+ 三个客户端「真问一句」与交互式卸载走查。
+接手 Claude Gateway 收尾第三轮：读 START-HERE.md 与 cg-notes 里的现场卡。收尾第二轮 ①②③④ 全部已办（公开仓库 + v0.2.0 Release + 真 https 闭环已验、票 67 已 resolved、三张客户端卡已回 effective），别重做；剩下三件都要人：①在设置页点一次「检查更新」看界面（命令行已验）、②把 cg-notes\keys 离线备份（丢了发不了升级）、③三个客户端「真问一句」+ 交互式卸载走查（选默认还原那条）。
 ```
 
 想直接开工其中一件，就说：
 
-- 让三张客户端卡回「已生效」：`按 START-HERE 的「本机现状」那段跑一键切换`
 - 备份签名私钥：`告诉我 cg-notes\keys 该怎么离线备份`
+- 界面复看升级：`带我在设置页点一次检查更新（命令行那条已经验过）`
+- ~~让三张客户端卡回「已生效」~~：**已办（2026-10-16）**，三张卡现在都是 `effective`。
 - ~~走 GitHub 那半步~~：**已办（2026-10-16）**，现场小节见 `cg-notes/m4-live.md` 第 6 节 + 本文件「走到哪了」+ 票 63 的 Answer「收尾第二轮补」。
 - ~~修 quirk 名解析缺口~~：**已办（2026-10-16）**，票 67 `resolved`，见已办第 4 条。
 - ~~换回生产版~~：**已办（2026-10-16）**，本机现在就是公开仓库发的 0.2.0。
 
 **没有别的实现期票据了**——要开新票请先看下面的「待办」与「遗留」，别顺手改判据（spec §12.1）。
 
-## 待办（收尾第二轮之后剩下的三件，都要人）
+## 待办（收尾第二轮之后剩下的，都要人）
 
-1. **让三张客户端卡回「已生效」+ 在界面点一次「检查更新」**：命令行的真 https 闭环已经验过（记录见上面已办第 2 条），剩下的是人眼那两下——按上面「本机现状」那段跑一键切换，再在设置页「关于与版本」点一次「检查更新」看界面显示。
+1. **在界面点一次「检查更新」**（人眼复核；命令行的真 https 闭环已经验过，记录见上面已办第 2 条）：设置页「关于与版本」点一下，看到 `0.2.0` 与「已是最新版本」即可。
 2. **离线备份 `cg-notes\keys\`**（签名私钥，用户资产，丢了发不了升级；公开仓库那两个 Secret 就是它）。
 3. **三个客户端「真问一句」+ 交互式卸载走查**（选默认还原那条；M4 现场只跑过 `/S` 静默那条）。
 
