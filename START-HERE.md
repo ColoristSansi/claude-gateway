@@ -11,28 +11,36 @@
 - **走到哪了**：**收尾第二轮已收工（2026-10-16）**。`integration/model-gateway` 上 **29 张 `Type: task` 票据全部 `resolved`** —— 原计划 §12 的 25 张（M1 = 39–44、M2 = 45–55、M3 = 56–60、M4 = 61–63）**加收口后评审揪出缺口补的 3 张**（64 OpenAI Chat 入站、65 上游 Responses 出站、66 三个 quirk 的执法点），**加收尾第二轮修的 [票 67](.scratch/model-gateway/issues/67-task-quirk-name-camelcase-parse.md)（quirk 名 camelCase 只认一半）**。相对 `main`（只有票 39 的建仓提交）**129 次提交**、354 个受跟踪文件。
 - **四段里程碑都已现场验收 + 你签字**：[44](.scratch/model-gateway/issues/44-task-m1-exit-acceptance.md)（托盘/窗口/库/端口被占）、[55](.scratch/model-gateway/issues/55-task-m2-exit-acceptance.md)（**三个真实客户端各问一句全通** + 一键还原）、[60](.scratch/model-gateway/issues/60-task-m3-exit-acceptance.md)（用量对账三条逐项零差异 + Ollama 面 + 能力位；走查时抓到的白屏 bug 当场修掉）、[63](.scratch/model-gateway/issues/63-task-m4-exit-acceptance.md)（完整卸载 → 干净装 → 应用内升一版 → 再卸载选还原）。**「可以开始拿它日常用」那条线（M2 收口）已过。**
 - **门禁**：`pwsh -File .\check.ps1 -Quick -Replay` → `全部通过。` exit 0，**358 条通过 / 15 条 `#[ignore]`**（真上游与人眼项，按票据 Answer 里的命令手动跑）；含 lib 191、**回放 23 格**、ollama 12、chat_inbound 11、responses_outbound 10、structured 19，以及**前端类型检查步**（`tsc --noEmit && vite build`）。最后一轮是在**全新 `CARGO_TARGET_DIR`（`cg-target\67`）** 上跑的，日志 `cg-notes\67-check.log`。
-- **GitHub 那半步已走完（2026-10-16）**：公开仓库 [`ColoristSansi/claude-gateway`](https://github.com/ColoristSansi/claude-gateway)，`main` 快进到与 tag 同一提交，tag **`v0.2.0`** 触发 CI `bundle` job 出签名产物，Release `v0.2.0` 上传了 `Claude Gateway_0.2.0_x64-setup.exe` 与 `latest.json`（外加免安装 zip）。**升级闭环走的是真 https**，本机不再依赖 `127.0.0.1:8791` 那个本地源。
-- **本机现状**：装的是 **0.2.0（本地验收源版，端点指 `127.0.0.1:8791`）**，数据目录 `%APPDATA%\com.claudegateway.desktop\`，两个真实上游（`commandcode` / `opencode-go`）与四个家族槽位都配好且探针 200，三个客户端「已生效」。**想换成公开仓库那一版**：见下面待办①。
+- **GitHub 那半步已全部走完（2026-10-16）**：公开仓库 [`ColoristSansi/claude-gateway`](https://github.com/ColoristSansi/claude-gateway)，`main` 快进到与 tag 同一提交，tag **`v0.2.0`** 触发 CI `bundle` job 出签名产物（`check` 与 `bundle` 两个 job 都绿），[Release `v0.2.0`](https://github.com/ColoristSansi/claude-gateway/releases/tag/v0.2.0) 上传了 `Claude.Gateway_0.2.0_x64-setup.exe` + `latest.json` + 免安装 zip。**真 https 升级闭环现场跑通了**（生产配置 0.1.0 → 检查更新 → 下载安装 → 0.2.0，端口与库路径不变），本机不再依赖 `127.0.0.1:8791` 那个本地源。原文 `cg-notes\67-https-loop.log`。
+- **本机现状（2026-10-16 收尾后更正）**：装的是**公开仓库发的生产版 `0.2.0`**（端点指 `https://github.com/ColoristSansi/claude-gateway/...`，真 https 闭环已跑过：0.1.0 → 检查更新 → 0.2.0），数据目录 `%APPDATA%\com.claudegateway.desktop\`，两个真实上游都在，四个家族槽位配好。**三个客户端现在是 `official`（不是「已生效」）**——闭环前占着 8787 的是一个 0.1.0 免安装残留进程，那段时间没接管；要用得重跑一次「一键切换」（三个客户端都要完全退出重开）：
+  ```powershell
+  $b='http://127.0.0.1:8787'
+  foreach ($id in 'claude-desktop','claude-code','codex') {
+    Invoke-RestMethod -Method Post -Uri "$b/api/clients/$id/apply" -ContentType 'application/json' -Body '{}'
+  }
+  ```
+  **更正一条旧的现场记录**：闭环前 `%LOCALAPPDATA%\Claude Gateway` **并不存在**（没有「已安装的 0.2.0 本地验收源版」），只有上述残留进程；详见[票 63 的 Answer](.scratch/model-gateway/issues/63-task-m4-exit-acceptance.md)「收尾第二轮补」。
 
 ## 回来直接说这一句
 
 ```
-接手 Claude Gateway 收尾第三轮：读 START-HERE.md 与 cg-notes 里的现场卡。收尾第二轮的 ②④ 都已办（公开仓库 + v0.2.0 Release 已发、票 67 已 resolved），别重做；剩下三件都要人：①把本机换成公开仓库那一版 0.2.0 并跑一次真 https 更新闭环、②离线备份 cg-notes\keys（丢了发不了升级）、③三个客户端「真问一句」+ 交互式卸载走查（默认还原那条）。
+接手 Claude Gateway 收尾第三轮：读 START-HERE.md 与 cg-notes 里的现场卡。收尾第二轮 ①②③④ 全部已办（公开仓库 + v0.2.0 Release + 真 https 闭环已验、票 67 已 resolved），别重做；剩下两件都要人：①重跑一次「一键切换」让三张客户端卡回「已生效」+ 在设置页点一次「检查更新」看界面、②离线备份 cg-notes\keys（丢了发不了升级）+ 三个客户端「真问一句」与交互式卸载走查。
 ```
 
 想直接开工其中一件，就说：
 
-- ~~同步 spec 口径差~~：**已办（2026-10-16）**，四条原文见下面待办①的记录。
-- ~~走 GitHub 那半步~~：**已办（2026-10-16）**，现场小节见 `cg-notes/m4-live.md` 第 6 节 + 本文件「走到哪了」。
-- ~~修 quirk 名解析缺口~~：**已办（2026-10-16）**，票 67 `resolved`，见待办④。
-- 换回生产版：`把本机换装公开仓库的 0.2.0（见 cg-notes/m4-live.md）`
+- 让三张客户端卡回「已生效」：`按 START-HERE 的「本机现状」那段跑一键切换`
+- 备份签名私钥：`告诉我 cg-notes\keys 该怎么离线备份`
+- ~~走 GitHub 那半步~~：**已办（2026-10-16）**，现场小节见 `cg-notes/m4-live.md` 第 6 节 + 本文件「走到哪了」+ 票 63 的 Answer「收尾第二轮补」。
+- ~~修 quirk 名解析缺口~~：**已办（2026-10-16）**，票 67 `resolved`，见已办第 4 条。
+- ~~换回生产版~~：**已办（2026-10-16）**，本机现在就是公开仓库发的 0.2.0。
 
 **没有别的实现期票据了**——要开新票请先看下面的「待办」与「遗留」，别顺手改判据（spec §12.1）。
 
 ## 待办（收尾第二轮之后剩下的三件，都要人）
 
-1. **把本机换成公开仓库那一版 0.2.0，跑一次真 https 更新闭环**（`m4-live.md` §6 第 6 条）：装一份**生产配置**的旧版（不带 `--config`，端点已是真仓库）→ 启动 → 设置页「关于与版本 → 检查更新」或顶栏横幅 → 看到 0.2.0 → 下载并安装 → 重启后 `/api/status` 的 `version` 是 `0.2.0`。**收尾自查**：`git grep 127.0.0.1:8791 src-tauri/tauri.conf.json` 必须是空。做完把实测结果写进[票 63 的 Answer](.scratch/model-gateway/issues/63-task-m4-exit-acceptance.md)（第 7 条）。本机现在装的是**本地验收源**那一版（端点指临时起的 `127.0.0.1:8791`），公开仓库的 Release 一上，它就该换成生产版。
-2. **离线备份 `cg-notes\keys\`**（签名私钥，用户资产，丢了发不了升级）。
+1. **让三张客户端卡回「已生效」+ 在界面点一次「检查更新」**：命令行的真 https 闭环已经验过（记录见上面已办第 2 条），剩下的是人眼那两下——按上面「本机现状」那段跑一键切换，再在设置页「关于与版本」点一次「检查更新」看界面显示。
+2. **离线备份 `cg-notes\keys\`**（签名私钥，用户资产，丢了发不了升级；公开仓库那两个 Secret 就是它）。
 3. **三个客户端「真问一句」+ 交互式卸载走查**（选默认还原那条；M4 现场只跑过 `/S` 静默那条）。
 
 ## 收尾第二轮已办（留作记录，别重做）
@@ -42,7 +50,7 @@
    - `cache_write` 缺价 → 整条 `cost_usd` NULL：[票 58](.scratch/model-gateway/issues/58-task-cache-write-accounting.md) 在实现期自定**并回写了 spec §9**——这是全程唯一一次改 spec，严格说越出 §12.1。
    - [票 59](.scratch/model-gateway/issues/59-task-remaining-three-pages.md) 新增的 `request_frames` 表没进 spec §9 的表清单。
    - quirk 示例表没收录 `ModelsListNeedsCredential`（[票 50](.scratch/model-gateway/issues/50-task-model-discovery-fallback.md)）。
-2. ~~**GitHub 那半步**~~ **已办（2026-10-16）**：公开仓库 `ColoristSansi/claude-gateway`（README + MIT LICENSE 一并补上，README 里写了 SmartScreen 那条），`tauri.conf.json` 与 `Cargo.toml` 一起抬到 **0.2.0**、`endpoints` 换成真仓库，`main` 快进到该提交，tag **`v0.2.0`** → CI `bundle` job 出签名产物 → Release 上传 `Claude Gateway_0.2.0_x64-setup.exe` + `latest.json`（+ 免安装 zip）。逐条命令仍是 `cg-notes\m4-live.md` 第 6 节（抄自票 61 的 Answer），**只剩第 6 条「现场验一次真 https 闭环」与第 7 条「把实测结果写进票 63 的 Answer」没做**（见上面待办第 1 条）。顺带修了 CI 的一个真洞：两个 job 都缺「装前端依赖」（`check.ps1` 的 web 步与 tauri 的 `beforeBuildCommand` 都要 `app/node_modules`），commit `60aace9`。
+2. ~~**GitHub 那半步**~~ **已办（2026-10-16）**：公开仓库 `ColoristSansi/claude-gateway`（README + MIT LICENSE 一并补上，README 里写了 SmartScreen 那条），`tauri.conf.json` 与 `Cargo.toml` 一起抬到 **0.2.0**、`endpoints` 换成真仓库，`main` 快进到该提交，tag **`v0.2.0`** → CI `bundle` job 出签名产物 → Release 上传 `Claude.Gateway_0.2.0_x64-setup.exe` + `latest.json`（+ 免安装 zip）。**六条全做完，含第 6 条真 https 闭环与第 7 条写进票 63 的 Answer**（原文 `cg-notes\67-https-loop.log`）。顺带修了两个真洞：① CI 两个 job 都缺「装前端依赖」（commit `60aace9`）；② GitHub 会把资产名的空格换成点，票 61 那句「会写成 `%20`」是错的，`pack.ps1` 现在按 GitHub 规则拼地址（commit `3ebfb5f`，见硬约束第 14 条）。
 3. **签名私钥是你资产**：`C:\Users\ZHANQUAN\AIGC\Project\cg-notes\keys\`（`updater.key` + `.password.txt` + `.pub`）。**丢了以后再也发不了升级，请离线备份整个目录。** ACL 已于 2026-10-16 收紧（原先是继承来的 `CodexSandboxUsers:(RX)` + `SYSTEM`/`Administrators`，现在**只有 `ZHANQUAN:(OI)(CI)F`**）；若以后要用管理员身份的备份/CI 工具读它，得先加回 `Administrators`。**公开仓库里的两个 Secret（`TAURI_SIGNING_PRIVATE_KEY` / `..._PASSWORD`）就是从这个目录取的，构建产物里只有公钥。**
 4. ~~**票 67（新，实现期收工后由收尾轮发现）**~~ **已办（2026-10-16）**：`Quirk::parse` 三个值补了 camelCase 分支（一处改，库 / 预填表 / 管理面三个调用点同时受益），并按编排者拍板做了第 3 条——解析不出的名字不再静默丢，而是回在 `POST/PUT /api/upstreams` 回执的 **`ignoredQuirks`** 里。两条新用例（单测从 `Quirk::all()` 现派生 camelCase 全过一遍 + `admin_api.rs` 照 spec §6:211 示例逐字 POST/PUT），先红后绿证据与门禁原文都写在[票 67 的 Answer](.scratch/model-gateway/issues/67-task-quirk-name-camelcase-parse.md) 里。
 

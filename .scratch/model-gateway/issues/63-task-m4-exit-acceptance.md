@@ -82,9 +82,51 @@ Blocked by: 61, 62
 
 ### 遗留
 
-1. 本机现在装的是 **0.2.0（本地验收源那一版）**，端点指 `127.0.0.1:8791`；要换生产配置版就装 `63-packages\v2-0.2.0-production-setup.exe`（数据/端口/客户端都不动，代价是那个占位端点下「检查更新」会失败，这是换真仓库前的预期）。
+1. ~~本机现在装的是 **0.2.0（本地验收源那一版）**，端点指 `127.0.0.1:8791`~~ → **已被下面「收尾第二轮补」第 3 条取代**：本机现在是公开仓库发的**生产版 0.2.0**，端点指真仓库。
 2. 卸载后 `HKCU\Software\claudegateway` 会留一个键（只有勾「Delete app data」才清）。
 3. 收尾数据目录 38 个文件而非 36（多的两个是升级回执与留包），属预期。
 4. `commandcode` 的 chat 面在 02:34–02:41 抖了 7 分钟（四探针连续 3 轮全 504，同一刻上游自检与 `/v1/messages` 真流量都 200，02:43 自己恢复）——**现场遇到重问一次即可**，原文 `63-upstream-flap.log`。
 5. 免安装 zip 不参与自动更新（spec 已定）。
-6. **上游 Responses 出站 wire 仍未实现**（`wire_not_implemented` 两处；票 57 只交付了 `text.format` 映射）——Codex 走的是 **Responses 入站**，不受影响；要接 Responses 出站得另开票。
+6. ~~**上游 Responses 出站 wire 仍未实现**~~ → 该缺口在收尾期由[票 65](65-task-responses-outbound.md) 补上（本票写这句话时 65 还没开）。
+
+## Answer（收尾第二轮补：GitHub 那半步 + 真 https 闭环）
+
+**执行人**：收尾第二轮（2026-10-16）。本条只补本票「六、GitHub 待办」那 6 条的落地与第 6 条现场闭环，不改前面已签字的四段验收。
+
+### 1. 仓库与 Release（对应待办 1–5）
+
+- 公开仓库 **<https://github.com/ColoristSansi/claude-gateway>**（README + MIT LICENSE 一并补上，README 里写了 SmartScreen 那条）。
+- `src-tauri/tauri.conf.json` 与 `src-tauri/Cargo.toml`（+ `Cargo.lock`）**一起**抬到 `0.2.0`，`endpoints` 的 `OWNER/REPO` 换成真仓库（唯一一处）；`main` 快进到与 tag 同一提交，tag **`v0.2.0`**。
+- CI：`check`（main 与 tag 两次都绿）与 `bundle` 都 success；pack 步的环境里能看到 `TAURI_SIGNING_PRIVATE_KEY: ***`，**没有**「没有 TAURI_SIGNING_PRIVATE_KEY」那句警告 → 真签上了。
+- Release `v0.2.0`（公开）三个资产：`Claude.Gateway_0.2.0_x64-setup.exe`（6083879 B）、`latest.json`（1449 B）、`Claude-Gateway_0.2.0_x64-portable.zip`（9019545 B）。清单里的 `signature` 与产物 `.sig`（444 B）逐字相同，两个平台键（`windows-x86_64-nsis` / `windows-x86_64`）写同一份签名与地址。
+- 匿名自检：`https://github.com/ColoristSansi/claude-gateway/releases/latest/download/latest.json` → **200**；清单里那条安装包地址 → **206**（range 取到 1024 B）。
+
+### 2. 两个顺带修掉的真洞（都不在票 61 的清单里）
+
+1. **CI 两个 job 都缺「装前端依赖」**：`check.ps1` 的 web 步与 tauri 的 `beforeBuildCommand` 都要 `app/node_modules`，而 workflow 只装了 pnpm CLI。第一次跑就会两个 job 全红。commit `60aace9`。
+2. **票 61 那句「资产名里的空格 GitHub 会写成 `%20`，对得上」是错的**：GitHub 会把资产名里除 `[A-Za-z0-9._-]` 以外的字符**换成点**（实测 `Claude Gateway_0.2.0_x64-setup.exe` → `Claude.Gateway_0.2.0_x64-setup.exe`，顺手传的 `space test.txt` → `space.test.txt`）。按原样发出去的清单点「检查更新」会在**下载那步 404**。`pack.ps1` 现在只在 `-BaseUrl` 是 `https://github.com/...` 时做这个替换（本地源仍按磁盘原名取文件），commit `3ebfb5f`；这也是第一次打 tag 后把 Release 与 tag 撤掉重发的原因（当时还没有任何消费者）。
+
+### 3. 真 https 闭环（对应待办 6）——现场实测
+
+1. 旧版：用**生产配置 0.1.0**（端点已是真仓库、无 `127.0.0.1:8791`；包 `cg-notes\67-packages\v-0.1.0-production-realendpoint-setup.exe`，SHA256 `3A22437E…C49`）`/S` 装到本机，`/api/status` → `version=0.1.0 port=8787`。
+2. `POST /api/update/check` → `currentVersion=0.1.0`、`available.version=0.2.0`、
+   `available.downloadUrl=https://github.com/ColoristSansi/claude-gateway/releases/download/v0.2.0/Claude.Gateway_0.2.0_x64-setup.exe`、`error=null`。
+3. `POST /api/update/install` → 立刻应答 `installing=true`；约 25 秒后 `/api/status` → **`version=0.2.0`、`port=8787`、`dbPath` 逐字不变**。
+4. 回执 `%APPDATA%\com.claudegateway.desktop\updates\last-update.json` = `{"from":"0.1.0","to":"0.2.0","at":"2026-10-16T11:33:42Z","package":"Claude.Gateway_0.2.0_x64-setup.exe"}`。
+5. 收尾自查：`git grep 127.0.0.1:8791 src-tauri/tauri.conf.json` → **空**。
+6. 数据目录文件数 39 → 39（升降级都不动数据）。原文 `cg-notes\67-https-loop.log`。
+
+### 4. 现场两处与交班单不符（如实记下）
+
+1. **闭环前本机并没有「已安装的 0.2.0」**：`%LOCALAPPDATA%\Claude Gateway` 当时**不存在**，占着 8787 的是一个从 `target\release\bundle\zip\Claude-Gateway_0.1.0_x64-portable\` 跑起来的**免安装 0.1.0 残留进程**（08:56 起；exe 里既没有 `8791` 也没有真仓库字符串，是更早的构建）。按「精确 PID + 精确 exe 路径」停掉它之后才知道。→ 本票遗留 1 与 START-HERE 的「本机现状」都按事实更正。
+2. **三个客户端现在是 `official`（不是「已生效」）**：残留进程那段时间没有接管，或中途被还原过。要回到收尾态得再点一次「一键切换」（三个客户端都要完全退出重开）：
+
+   ```powershell
+   $b='http://127.0.0.1:8787'
+   foreach ($id in 'claude-desktop','claude-code','codex') {
+     Invoke-RestMethod -Method Post -Uri "$b/api/clients/$id/apply" -ContentType 'application/json' -Body '{}'
+   }
+   ```
+
+   上游 2 条、数据与库都在（`/api/upstreams` 2 条）。
+
