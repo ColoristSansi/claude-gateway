@@ -27,7 +27,7 @@
 //! | --- | --- | --- |
 //! | `anthropic.rs` | `decode_request`、`AnthropicEncoder`、`AnthropicAssembler` | `encode_request`、`encode_count_request`、`AnthropicDecoder` |
 //! | `openai.rs` | `decode_request`、`ChatEncoder`、`ChatAssembler`（票 64） | `encode_request`、`OpenAiDecoder` |
-//! | `responses.rs` | `decode_request`、`ResponsesEncoder`、`ResponsesAssembler` | —（上游 Responses wire 未做） |
+//! | `responses.rs` | `decode_request`、`ResponsesEncoder`、`ResponsesAssembler` | `encode_request`、`ResponsesDecoder`（票 65） |
 
 pub mod anthropic;
 pub mod binding;

@@ -15,8 +15,8 @@
 //! - `crate::openai::encode_request` → [`encode_openai_chat_request`]（IR → 上游 Chat 请求体）
 //! - `crate::openai::OpenAiDecoder`（上游 Chat SSE → IR 事件）
 //!
-//! `responses.rs` 在此**没有**导出：它的「出站编码」是把帧写回 Codex（客户端面），
-//! 归 `ingress`；上游 Responses wire 未做。
+//! `responses.rs` 不在这里 re-export：它的编解码（含票 65 接上的**上游 Responses 出站**
+//! `encode_request` / `ResponsesDecoder`）由 [`upstream`] 直接 `use crate::responses`。
 
 pub mod discovery;
 pub mod provider;
