@@ -7,7 +7,7 @@
 ## 30 秒回到现场
 
 - **要做什么**：本机跑一个网关（Tauri 2 + Rust + React），把第三方模型聚合成「本地模型目录」，让 Claude Desktop（3P 模式）、Claude Code、Codex 三个客户端都用上第三方模型。
-- **走到哪了**：**实现期第一轮全部做完（2026-10-16）**。`integration/model-gateway` 上 **28 张 `Type: task` 票据全部 `resolved`** —— 原计划 §12 的 25 张（M1 = 39–44、M2 = 45–55、M3 = 56–60、M4 = 61–63）**加收口后评审揪出缺口补的 3 张**（64 OpenAI Chat 入站、65 上游 Responses 出站、66 三个 quirk 的执法点）。相对 `main`（只有票 39 的建仓提交）**123 次提交**、351 个受跟踪文件。
+- **走到哪了**：**实现期第一轮全部做完（2026-10-16）**。`integration/model-gateway` 上 **28 张 `Type: task` 票据全部 `resolved`** —— 原计划 §12 的 25 张（M1 = 39–44、M2 = 45–55、M3 = 56–60、M4 = 61–63）**加收口后评审揪出缺口补的 3 张**（64 OpenAI Chat 入站、65 上游 Responses 出站、66 三个 quirk 的执法点）。**收尾轮又开了 [票 67](.scratch/model-gateway/issues/67-task-quirk-name-camelcase-parse.md)（`open`，见待办④）**，它是收尾时读码发现的，不属于实现期那 28 张。相对 `main`（只有票 39 的建仓提交）**123 次提交 + 收尾 2 次**、351 个受跟踪文件。
 - **四段里程碑都已现场验收 + 你签字**：[44](.scratch/model-gateway/issues/44-task-m1-exit-acceptance.md)（托盘/窗口/库/端口被占）、[55](.scratch/model-gateway/issues/55-task-m2-exit-acceptance.md)（**三个真实客户端各问一句全通** + 一键还原）、[60](.scratch/model-gateway/issues/60-task-m3-exit-acceptance.md)（用量对账三条逐项零差异 + Ollama 面 + 能力位；走查时抓到的白屏 bug 当场修掉）、[63](.scratch/model-gateway/issues/63-task-m4-exit-acceptance.md)（完整卸载 → 干净装 → 应用内升一版 → 再卸载选还原）。**「可以开始拿它日常用」那条线（M2 收口）已过。**
 - **门禁**：`pwsh -File .\check.ps1 -Quick -Replay` → `全部通过。` exit 0，**356 条通过 / 13 条 `#[ignore]`**（真上游与人眼项，按票据 Answer 里的命令手动跑）；含 lib 190、**回放 23 格**、ollama 12、chat_inbound 11、responses_outbound 10、structured 19，以及**前端类型检查步**（`tsc --noEmit && vite build`）。最后一轮是在**全新 `CARGO_TARGET_DIR`** 上跑的。
 - **本机现状**：装的是 **0.2.0（本地验收源版，端点指 `127.0.0.1:8791`）**，数据目录 `%APPDATA%\com.claudegateway.desktop\`，两个真实上游（`commandcode` / `opencode-go`）与四个家族槽位都配好且探针 200，三个客户端「已生效」。
@@ -15,18 +15,19 @@
 ## 回来直接说这一句
 
 ```
-接手 Claude Gateway 实现期收工后的收尾：读 START-HERE.md 与 cg-notes 里的现场卡，先把待办三件事过一遍。
+接手 Claude Gateway 收尾第二轮：读 START-HERE.md 与 cg-notes 里的现场卡。①已办（spec 口径差已并入，commit 12bd56c）、③的 keys ACL 已收紧，这两件别重做；先定 ② GitHub 那半步（要选打 tag 的分支与仓库公开范围），再定 ④ 票 67 那个新缺口修不修。
 ```
 
 想直接开工其中一件，就说：
 
 - ~~同步 spec 口径差~~：**已办（2026-10-16）**，四条原文见下面待办①的记录。
 - 走 GitHub 那半步：`按 cg-notes/m4-live.md 第 6 节走 GitHub Releases 那半步`
+- 修 quirk 名解析缺口：`做票 67：quirk 名的 camelCase 只认一半（见 START-HERE 待办④）`
 - 换回生产版：`把本机换装生产配置的 0.2.0（见 cg-notes/m4-live.md）`
 
 **没有别的实现期票据了**——要开新票请先看下面的「待办」与「遗留」，别顺手改判据（spec §12.1）。
 
-## 待办三件事（实现期收工后剩下的）
+## 待办（实现期收工后剩下的）
 
 1. ~~**spec 与实现的口径差 4 条，要你拍**~~ **已办（2026-10-16）**：第 1/3/4 条已同步进 spec（§8 表 Desktop 接管键补 `inferenceCredentialKind`、§6 quirks 示例与例外段补 `ModelsListNeedsCredential`、§9 表清单补 `request_frames`）；第 2 条 `cache_write` 票 58 当时就写进了 §9，已在 §12.1 记「收尾追认」。四条原文留作记录：
    - Desktop 的接管键：spec §8 表写 **5 个**，实现是 **6 个**（多 `inferenceCredentialKind="static"`；依据在[票 46](.scratch/model-gateway/issues/46-task-writer-claude-desktop.md) 的 Answer）。
@@ -34,7 +35,8 @@
    - [票 59](.scratch/model-gateway/issues/59-task-remaining-three-pages.md) 新增的 `request_frames` 表没进 spec §9 的表清单。
    - quirk 示例表没收录 `ModelsListNeedsCredential`（[票 50](.scratch/model-gateway/issues/50-task-model-discovery-fallback.md)）。
 2. **GitHub 那半步**（你选留作待办）：建公开仓库 → 配两个 Secret → 抬版本打 tag → Release 上传 setup + `latest.json` → 真 https 闭环。**逐条命令在 `cg-notes\m4-live.md` 第 6 节**（抄自票 61 的 Answer）。
-3. **签名私钥是你资产**：`C:\Users\ZHANQUAN\AIGC\Project\cg-notes\keys\`（`updater.key` + `.password.txt` + `.pub`，ACL 只留当前用户）。**丢了以后再也发不了升级，请离线备份整个目录。**
+3. **签名私钥是你资产**：`C:\Users\ZHANQUAN\AIGC\Project\cg-notes\keys\`（`updater.key` + `.password.txt` + `.pub`）。**丢了以后再也发不了升级，请离线备份整个目录。** ACL 已于 2026-10-16 收紧（原先是继承来的 `CodexSandboxUsers:(RX)` + `SYSTEM`/`Administrators`，现在**只有 `ZHANQUAN:(OI)(CI)F`**）；若以后要用管理员身份的备份/CI 工具读它，得先加回 `Administrators`。
+4. **票 67（新，实现期收工后由收尾轮发现）**：`Quirk::parse` 的 camelCase 只认 7 个值里的 4 个，`temperatureMax2` / `emptyThinkingSignature` / `silentTruncate` 认不出，而 `upstreams.rs:642` 的 `filter_map` **静默丢掉**——照 spec §6 示例写配置会丢三条。**读码认定、未执行验证**；票在 [issues/67](.scratch/model-gateway/issues/67-task-quirk-name-camelcase-parse.md)，`Status: open`。
 
 ## 已定死、不要再讨论的
 
