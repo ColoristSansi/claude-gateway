@@ -152,7 +152,8 @@ pub fn encode_request(ir: &IrRequest, stream: bool) -> Value {
     body
 }
 
-fn tool_result_text(content: &Value) -> String {
+/// `tool_result` 的载荷 → 字符串（Responses 出站也复用它）。
+pub(crate) fn tool_result_text(content: &Value) -> String {
     match content {
         Value::String(s) => s.clone(),
         Value::Array(a) => a
@@ -165,7 +166,8 @@ fn tool_result_text(content: &Value) -> String {
     }
 }
 
-fn data_url(source: &Value) -> String {
+/// IR 的 base64 `source` → `data:` URL（Responses 出站的 `input_image` 也复用它）。
+pub(crate) fn data_url(source: &Value) -> String {
     let media = source
         .get("media_type")
         .and_then(|m| m.as_str())

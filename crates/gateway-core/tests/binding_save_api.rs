@@ -264,20 +264,25 @@ async fn slot_binding_save_reads_back_survives_a_restart_and_rejects_an_undeclar
     h.stop().await;
 }
 
-/// 未实现的 wire（`openai-responses`）**界面要标出来、保存要拒收**（评审的阻断③）：
-/// 后端从前用 `Wire::ALL` 全量回、预设里 5 个声明了 `/responses`、下拉可选 →
-/// 用户能存下一个永远 502 的绑定（自检会红，但不该让人先踩进去）。
+/// 票 65：`openai-responses` 的绑定**必须能存下去**（评审的阻断③已随出站 wire 落地销账）。
+///
+/// 上一轮给的临时措施（`unimplementedWires` + 保存拒收）随本票一起撤掉：`/api/bindings`
+/// 与 `/api/providers` 都不再回那个字段，两条保存路径（槽位绑定 / 普通虚拟模型）都放行。
 #[tokio::test]
-async fn an_unimplemented_wire_is_marked_and_cannot_be_saved() {
-    let h = H::boot(tmp("unimplemented-wire"), "起网关").await;
+async fn responses_wire_bindings_are_saved_through_both_paths() {
+    let h = H::boot(tmp("responses-wire"), "起网关").await;
 
-    // 界面拿到的候选里，未实现的仍然列出来（好解释为什么不能选），但要在单独的字段里标出来。
+    // 界面拿到的候选里没有「不可选」的 wire 了（字段整个撤掉，不是空数组）。
     let (s, body) = h.get("/api/bindings?client=global").await;
     assert_eq!(s, 200, "{body}");
-    assert_eq!(
-        body["unimplementedWires"],
-        json!(["openai-responses"]),
-        "界面下拉据此标注 / 禁选：{body}"
+    println!(
+        "\n[票 65] GET /api/bindings?client=global → wires={}，还带 unimplementedWires 吗：{}",
+        body["wires"],
+        body.get("unimplementedWires").is_some()
+    );
+    assert!(
+        body.get("unimplementedWires").is_none(),
+        "临时措施该整条撤掉：{body}"
     );
     assert!(
         body["wires"]
@@ -285,10 +290,13 @@ async fn an_unimplemented_wire_is_marked_and_cannot_be_saved() {
             .unwrap()
             .iter()
             .any(|w| w == "openai-responses"),
-        "候选里照旧列全量（标出来比藏起来诚实）：{body}"
+        "候选里照旧列全量：{body}"
     );
+    let (s, body) = h.get("/api/providers").await;
+    assert_eq!(s, 200, "{body}");
+    assert!(body.get("unimplementedWires").is_none(), "{body}");
 
-    // 上游 + 一条只声明 `openai-responses` 的手工模型：7 个内置预设里 5 个就是这个样子。
+    // 上游 + 一条只声明 `openai-responses` 的手工模型（预设里 5 个就是这个样子）。
     let (s, body) = h
         .send(
             "POST",
@@ -312,7 +320,7 @@ async fn an_unimplemented_wire_is_marked_and_cannot_be_saved() {
         .await;
     assert_eq!(s, 200, "{body}");
 
-    // 槽位绑定：拒收 + 说清「本版未实现」与怎么绕开。
+    // ① 槽位绑定：**故意选一次 openai-responses，存下去要成功**（这就是界面那个下拉发的请求）。
     let (s, body) = h
         .put_binding(
             "claude-sonnet",
@@ -321,24 +329,20 @@ async fn an_unimplemented_wire_is_marked_and_cannot_be_saved() {
             "openai-responses",
         )
         .await;
-    assert_eq!(s, 400, "未实现的 wire 必须 400：{body}");
-    let err = &body["error"];
-    assert!(
-        err["what"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("本版未实现"),
-        "要说清这条路本版走不通：{body}"
+    assert_eq!(s, 200, "openai-responses 必须能存：{body}");
+    assert_eq!(body["saved"], true, "{body}");
+    println!(
+        "[票 65] PUT /api/bindings/claude-sonnet?client=global wire=openai-responses → {s}，saved={}，读回：{}",
+        body["saved"],
+        h.triple("claude-sonnet").await
     );
-    assert!(
-        err["likelyCause"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("anthropic"),
-        "要指出改用哪些已实现的 wire：{body}"
+    assert_eq!(
+        h.triple("claude-sonnet").await,
+        triple("resp", "gpt-5-responses", "openai-responses"),
+        "读回要与刚存的一致"
     );
 
-    // 普通虚拟模型是另一条保存路径，同样拒收。
+    // ② 普通虚拟模型是另一条保存路径，同样放行。
     let (s, body) = h
         .send(
             "POST",
@@ -346,36 +350,27 @@ async fn an_unimplemented_wire_is_marked_and_cannot_be_saved() {
             json!({"name": "v1", "upstreamId": "resp", "realModel": "gpt-5-responses", "wire": "openai-responses"}),
         )
         .await;
-    assert_eq!(s, 400, "{body}");
-
-    // 两条路都没落库。
-    let (s, body) = h.get("/api/bindings?client=global").await;
     assert_eq!(s, 200, "{body}");
-    let sonnet = body["slots"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|r| r["slot"] == "claude-sonnet")
-        .unwrap();
-    assert!(sonnet["binding"].is_null(), "没存下去：{body}");
-    assert!(
-        body["virtualModels"].as_array().unwrap().is_empty(),
-        "{body}"
+    assert_eq!(body["saved"], true, "{body}");
+    println!(
+        "[票 65] POST /api/virtual-models wire=openai-responses → {s}，triple={}",
+        body["binding"]["triple"]
     );
 
-    // 已实现的 wire 不受影响（同一个上游上照常能存）。
-    let (s, body) = h
-        .send(
-            "POST",
-            "/api/upstreams/resp/models",
-            json!({"modelId": "claude-on-anthropic", "wires": ["anthropic"]}),
-        )
-        .await;
+    // 重启也还在（走的还是同一个 `bindings` 表）。
+    let h = h.restart().await;
+    assert_eq!(
+        h.triple("claude-sonnet").await,
+        triple("resp", "gpt-5-responses", "openai-responses"),
+        "重启后该还是刚存的那条"
+    );
+    let (s, body) = h.get("/api/bindings?client=global").await;
     assert_eq!(s, 200, "{body}");
-    let (s, body) = h
-        .put_binding("claude-sonnet", "resp", "claude-on-anthropic", "anthropic")
-        .await;
-    assert_eq!(s, 200, "anthropic 面照常：{body}");
+    assert_eq!(
+        body["virtualModels"][0]["triple"],
+        triple("resp", "gpt-5-responses", "openai-responses"),
+        "{body}"
+    );
 
     h.stop().await;
 }

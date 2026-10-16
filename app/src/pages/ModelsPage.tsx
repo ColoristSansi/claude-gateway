@@ -106,10 +106,8 @@ export function ModelsPage({ ctx }: { ctx: ShellCtx }) {
     }
   };
 
-  // 本版未实现的 wire（后端 `/api/bindings` 的 `unimplementedWires`）：下拉里标出来并禁选。
-  // 后端保存时也拒收（`ingress/api/bindings.rs`），这里只是别让人先踩进去。
-  const unimplemented = new Set(view?.unimplementedWires ?? []);
-  const wireLabel = (wire: string) => (unimplemented.has(wire) ? `${wire}（本版未实现，不可选）` : wire);
+  // 三条 wire 都实现了（票 65 接上 `openai-responses`）：下拉里没有禁选项，wire 名直接显示。
+  const wireLabel = (wire: string) => wire;
 
   return (
     <section className="page">
@@ -197,7 +195,7 @@ export function ModelsPage({ ctx }: { ctx: ShellCtx }) {
                   >
                     {(declared.length > 0 ? declared : view?.wires ?? []).map(
                       (wire) => (
-                        <option key={wire} value={wire} disabled={unimplemented.has(wire)}>
+                        <option key={wire} value={wire}>
                           {wireLabel(wire)}
                         </option>
                       ),
@@ -289,7 +287,7 @@ export function ModelsPage({ ctx }: { ctx: ShellCtx }) {
         </select>
         <select value={newModel.wire} onChange={(e) => setNewModel({ ...newModel, wire: e.target.value })}>
           {(view?.wires ?? []).map((wire) => (
-            <option key={wire} value={wire} disabled={unimplemented.has(wire)}>
+            <option key={wire} value={wire}>
               {wireLabel(wire)}
             </option>
           ))}

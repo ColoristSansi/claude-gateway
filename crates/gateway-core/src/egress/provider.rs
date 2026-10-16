@@ -90,25 +90,9 @@ impl Wire {
         }
     }
 
-    /// 出站编解码**本版做了没有**。`openai-responses` 还没接：`egress/upstream.rs` 恒回 502，
-    /// 所以界面要标出来、绑定保存要拒收——别让用户存下一个必然 502 的绑定。
-    /// 接上 Responses 出站时只改这里（全仓的标注 / 拒收都从它来）。
-    pub fn implemented(self) -> bool {
-        !matches!(self, Wire::OpenAiResponses)
-    }
-
-    /// 未实现的 wire 在界面上的标注；实现了的不标。
-    pub fn unimplemented_note(self) -> Option<&'static str> {
-        if self.implemented() {
-            None
-        } else {
-            Some(UNIMPLEMENTED_WIRE_NOTE)
-        }
-    }
+    // 票 64 那轮临时加的 `implemented()` / `unimplemented_note()` 随票 65 一起撤掉：
+    // 三条 wire 的编解码都实现了，再留一套「哪个没实现」的机制就是死代码。
 }
-
-/// 未实现的 wire 的界面标注（[`Wire::unimplemented_note`]）。
-pub const UNIMPLEMENTED_WIRE_NOTE: &str = "本版未实现";
 
 /// 认证方式（原型两个值，逐字保留）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
