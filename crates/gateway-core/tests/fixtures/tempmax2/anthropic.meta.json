@@ -1,0 +1,32 @@
+{
+  "scenario": "tempmax2",
+  "outbound_wire": "anthropic",
+  "upstream": "mockq",
+  "model": "mock-tempmax2",
+  "origin": "authored",
+  "recorded_at": "2026-10-16T00:00:00Z",
+  "request": {
+    "model": "mock-anthropic-tempmax2",
+    "max_tokens": 256,
+    "temperature": 3.0,
+    "stream": true,
+    "messages": [
+      {
+        "role": "user",
+        "content": "温度夹取"
+      }
+    ]
+  },
+  "expect": {
+    "status": 200,
+    "last_event": "message_stop"
+  },
+  "quirks": [
+    "TemperatureMax2"
+  ],
+  "masks": [
+    "message.id"
+  ],
+  "chunks": [],
+  "changed_why": "票 66：同一份字节同时挂在 mockq（声明 TemperatureMax2）与 mock（不声明）两条上游上，出站 temperature 一个夹到 2、一个原样。"
+}

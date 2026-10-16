@@ -1,0 +1,31 @@
+{
+  "scenario": "trunced",
+  "outbound_wire": "anthropic",
+  "upstream": "mockq",
+  "model": "mock-trunced",
+  "origin": "authored",
+  "recorded_at": "2026-10-16T00:00:00Z",
+  "request": {
+    "model": "mock-anthropic-trunced",
+    "max_tokens": 256,
+    "stream": true,
+    "messages": [
+      {
+        "role": "user",
+        "content": "说到一半就断"
+      }
+    ]
+  },
+  "expect": {
+    "status": 200,
+    "last_event": "message_stop"
+  },
+  "quirks": [
+    "SilentTruncate"
+  ],
+  "masks": [
+    "message.id"
+  ],
+  "chunks": [],
+  "changed_why": "票 66：流在内容块中途干净结束且没有终态帧。声明了 SilentTruncate 的上游（mockq）由网关补终态；没声明的那条上游（mock）仍按票 30 报 upstream_abort。"
+}
