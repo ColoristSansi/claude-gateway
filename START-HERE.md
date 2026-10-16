@@ -20,7 +20,7 @@
 
 想直接开工其中一件，就说：
 
-- 同步 spec 口径差：`把 spec 与实现的 4 处口径差同步进 spec（见 START-HERE 的待办①）`
+- ~~同步 spec 口径差~~：**已办（2026-10-16）**，四条原文见下面待办①的记录。
 - 走 GitHub 那半步：`按 cg-notes/m4-live.md 第 6 节走 GitHub Releases 那半步`
 - 换回生产版：`把本机换装生产配置的 0.2.0（见 cg-notes/m4-live.md）`
 
@@ -28,7 +28,7 @@
 
 ## 待办三件事（实现期收工后剩下的）
 
-1. **spec 与实现的口径差 4 条，要你拍**（实现期按 §12.1 一律没让子代理动 spec）：
+1. ~~**spec 与实现的口径差 4 条，要你拍**~~ **已办（2026-10-16）**：第 1/3/4 条已同步进 spec（§8 表 Desktop 接管键补 `inferenceCredentialKind`、§6 quirks 示例与例外段补 `ModelsListNeedsCredential`、§9 表清单补 `request_frames`）；第 2 条 `cache_write` 票 58 当时就写进了 §9，已在 §12.1 记「收尾追认」。四条原文留作记录：
    - Desktop 的接管键：spec §8 表写 **5 个**，实现是 **6 个**（多 `inferenceCredentialKind="static"`；依据在[票 46](.scratch/model-gateway/issues/46-task-writer-claude-desktop.md) 的 Answer）。
    - `cache_write` 缺价 → 整条 `cost_usd` NULL：[票 58](.scratch/model-gateway/issues/58-task-cache-write-accounting.md) 在实现期自定**并回写了 spec §9**——这是全程唯一一次改 spec，严格说越出 §12.1。
    - [票 59](.scratch/model-gateway/issues/59-task-remaining-three-pages.md) 新增的 `request_frames` 表没进 spec §9 的表清单。

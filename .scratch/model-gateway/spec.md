@@ -208,7 +208,7 @@ enum StreamEvent { Start, BlockStart(Kind), TextDelta, ThinkingDelta,
     "openaiResponses": "/v1/responses"
   },
   "headerPassthrough": ["anthropic-version", "anthropic-beta"],
-  "quirks": ["noModelsEndpoint", "temperatureMax2", "emptyThinkingSignature", "silentTruncate"]
+  "quirks": ["noModelsEndpoint", "modelsListNeedsCredential", "temperatureMax2", "emptyThinkingSignature", "silentTruncate"]
 }
 ```
 
@@ -216,7 +216,7 @@ enum StreamEvent { Start, BlockStart(Kind), TextDelta, ThinkingDelta,
 
 **拉取的失败与空结果**（[票 35](issues/35-grilling-model-discovery-fallback.md)）：**404/405 = 该上游不提供模型发现**——软提示「请手填模型 ID」+ 手填入口，不算错误、卡片不报红（`noModelsEndpoint` quirk 的含义收窄为「不必尝试」，通用 404/405 规则兜住没声明过的上游）；**其他非 2xx（401/403/429/5xx）/ 超时 / 断网 = 拉取失败**，失败提示里直接给「手工添加模型」按钮，在向导同一页内联新增（条目按 `manual` 锁定），**上游仍可保存**（拉模型可跳过、只强制自检）。拉取**20 秒超时**（超时算失败）、**不自动重试**——401/403/429/404 立即返回，5xx/超时也只报一次，失败提示里给「重试」按钮由用户点（与票 26「不给上游转发加统一超时」不冲突：这是网关自己去拉一次清单）。**200 但零条**与「不提供模型发现」同一支处理。**重拉失败保留旧条目**，只提示「沿用上次结果（时间）」，只有成功拉取才覆盖 `upstream` 来源的条目。这两类提示都**不计入**侧栏「未通过自检的上游数」与概览三步就绪——判据只看自检。opencode 只拉带凭据的那份目录（19/85 的差异是权限过滤，未授权模型调用一律 403），不做匿名拉取。
 
-`quirks` 只允许枚举值，新增一个 quirk 必须同时新增一条回归 fixture；不允许在转换代码里写供应商名判断。**「哪些协议面服务哪些模型」不进 quirks**——那是上游模型目录的职责（原 `ClaudeModelsOnAnthropicOnly` 已删除，见票 23）；`noModelsEndpoint` 是例外，它说的是**上游根本不提供模型发现端点**这个上游级事实，与「哪个协议面服务哪些模型」无关，只表示「不必尝试拉取、向导直接给手填入口」。
+`quirks` 只允许枚举值，新增一个 quirk 必须同时新增一条回归 fixture；不允许在转换代码里写供应商名判断。**「哪些协议面服务哪些模型」不进 quirks**——那是上游模型目录的职责（原 `ClaudeModelsOnAnthropicOnly` 已删除，见票 23）；`noModelsEndpoint` 与 `modelsListNeedsCredential` 是例外：两者说的都是**上游级事实**，与「哪个协议面服务哪些模型」无关——前者 = 上游根本不提供模型发现端点，只表示「不必尝试拉取、向导直接给手填入口」；后者 = 模型清单只有带凭据那份可信（没凭据就不拉、带凭据 404/零条才退匿名兜底；[票 50](issues/50-task-model-discovery-fallback.md)）。两者都在发现流程里执法、不产生回放 fixture（豁免表 `tests/fixtures/quirk-exempt.json`）。
 
 **结构化输出能力位**（[票 37](issues/37-grilling-structured-output-slot.md)）：粒度 = **上游 × 出站协议**，两态 `native`（缺省）/ `ignore`，另记 `source`（`manual` / `selfcheck`）。它存在的唯一理由是**状态码骗人**：实测 commandcode 的 Anthropic 兼容端点对 `output_config.format`（含旧名 ± beta 头、连伪造的 `response_format`）**6 个变体全 200 且逐字静默忽略**，而同一上游的 Chat wire 反而是真强制。判定靠自检，不靠状态码：**带 schema 的最短请求 + 敌意提示词**（「只说 hello，不要 JSON」），回答没被 schema 约束住就标 `ignore`。被标 `ignore` 时，客户端要结构化输出 → **请求期 400** 并说明原因。wire 级事实进表、不进 quirks（与上一段同一条口径）。
 
@@ -243,7 +243,7 @@ enum StreamEvent { Start, BlockStart(Kind), TextDelta, ThinkingDelta,
 | --- | --- | --- | --- |
 | Claude Code | `%USERPROFILE%\.claude\settings.json` 的 `env` 块 | `ANTHROPIC_BASE_URL`、**只写 `ANTHROPIC_AUTH_TOKEN`**（不写 `ANTHROPIC_API_KEY`）、四个 `ANTHROPIC_DEFAULT_*_MODEL` | 环境变量优先于 shell 导出；`apiKeyHelper` 会同时发两个头；**`ANTHROPIC_API_KEY` 需要一次 `/config` 交互批准、曾拒绝过就静默失灵**（见 §8.3）；凭据必须落在「首次运行向导之前可读」的位置，项目级 `.claude/settings*.json` 不合格 |
 | Codex | `%USERPROFILE%\.codex\config.toml` | `model_providers.*`（`base_url` / `env_key` / `wire_api="responses"` / `http_headers`）、`model_catalog_json` | 必须保序改写；`wire_api` 只能是 `responses`；**不写 `requires_openai_auth = true`**（默认即免登录）；`env_key` 声明的环境变量必须真存在；不写 `auth.json`（见 §8.3） |
-| Claude Desktop | `%LOCALAPPDATA%\Claude-3p\configLibrary\*.json` + `_meta.json` | `inferenceProvider="gateway"`、`inferenceGatewayBaseUrl`、`inferenceGatewayApiKey`、`inferenceGatewayAuthScheme`、`inferenceModels` | baseUrl **不带** `/v1`；切回 1P 只需摘 `inferenceProvider`（见 §8.1）；3P **不需要官方登录态**、key 允许占位（见 §8.3）。另有注册表托管路径 `HKLM\|HKCU\SOFTWARE\Policies\Claude`，本期不做 |
+| Claude Desktop | `%LOCALAPPDATA%\Claude-3p\configLibrary\*.json` + `_meta.json` | `inferenceProvider="gateway"`、`inferenceGatewayBaseUrl`、`inferenceGatewayApiKey`、`inferenceGatewayAuthScheme`、`inferenceCredentialKind`（值 `static`）、`inferenceModels` | baseUrl **不带** `/v1`；切回 1P 只需摘 `inferenceProvider`（见 §8.1）；3P **不需要官方登录态**、key 允许占位（见 §8.3）。另有注册表托管路径 `HKLM\|HKCU\SOFTWARE\Policies\Claude`，本期不做 |
 
 写入引擎的规则（照 cc-switch 的 `live/` 引擎；事务性与还原的细节由[票 28](issues/28-grilling-config-writer-transactionality.md) 定案，见 §8.4）：
 
@@ -307,7 +307,7 @@ enum StreamEvent { Start, BlockStart(Kind), TextDelta, ThinkingDelta,
 
 ## 9. 存储、安全与可观测
 
-**SQLite 表（草案）**：`upstreams`（含「上次拉取时间 / 结果 / 警告」）、`upstream_models`（上游模型目录：真实模型 + 可用 wire 集合 + 来源 + **手工价四列**：输入/输出/缓存读/缓存写，可空 = 回退 models.dev）、`credentials`(密文，按上游 × wire)、`virtual_models`、`client_profiles`、`client_config_state`(每个「客户端 × 文件」一行：上次由网关写入的接管键值、时间、备份路径、首写时文件是否存在；§8.4)、`requests`(元数据 + `cost_usd`：请求时按当时价冻结)、`request_bodies`(可选)、`model_catalog`(随包内置的 models.dev 快照，设置页手动刷新)、`settings`(端口、日志保留、**汇率**、快照刷新时间)。
+**SQLite 表（草案）**：`upstreams`（含「上次拉取时间 / 结果 / 警告」）、`upstream_models`（上游模型目录：真实模型 + 可用 wire 集合 + 来源 + **手工价四列**：输入/输出/缓存读/缓存写，可空 = 回退 models.dev）、`credentials`(密文，按上游 × wire)、`virtual_models`、`client_profiles`、`client_config_state`(每个「客户端 × 文件」一行：上次由网关写入的接管键值、时间、备份路径、首写时文件是否存在；§8.4)、`requests`(元数据 + `cost_usd`：请求时按当时价冻结)、`request_bodies`(可选)、`request_frames`(帧时间轴：`request_id` + `seq` + `at_ms` + `event` + `summary` + `raw`，随 `requests` 行级联删；[票 59](issues/59-task-remaining-three-pages.md) 的 v8 迁移，日志详情第三段的落点)、`model_catalog`(随包内置的 models.dev 快照，设置页手动刷新)、`settings`(端口、日志保留、**汇率**、快照刷新时间)。
 
 **密钥**：DPAPI 加密后入库；界面只显示掩码；导出 JSON 时默认不含明文密钥（可选带密码的加密导出）。
 
@@ -405,6 +405,7 @@ enum StreamEvent { Start, BlockStart(Kind), TextDelta, ThinkingDelta,
 - **四张收口票（44 / 55 / 60 / 63）不甩给子代理**：它们是现场验收 + 用户签字，由主会话带着用户走。
 - **`prototype/` 冻结**：只读参照物，改行为只发生在正牌骨架里。
 - **实现期不改判据**：§4–§10 与 ADR-0001~0007 已定死的行为照做；要改先回到票据层面重新决策，不顺手改。
+- **收尾追认（2026-10-16）**：[票 58](issues/58-task-cache-write-accounting.md) 为实现缓存写计价，直接把「缺缓存写价按未知价处理、不拿输入价顶替」写进了 §9 —— 这是全程唯一一次实现期改 spec，严格说越出本节上一条。**编排者与用户已追认**该条并入 §9，行为一律以 §9 现文为准。
 
 ---
 
